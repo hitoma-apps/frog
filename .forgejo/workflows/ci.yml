@@ -33,13 +33,3 @@ jobs:
 
       - name: Test
         run: cargo test --locked --all-targets
-
-      - name: Upload release build
-        uses: actions/upload-artifact@v4
-        with:
-          name: gmail-imap-proto-linux-x86_64
-          path: |
-            target/release/gmail-imap-proto
-            target/release/libgmail_imap_proto.rlib
-          if-no-files-found: error
-          retention-days: 14
