@@ -56,9 +56,15 @@ fn rejects_non_fetch_responses() {
 
 #[test]
 fn classifies_labels() {
-    assert_eq!(Label::classify("\\Inbox"), Label::System(SystemLabel::Inbox));
+    assert_eq!(
+        Label::classify("\\Inbox"),
+        Label::System(SystemLabel::Inbox)
+    );
     assert_eq!(Label::classify("\\Muted"), Label::Other("\\Muted"));
-    assert_eq!(Label::classify("Work/Projects"), Label::User("Work/Projects"));
+    assert_eq!(
+        Label::classify("Work/Projects"),
+        Label::User("Work/Projects")
+    );
 }
 
 #[test]
@@ -78,7 +84,10 @@ fn user_label_names_are_quoted_and_escaped() {
     let cmd = uid_store_labels(
         &[5],
         LabelAction::Add,
-        &[LabelRef::Name(r#"He said "hi" \o/"#), LabelRef::Name("Work/Projects")],
+        &[
+            LabelRef::Name(r#"He said "hi" \o/"#),
+            LabelRef::Name("Work/Projects"),
+        ],
     )
     .unwrap();
     assert_eq!(
@@ -92,7 +101,14 @@ fn replace_with_empty_list_clears_labels() {
     let cmd = uid_store_labels(&[1], LabelAction::Replace, &[]).unwrap();
     assert_eq!(cmd, "UID STORE 1 X-GM-LABELS ()");
     assert!(uid_store_labels(&[1], LabelAction::Add, &[]).is_none());
-    assert!(uid_store_labels(&[], LabelAction::Add, &[LabelRef::System(SystemLabel::Spam)]).is_none());
+    assert!(
+        uid_store_labels(
+            &[],
+            LabelAction::Add,
+            &[LabelRef::System(SystemLabel::Spam)]
+        )
+        .is_none()
+    );
 }
 
 #[test]
@@ -116,7 +132,10 @@ fn renders_plaintext_part_of_multipart() {
         "--b1--\r\n",
     );
     let out = render_plaintext(raw.as_bytes()).unwrap();
-    assert!(out.contains("From: Ada Lovelace <ada@example.com>"), "{out}");
+    assert!(
+        out.contains("From: Ada Lovelace <ada@example.com>"),
+        "{out}"
+    );
     assert!(out.contains("To: Charles <charles@example.com>"), "{out}");
     assert!(out.contains("Subject: Plaintext please"), "{out}");
     assert!(out.contains("Plain body line."), "{out}");

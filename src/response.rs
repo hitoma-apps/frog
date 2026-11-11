@@ -77,7 +77,10 @@ impl<'a> Cursor<'a> {
                 self.pos += 1;
                 Ok(())
             }
-            Some(found) => Err(ParseError::Unexpected { pos: self.pos, found }),
+            Some(found) => Err(ParseError::Unexpected {
+                pos: self.pos,
+                found,
+            }),
             None => Err(ParseError::UnexpectedEof),
         }
     }
@@ -191,7 +194,8 @@ impl<'a> Cursor<'a> {
                 found: self.peek().unwrap_or(0),
             });
         }
-        let s = std::str::from_utf8(&buf[start..self.pos]).map_err(|_| ParseError::BadAtom(start))?;
+        let s =
+            std::str::from_utf8(&buf[start..self.pos]).map_err(|_| ParseError::BadAtom(start))?;
         if s.eq_ignore_ascii_case("NIL") {
             Ok(Value::Nil)
         } else if let Ok(n) = s.parse::<u64>() {
@@ -215,7 +219,9 @@ pub fn parse_fetch(buf: &[u8]) -> Result<FetchResponse<'_>, ParseError> {
     c.expect(b'*')?;
     c.skip_spaces();
     let seq = match c.value()? {
-        Value::Number(n) => u32::try_from(n).map_err(|_| ParseError::BadFetch("seq out of range"))?,
+        Value::Number(n) => {
+            u32::try_from(n).map_err(|_| ParseError::BadFetch("seq out of range"))?
+        }
         _ => return Err(ParseError::BadFetch("missing sequence number")),
     };
     match c.value()? {

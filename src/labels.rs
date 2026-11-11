@@ -106,7 +106,11 @@ impl LabelAction {
 /// The caller adds the tag and CRLF. UIDs are sent as ranges where possible,
 /// which keeps long commands short for large selections. Returns `None` for
 /// an empty label list, except `Replace`, which clears all labels.
-pub fn uid_store_labels(uids: &[u32], action: LabelAction, labels: &[LabelRef<'_>]) -> Option<String> {
+pub fn uid_store_labels(
+    uids: &[u32],
+    action: LabelAction,
+    labels: &[LabelRef<'_>],
+) -> Option<String> {
     if uids.is_empty() {
         return None;
     }
@@ -135,12 +139,20 @@ pub fn uid_store_labels(uids: &[u32], action: LabelAction, labels: &[LabelRef<'_
 
 /// Archive = remove `\Inbox`.
 pub fn archive(uids: &[u32]) -> Option<String> {
-    uid_store_labels(uids, LabelAction::Remove, &[LabelRef::System(SystemLabel::Inbox)])
+    uid_store_labels(
+        uids,
+        LabelAction::Remove,
+        &[LabelRef::System(SystemLabel::Inbox)],
+    )
 }
 
 /// Trash = add `\Trash`.
 pub fn trash(uids: &[u32]) -> Option<String> {
-    uid_store_labels(uids, LabelAction::Add, &[LabelRef::System(SystemLabel::Trash)])
+    uid_store_labels(
+        uids,
+        LabelAction::Add,
+        &[LabelRef::System(SystemLabel::Trash)],
+    )
 }
 
 /// Sorts, dedupes and emits UIDs as comma-separated ranges, e.g. `1:3,7,9:10`.
