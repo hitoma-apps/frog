@@ -1,0 +1,7 @@
+[package]
+name = "gmail-imap-proto"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mail-parser = "0.11.9"
