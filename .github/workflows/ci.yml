@@ -42,9 +42,9 @@ jobs:
       - name: Upload release build
         uses: actions/upload-artifact@v4
         with:
-          name: gmail-imap-proto-release
+          name: gmail-imap-proto-linux-x86_64
           path: |
+            target/release/gmail-imap-proto
             target/release/libgmail_imap_proto.rlib
-            target/release/libgmail_imap_proto.d
           if-no-files-found: error
           retention-days: 14
