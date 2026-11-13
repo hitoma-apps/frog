@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use gmail_imap_proto::labels::{LabelAction, SystemLabel};
+use gmail_imap_proto::linkcheck::{self, LinkInfo};
 use gmail_imap_proto::links::gmail_thread_url;
 use gmail_imap_proto::render_plaintext;
 
@@ -70,7 +71,9 @@ fn adjust_counts(counts: &mut BTreeMap<String, usize>, labels: &BTreeSet<String>
 }
 
 /// Draws one line of a message. Long lines wrap, and links are clickable.
-fn render_line(ui: &mut egui::Ui, line: &str) {
+/// A link that looks disguised isn't opened here. Its check result goes to
+/// `pending` so the confirmation window can show it.
+fn render_line(ui: &mut egui::Ui, line: &str, pending: &mut Option<LinkInfo>) {
     if line.is_empty() {
         ui.add_space(ui.text_style_height(&egui::TextStyle::Monospace) * 0.6);
         return;
@@ -86,6 +89,20 @@ fn render_line(ui: &mut egui::Ui, line: &str) {
             match segment {
                 Segment::Text(text) => {
                     ui.label(egui::RichText::new(text).monospace());
+                }
+                Segment::Link(url) if linkcheck::is_suspicious(url) => {
+                    let info = linkcheck::analyze(url);
+                    let hover = format!(
+                        "Goes to {}\n{}\nClick to check before opening.",
+                        info.target,
+                        info.warnings.join("\n")
+                    );
+                    let text = egui::RichText::new(format!("⚠ {url}"))
+                        .monospace()
+                        .color(egui::Color32::LIGHT_RED);
+                    if ui.link(text).on_hover_text(hover).clicked() {
+                        *pending = Some(info);
+                    }
                 }
                 Segment::Link(url) => {
                     ui.hyperlink_to(egui::RichText::new(url).monospace(), url);
@@ -135,6 +152,8 @@ struct App {
     requested_bodies: HashSet<u32>,
     /// Cached blocks of the open message: `(uid, blocks)`.
     rendered: Option<(u32, Vec<Block>)>,
+    /// A suspicious link waiting for the user to confirm it.
+    pending_link: Option<LinkInfo>,
 
     /// `None` shows All Mail, `Some(label)` filters by one raw label.
     filter: Option<String>,
@@ -170,6 +189,7 @@ impl App {
             last_check: Instant::now(),
             requested_bodies: HashSet::new(),
             rendered: None,
+            pending_link: None,
             filter: None,
             checked: BTreeSet::new(),
             open: None,
@@ -615,13 +635,14 @@ impl App {
         ));
         ui.separator();
 
+        let mut pending: Option<LinkInfo> = None;
         egui::ScrollArea::vertical()
             .id_salt("reader")
             .show(ui, |ui| match &self.rendered {
                 Some((id, blocks)) if *id == uid => {
                     for (i, block) in blocks.iter().enumerate() {
                         match block {
-                            Block::Line(line) => render_line(ui, line),
+                            Block::Line(line) => render_line(ui, line, &mut pending),
                             Block::Quote(lines) => {
                                 ui.push_id(i, |ui| {
                                     egui::CollapsingHeader::new(format!(
@@ -631,7 +652,7 @@ impl App {
                                     .default_open(false)
                                     .show(ui, |ui| {
                                         for line in lines {
-                                            render_line(ui, line);
+                                            render_line(ui, line, &mut pending);
                                         }
                                     });
                                 });
@@ -647,6 +668,51 @@ impl App {
                     }
                 }
             });
+        if pending.is_some() {
+            self.pending_link = pending;
+        }
+    }
+
+    /// The confirmation shown before opening a link that looks disguised.
+    fn link_confirmation(&mut self, ctx: &egui::Context) {
+        let Some(info) = self.pending_link.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut decision = None;
+        egui::Window::new("Check this link")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("This link may be disguised. Check the real address before opening it.");
+                ui.add_space(6.0);
+                ui.monospace(format!("Link text:  {}", info.url));
+                ui.monospace(format!("Goes to:    {}", info.target));
+                ui.add_space(6.0);
+                for w in &info.warnings {
+                    ui.colored_label(egui::Color32::LIGHT_RED, format!("• {w}"));
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Open the real address").clicked() {
+                        decision = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+        match decision {
+            Some(true) => {
+                ctx.open_url(egui::OpenUrl::new_tab(info.target.clone()));
+                self.pending_link = None;
+            }
+            Some(false) => self.pending_link = None,
+            None if !open => self.pending_link = None,
+            None => {}
+        }
     }
 
     fn command_log(&self, ui: &mut egui::Ui) {
@@ -706,6 +772,8 @@ impl eframe::App for App {
                 .show(ui, |ui| self.message_list(ui));
             egui::CentralPanel::default().show(ui, |ui| self.reader(ui));
         });
+        let ctx = ui.ctx().clone();
+        self.link_confirmation(&ctx);
     }
 }
 
