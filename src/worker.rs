@@ -62,6 +62,8 @@ pub enum Event {
     Batch(Vec<Message>),
     LoadFinished,
     CheckFinished(Vec<Message>),
+    /// Messages that arrived in a check, newer than anything we had. Used for notifications.
+    NewArrivals(Vec<Message>),
     /// `cached` headers are held locally, out of `total` messages in the mailbox.
     Progress {
         cached: usize,
@@ -692,6 +694,8 @@ impl Worker {
             self.state.prefetch.push_front(uid);
         }
 
+        // Before changes to older messages are folded in, `msgs` holds only arrivals.
+        let arrivals = msgs.clone();
         if let (Some(modseq), true) = (self.state.modseq, src.supports_condstore()) {
             self.sync_changes(src, modseq, &mut msgs)?;
         }
@@ -703,6 +707,9 @@ impl Worker {
             self.state.modseq = Some(modseq);
         }
 
+        if !arrivals.is_empty() {
+            self.emit.send(Event::NewArrivals(arrivals));
+        }
         self.emit.send(Event::CheckFinished(msgs));
         self.emit_progress();
         self.save_sync();
@@ -1258,6 +1265,7 @@ mod sync_tests {
             Event::Batch(_) => "Batch",
             Event::LoadFinished => "LoadFinished",
             Event::CheckFinished(_) => "CheckFinished",
+            Event::NewArrivals(_) => "NewArrivals",
             Event::Progress { .. } => "Progress",
             Event::Body { .. } => "Body",
             Event::Labels { .. } => "Labels",
@@ -1353,6 +1361,43 @@ mod sync_tests {
                 }
                 Event::Body { .. } | Event::Progress { .. } | Event::CheckFinished(_) => {}
                 other => panic!("unexpected event: {}", name(&other)),
+            }
+        }
+    }
+
+    #[test]
+    fn delivered_mail_is_reported_as_an_arrival() {
+        let source = MockSource::demo();
+        let handle = source.handle();
+        let link = loaded(&source, Arc::new(Mutex::new(VecDeque::new())));
+        let uid = handle.deliver("Bob <bob@example.com>", "Lunch?", &["\\Inbox"]);
+        link.commands.send(Command::CheckNew).unwrap();
+        loop {
+            match next(&link) {
+                Event::NewArrivals(msgs) => {
+                    assert_eq!(msgs.len(), 1);
+                    assert_eq!(msgs[0].uid, uid);
+                    assert_eq!(msgs[0].subject, "Lunch?");
+                    break;
+                }
+                Event::CheckFinished(_) => panic!("the arrival was not reported"),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn label_changes_to_old_mail_are_not_arrivals() {
+        let source = MockSource::demo();
+        let handle = source.handle();
+        let link = loaded(&source, Arc::new(Mutex::new(VecDeque::new())));
+        handle.set_labels(2, &["\\Inbox", "Changed"]);
+        link.commands.send(Command::CheckNew).unwrap();
+        loop {
+            match next(&link) {
+                Event::CheckFinished(_) => break,
+                Event::NewArrivals(_) => panic!("an old message was reported as new"),
+                _ => {}
             }
         }
     }

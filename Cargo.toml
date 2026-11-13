@@ -8,6 +8,7 @@ directories = "6.0.0"
 eframe = "0.37.0"
 keyring = { version = "4.2.0", features = ["apple-native-keyring-store"] }
 mail-parser = "0.11.9"
+notify-rust = "4.19.0"
 rusqlite = { version = "0.42.0", features = ["bundled"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }

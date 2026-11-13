@@ -11,6 +11,7 @@
 mod backend;
 mod credentials;
 mod live;
+mod notify;
 mod reader;
 mod worker;
 
@@ -346,6 +347,21 @@ impl App {
                 self.view_dirty = true;
             }
             Event::IdleState(on) => self.idle_on = on,
+            Event::NewArrivals(msgs) => {
+                if self.settings.notifications {
+                    let items: Vec<notify::NewMail> = msgs
+                        .iter()
+                        .filter(|m| !m.seen && m.labels.contains(SystemLabel::Inbox.as_wire()))
+                        .map(|m| notify::NewMail {
+                            from: m.from.clone(),
+                            subject: m.subject.clone(),
+                        })
+                        .collect();
+                    if let Err(e) = notify::new_mail(&items) {
+                        eprintln!("Could not show a notification: {e}");
+                    }
+                }
+            }
             Event::Error(e) => {
                 self.checking = false;
                 self.loading = None;
@@ -493,6 +509,10 @@ impl App {
                 ui.checkbox(
                     &mut self.settings.remember_password,
                     "Remember password on this computer",
+                );
+                ui.checkbox(
+                    &mut self.settings.notifications,
+                    "Show desktop notifications for new mail",
                 );
                 ui.weak("The page size applies the next time the mailbox loads.");
                 ui.add_space(8.0);

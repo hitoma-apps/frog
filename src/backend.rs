@@ -279,6 +279,25 @@ impl MockHandle {
         }
     }
 
+    /// Delivers a new message to the mailbox, as an incoming mail would. Returns its UID.
+    pub fn deliver(&self, from: &str, subject: &str, labels: &[&str]) -> u32 {
+        let mut st = self.state.lock().unwrap();
+        let uid = st.entries.iter().map(|e| e.uid).max().unwrap_or(0) + 1;
+        st.highest_modseq += 1;
+        let modseq = st.highest_modseq;
+        let raw = format!("From: {from}\r\nSubject: {subject}\r\n\r\nbody\r\n").into_bytes();
+        st.entries.push(MockEntry {
+            msgid: 2000 + uid as u64,
+            thrid: 2000 + uid as u64,
+            uid,
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+            seen: false,
+            raw,
+            modseq,
+        });
+        uid
+    }
+
     /// Removes a message, as an expunge from another client would.
     pub fn expunge(&self, uid: u32) {
         let mut st = self.state.lock().unwrap();

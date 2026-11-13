@@ -26,6 +26,8 @@ pub struct Settings {
     pub check_interval_secs: u64,
     /// Messages to load on each page.
     pub page_size: usize,
+    /// Show a desktop notification when new mail arrives.
+    pub notifications: bool,
 }
 
 impl Default for Settings {
@@ -35,6 +37,7 @@ impl Default for Settings {
             remember_password: false,
             check_interval_secs: 60,
             page_size: 500,
+            notifications: true,
         }
     }
 }
@@ -103,6 +106,7 @@ mod tests {
             remember_password: true,
             check_interval_secs: 120,
             page_size: 200,
+            notifications: false,
         };
         s.save_to(&path).unwrap();
         assert_eq!(Settings::load_from(&path), s);
