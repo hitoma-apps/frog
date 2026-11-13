@@ -8,7 +8,6 @@
 //! reconnects when the connection drops, retrying the failed command once.
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::thread;
 use std::time::Duration;
@@ -138,21 +137,22 @@ pub struct Link {
 type Connector = Box<dyn FnMut() -> Result<Box<dyn MailSource>, String> + Send>;
 
 /// Opens the account's cache file, returning the path too. The error is for the user.
-pub fn open_cache(email: &str) -> Result<(Store, PathBuf), String> {
+/// Opens the account's cache, checking it first if it wasn't closed cleanly. Returns the
+/// notes about any repair or replacement, for the user.
+pub fn open_cache(email: &str) -> Result<(Store, Vec<String>), String> {
     let path = account_cache_path(email).ok_or_else(|| {
         "No data directory found; the cache is kept in memory for this session.".to_string()
     })?;
-    let store = Store::open(&path).map_err(|e| {
+    Store::open_checked(&path).map_err(|e| {
         format!("Could not open the cache; it is kept in memory for this session. {e}")
-    })?;
-    Ok((store, path))
+    })
 }
 
 /// The account's cache, plus any startup errors to send once connected. If the cache
 /// file can't be used, a cache in memory keeps the list working for this session.
 fn cache_for(email: &str) -> (Option<Store>, Vec<Event>) {
     match open_cache(email) {
-        Ok((store, _path)) => (Some(store), Vec::new()),
+        Ok((store, notes)) => (Some(store), notes.into_iter().map(Event::Error).collect()),
         Err(e) => (
             Store::open_in_memory(DEFAULT_BODY_CAP).ok(),
             vec![Event::Error(e)],

@@ -25,7 +25,7 @@ pub const DEFAULT_BODY_CAP: u64 = 1 << 30;
 /// zstd level. Mail is text, so a low level compresses well and stays fast.
 const ZSTD_LEVEL: i32 = 3;
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -121,6 +121,17 @@ pub struct MailboxState {
 pub struct Store {
     conn: Connection,
     body_cap: u64,
+    /// Whether the last session closed the cache cleanly. `false` after a crash or kill.
+    opened_cleanly: bool,
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        // Marks the cache as closed cleanly, so the next start can skip the checks.
+        let _ = self
+            .conn
+            .execute("UPDATE cache_state SET clean = 1 WHERE id = 1", []);
+    }
 }
 
 /// Where an account's cache file lives: `<data dir>/accounts/<sanitized email>.sqlite`.
@@ -151,6 +162,69 @@ pub fn sent_timestamp(headers: &[u8]) -> i64 {
         .parse(headers)
         .and_then(|m| m.date().map(|d| d.to_timestamp()))
         .unwrap_or(0)
+}
+
+/// What `Store::check` found. Physical problems mean the file can't be trusted. Logical
+/// problems mean the summaries disagree with the messages, and can be rebuilt.
+#[derive(Debug, Default)]
+pub struct CheckReport {
+    pub physical: Vec<String>,
+    pub logical: Vec<String>,
+}
+
+/// Recomputes every summary table from the messages. The search index is not included.
+fn rebuild_derived(tx: &Transaction) -> Result<()> {
+    tx.execute_batch(
+        "DELETE FROM threads;
+         DELETE FROM thread_labels;
+         DELETE FROM label_stats;
+         INSERT INTO threads (thrid, count, unread, newest_uid)
+             SELECT thrid, COUNT(*), SUM(seen = 0), MAX(uid) FROM messages
+             WHERE uid IS NOT NULL GROUP BY thrid;
+         INSERT INTO thread_labels (label, thrid)
+             SELECT DISTINCT l.label, m.thrid FROM messages m
+             JOIN message_labels l ON l.msgid = m.msgid WHERE m.uid IS NOT NULL;
+         INSERT INTO label_stats (label, count)
+             SELECT label, COUNT(*) FROM message_labels GROUP BY label;
+         UPDATE cache_totals SET messages = (SELECT COUNT(*) FROM messages WHERE uid IS NOT NULL);",
+    )?;
+    Ok(())
+}
+
+/// Copies the cache file aside, after folding the write-ahead log into it, so the copy
+/// is complete. Done before a migration rewrites the file.
+fn back_up(conn: &Connection, path: &Path) -> Result<()> {
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    std::fs::copy(
+        path,
+        path.with_file_name(format!("{name}.before-migration.bak")),
+    )?;
+    Ok(())
+}
+
+/// Renames a cache that can't be used, with its write-ahead log, so it's kept for
+/// inspection and a new cache can take its place.
+fn set_aside(path: &Path) -> Result<()> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let target = path.with_file_name(format!("{name}.damaged-{stamp}"));
+    std::fs::rename(path, &target)?;
+    for suffix in ["-wal", "-shm"] {
+        let side = PathBuf::from(format!("{}{suffix}", path.display()));
+        if side.exists() {
+            let _ = std::fs::rename(&side, format!("{}{suffix}", target.display()));
+        }
+    }
+    Ok(())
 }
 
 /// The thread of a stored message, by its `X-GM-MSGID`.
@@ -249,7 +323,154 @@ impl Store {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        Self::init(Connection::open(path)?, DEFAULT_BODY_CAP)
+        let conn = Connection::open(path)?;
+        // A cache from an older version is copied before any migration rewrites it.
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version > 0 && version < SCHEMA_VERSION {
+            back_up(&conn, path)?;
+        }
+        Self::init(conn, DEFAULT_BODY_CAP)
+    }
+
+    /// Opens the cache, checking it first if the last session didn't close it cleanly.
+    /// Damage is repaired where it can be, and a cache that can't be read is set aside
+    /// (renamed, not deleted) and a new one started. Returns what was done, for the user.
+    pub fn open_checked(path: &Path) -> Result<(Self, Vec<String>)> {
+        let mut notes = Vec::new();
+        let store = match Self::open(path) {
+            Ok(store) => store,
+            Err(e) => {
+                set_aside(path)?;
+                notes.push(format!(
+                    "The cache could not be opened ({e}). It was set aside, and a new one started."
+                ));
+                return Ok((Self::open(path)?, notes));
+            }
+        };
+        if store.opened_cleanly {
+            return Ok((store, notes));
+        }
+        let report = match store.check() {
+            Ok(report) => report,
+            Err(e) => CheckReport {
+                physical: vec![e.to_string()],
+                logical: Vec::new(),
+            },
+        };
+        if !report.physical.is_empty() {
+            drop(store);
+            set_aside(path)?;
+            notes.push(format!(
+                "The cache failed its checks ({}). It was set aside, and a new one started.",
+                report.physical.join("; ")
+            ));
+            return Ok((Self::open(path)?, notes));
+        }
+        let mut store = store;
+        if !report.logical.is_empty() {
+            store.repair()?;
+            notes.push(format!(
+                "The cache's summaries were out of step ({}). They were rebuilt from the messages.",
+                report.logical.join("; ")
+            ));
+        }
+        Ok((store, notes))
+    }
+
+    /// Whether the last session closed the cache cleanly.
+    pub fn opened_cleanly(&self) -> bool {
+        self.opened_cleanly
+    }
+
+    /// Checks the file and the data. Physical problems mean the file can't be trusted.
+    /// Logical problems mean the summaries disagree with the messages, and can be rebuilt.
+    pub fn check(&self) -> Result<CheckReport> {
+        let mut physical = Vec::new();
+        let mut stmt = self.conn.prepare("PRAGMA quick_check")?;
+        for line in stmt.query_map([], |r| r.get::<_, String>(0))? {
+            let line = line?;
+            if line != "ok" {
+                physical.push(line);
+            }
+        }
+        let orphans: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                    r.get(0)
+                })?;
+        if orphans > 0 {
+            physical.push(format!("{orphans} label rows point at missing messages"));
+        }
+
+        let mut logical = self.derived_mismatches()?;
+        if let Err(e) = self.conn.execute(
+            "INSERT INTO messages_fts (messages_fts) VALUES ('integrity-check')",
+            [],
+        ) {
+            logical.push(format!("search index: {e}"));
+        }
+        Ok(CheckReport { physical, logical })
+    }
+
+    /// Describes each summary that disagrees with the messages it's derived from.
+    fn derived_mismatches(&self) -> Result<Vec<String>> {
+        // Each pair: what the summary should hold, and what it holds. Rows in one but not
+        // the other, in either direction, are mismatches.
+        const CHECKS: [(&str, &str, &str); 3] = [
+            (
+                "thread summaries",
+                "SELECT thrid, COUNT(*), SUM(seen = 0), MAX(uid) FROM messages
+                 WHERE uid IS NOT NULL GROUP BY thrid",
+                "SELECT thrid, count, unread, newest_uid FROM threads",
+            ),
+            (
+                "thread labels",
+                "SELECT DISTINCT l.label, m.thrid FROM messages m
+                 JOIN message_labels l ON l.msgid = m.msgid WHERE m.uid IS NOT NULL",
+                "SELECT label, thrid FROM thread_labels",
+            ),
+            (
+                "label totals",
+                "SELECT label, COUNT(*) FROM message_labels GROUP BY label",
+                "SELECT label, count FROM label_stats",
+            ),
+        ];
+        let mut problems = Vec::new();
+        for (name, expected, actual) in CHECKS {
+            let differing: i64 = self.conn.query_row(
+                &format!(
+                    "SELECT (SELECT COUNT(*) FROM ({expected} EXCEPT {actual}))
+                          + (SELECT COUNT(*) FROM ({actual} EXCEPT {expected}))"
+                ),
+                [],
+                |r| r.get(0),
+            )?;
+            if differing > 0 {
+                problems.push(format!("{name}: {differing} rows differ"));
+            }
+        }
+        let total: i64 = self.conn.query_row(
+            "SELECT (SELECT messages FROM cache_totals WHERE id = 1)
+                  != (SELECT COUNT(*) FROM messages WHERE uid IS NOT NULL)",
+            [],
+            |r| r.get(0),
+        )?;
+        if total != 0 {
+            problems.push("message total is wrong".into());
+        }
+        Ok(problems)
+    }
+
+    /// Rebuilds the summaries and the search index from the messages.
+    pub fn repair(&mut self) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        rebuild_derived(&tx)?;
+        tx.commit()?;
+        self.conn.execute(
+            "INSERT INTO messages_fts (messages_fts) VALUES ('rebuild')",
+            [],
+        )?;
+        Ok(())
     }
 
     /// An in-memory cache, for tests.
@@ -260,9 +481,26 @@ impl Store {
     fn init(conn: Connection, body_cap: u64) -> Result<Self> {
         conn.pragma_update(None, "foreign_keys", true)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        let mut store = Self { conn, body_cap };
+        let mut store = Self {
+            conn,
+            body_cap,
+            opened_cleanly: false,
+        };
         store.migrate()?;
+        store.opened_cleanly = store.mark_open()?;
         Ok(store)
+    }
+
+    /// Records that the cache is open. Returns whether it was closed cleanly last time.
+    fn mark_open(&self) -> Result<bool> {
+        let clean: i64 =
+            self.conn
+                .query_row("SELECT clean FROM cache_state WHERE id = 1", [], |r| {
+                    r.get(0)
+                })?;
+        self.conn
+            .execute("UPDATE cache_state SET clean = 0 WHERE id = 1", [])?;
+        Ok(clean == 1)
     }
 
     fn migrate(&mut self) -> Result<()> {
@@ -429,6 +667,24 @@ impl Store {
                     params![msgid, sender_address(&headers)],
                 )?;
             }
+        }
+        if version < 7 {
+            // Duplicate UIDs can't be told apart, so only the oldest keeps its UID. The
+            // others are re-fetched by the next sync. Then the UID index rejects duplicates.
+            tx.execute_batch(
+                "UPDATE messages SET uid = NULL WHERE uid IS NOT NULL
+                     AND msgid NOT IN (SELECT MIN(msgid) FROM messages
+                                       WHERE uid IS NOT NULL GROUP BY uid);
+                 DROP INDEX messages_uid;
+                 CREATE UNIQUE INDEX messages_uid_unique ON messages(uid) WHERE uid IS NOT NULL;
+                 CREATE TABLE cache_state (
+                     id INTEGER PRIMARY KEY CHECK (id = 1),
+                     clean INTEGER NOT NULL
+                 );
+                 INSERT INTO cache_state (id, clean) VALUES (1, 0);",
+            )?;
+            // The UID fix above can change the summaries, so they're rebuilt.
+            rebuild_derived(&tx)?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -1299,6 +1555,9 @@ mod tests {
                  DROP TABLE thread_labels;
                  DROP TABLE cache_totals;
                  DROP INDEX messages_thread;
+                 DROP INDEX messages_uid_unique;
+                 CREATE INDEX messages_uid ON messages(uid);
+                 DROP TABLE cache_state;
                  ALTER TABLE messages DROP COLUMN sent;
                  ALTER TABLE messages DROP COLUMN from_email;
                  PRAGMA user_version = 3;",
@@ -1330,6 +1589,96 @@ mod tests {
             .unwrap();
         assert_eq!(s.get_body(1).unwrap().as_deref(), Some(&b"first body"[..]));
         assert_eq!(s.get_body(2).unwrap().as_deref(), Some(&b"second body"[..]));
+    }
+
+    #[test]
+    fn a_dirty_cache_with_stale_summaries_is_repaired() {
+        let dir = std::env::temp_dir().join(format!("gmail-repair-test-{}", std::process::id()));
+        let path = dir.join("cache.sqlite");
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let mut s = Store::open(&path).unwrap();
+            s.upsert_messages(&[msg(1, 1, &["Work"]), msg(2, 2, &["Work"])])
+                .unwrap();
+        }
+        // Damage a summary, and leave the cache marked as not closed cleanly.
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute("DELETE FROM threads", []).unwrap();
+            raw.execute("UPDATE cache_state SET clean = 0 WHERE id = 1", [])
+                .unwrap();
+        }
+        let (s, notes) = Store::open_checked(&path).unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("thread summaries"));
+        assert_eq!(s.thread_count(&ThreadFilter::All).unwrap(), 2);
+        assert!(s.check().unwrap().logical.is_empty());
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_damaged_cache_is_set_aside_and_a_new_one_started() {
+        let dir = std::env::temp_dir().join(format!("gmail-damage-test-{}", std::process::id()));
+        let path = dir.join("cache.sqlite");
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let mut s = Store::open(&path).unwrap();
+            s.upsert_messages(&[msg(1, 1, &["Work"])]).unwrap();
+        }
+        // Overwrite a page of the file, and mark it as not closed cleanly.
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute("UPDATE cache_state SET clean = 0 WHERE id = 1", [])
+                .unwrap();
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        for b in bytes.iter_mut().skip(4096).take(4096) {
+            *b = 0xFF;
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        let (s, notes) = Store::open_checked(&path).unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("set aside"), "{}", notes[0]);
+        assert_eq!(s.message_total().unwrap(), 0, "the new cache starts empty");
+        let kept: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(kept.iter().any(|n| n.contains(".damaged-")), "{kept:?}");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_backup_copies_the_cache_file() {
+        let dir = std::env::temp_dir().join(format!("gmail-backup-test-{}", std::process::id()));
+        let path = dir.join("cache.sqlite");
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let mut s = Store::open(&path).unwrap();
+            s.upsert_messages(&[msg(1, 1, &["Work"])]).unwrap();
+        }
+        let conn = Connection::open(&path).unwrap();
+        back_up(&conn, &path).unwrap();
+        let copy = dir.join("cache.sqlite.before-migration.bak");
+        assert_eq!(
+            std::fs::metadata(&copy).unwrap().len(),
+            std::fs::metadata(&path).unwrap().len()
+        );
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_uid_index_rejects_a_duplicate_uid() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        s.upsert_messages(&[msg(1, 1, &[])]).unwrap();
+        let err = s.upsert_messages(&[msg(2, 1, &[])]);
+        // The upsert resolves a conflict by msgid, so a second msgid with the same UID
+        // is the case the unique index must refuse.
+        assert!(err.is_err(), "a second message can't take UID 1");
     }
 
     #[test]
