@@ -454,6 +454,29 @@ impl<S: Read + Write> ImapConn<S> {
         Ok(())
     }
 
+    /// Every label (IMAP mailbox) on the account, including labels with no messages.
+    /// System folders and unselectable entries are left out.
+    pub fn list_labels(&mut self) -> Result<Vec<String>> {
+        let resp = self.command("LIST \"\" \"*\"")?;
+        let mut out = Vec::new();
+        for line in &resp.untagged {
+            let text = String::from_utf8_lossy(line);
+            let Some((attrs, name)) = parse_list_line(&text) else {
+                continue;
+            };
+            if attrs.iter().any(|a| a.eq_ignore_ascii_case("\\Noselect")) {
+                continue;
+            }
+            if name.eq_ignore_ascii_case("INBOX") || name.starts_with("[Gmail]") {
+                continue;
+            }
+            out.push(name);
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
     pub fn logout(&mut self) -> Result<()> {
         self.command("LOGOUT")?;
         Ok(())
@@ -470,6 +493,40 @@ fn literal_len(line: &[u8]) -> Option<usize> {
         return None;
     }
     std::str::from_utf8(digits).ok()?.parse().ok()
+}
+
+/// Parses one untagged LIST response: `* LIST (attrs) "delim" name`.
+/// Returns the attributes and the mailbox name.
+pub fn parse_list_line(line: &str) -> Option<(Vec<&str>, String)> {
+    let rest = line.strip_prefix("* LIST (")?;
+    let close = rest.find(')')?;
+    let attrs: Vec<&str> = rest[..close].split_whitespace().collect();
+    let rest = rest[close + 1..].trim_start();
+    let rest = match rest.strip_prefix('"') {
+        Some(r) => &r[r.find('"')? + 1..],
+        None => rest.strip_prefix("NIL")?,
+    };
+    let name = rest.trim();
+    let name = match name.strip_prefix('"') {
+        Some(q) => unescape_quoted(q.strip_suffix('"')?),
+        None => name.to_string(),
+    };
+    Some((attrs, name))
+}
+
+fn unescape_quoted(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Quotes a string for IMAP, escaping `\` and `"`.
@@ -642,5 +699,36 @@ mod idle_tests {
         });
         let mut conn = ImapConn::new(TcpStream::connect(addr).unwrap()).unwrap();
         assert!(conn.idle_poll(Duration::from_millis(200)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod list_tests {
+    use super::*;
+
+    #[test]
+    fn quoted_name_and_attributes() {
+        let (attrs, name) =
+            parse_list_line("* LIST (\\HasNoChildren) \"/\" \"House/HOA\"").unwrap();
+        assert_eq!(attrs, vec!["\\HasNoChildren"]);
+        assert_eq!(name, "House/HOA");
+    }
+
+    #[test]
+    fn unquoted_name_and_nil_delimiter() {
+        let (attrs, name) = parse_list_line("* LIST () NIL INBOX").unwrap();
+        assert!(attrs.is_empty());
+        assert_eq!(name, "INBOX");
+    }
+
+    #[test]
+    fn escaped_quotes_in_names() {
+        let (_, name) = parse_list_line(r#"* LIST () "/" "Say \"hi\"""#).unwrap();
+        assert_eq!(name, r#"Say "hi""#);
+    }
+
+    #[test]
+    fn non_list_lines_are_ignored() {
+        assert!(parse_list_line("* 5 EXISTS").is_none());
     }
 }

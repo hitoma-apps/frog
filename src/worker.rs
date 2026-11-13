@@ -73,6 +73,8 @@ pub enum Event {
         uid: u32,
         raw: Vec<u8>,
     },
+    /// Every label on the account, including ones with no messages.
+    LabelList(Vec<String>),
     Labels {
         updates: Vec<MessageUpdate>,
         command: String,
@@ -599,6 +601,7 @@ impl Worker {
         self.state.limit = limit;
         let info = src.select()?;
         self.begin_mailbox(info);
+        self.report_labels(src)?;
 
         let all = src.search_from(1)?;
         self.state.highest = all.last().copied();
@@ -662,6 +665,19 @@ impl Worker {
         Ok(())
     }
 
+    /// Sends the account's full label list. A failure here doesn't stop the
+    /// mailbox sync, so only a dropped connection is passed on.
+    fn report_labels(&mut self, src: &mut dyn MailSource) -> Result<(), SourceError> {
+        match src.list_labels() {
+            Ok(labels) => self.emit.send(Event::LabelList(labels)),
+            Err(e @ SourceError::Disconnected(_)) => return Err(e),
+            Err(e) => self
+                .emit
+                .send(Event::Error(format!("Could not list labels: {e}"))),
+        }
+        Ok(())
+    }
+
     /// Looks for messages newer than the highest UID we know about, then for
     /// changes to messages we have (labels and read state, via CONDSTORE), and
     /// removals after an expunge.
@@ -670,6 +686,7 @@ impl Worker {
         if self.begin_mailbox(info) {
             return self.op_load(src, self.state.limit);
         }
+        self.report_labels(src)?;
         let Some(highest) = self.state.highest else {
             return self.op_load(src, self.state.limit);
         };
@@ -922,7 +939,7 @@ mod tests {
     fn next_significant(link: &Link) -> Event {
         loop {
             match next(link) {
-                Event::Progress { .. } => continue,
+                Event::Progress { .. } | Event::LabelList(_) => continue,
                 ev => return ev,
             }
         }
@@ -1002,7 +1019,7 @@ mod tests {
                     cached: 6,
                     total: 6,
                 } => break,
-                Event::Body { .. } | Event::Progress { .. } => {}
+                Event::Body { .. } | Event::Progress { .. } | Event::LabelList(_) => {}
                 _ => panic!("unexpected event during background fill"),
             }
         }
@@ -1238,6 +1255,9 @@ mod sync_tests {
         fn changed_since(&mut self, modseq: u64) -> Result<Vec<MessageUpdate>, SourceError> {
             self.inner.changed_since(modseq)
         }
+        fn list_labels(&mut self) -> Result<Vec<String>, SourceError> {
+            self.inner.list_labels()
+        }
         fn supports_idle(&self) -> bool {
             true
         }
@@ -1269,6 +1289,7 @@ mod sync_tests {
             Event::Progress { .. } => "Progress",
             Event::Body { .. } => "Body",
             Event::Labels { .. } => "Labels",
+            Event::LabelList(_) => "LabelList",
             Event::Removed(_) => "Removed",
             Event::IdleState(_) => "IdleState",
             Event::Error(_) => "Error",
@@ -1324,7 +1345,10 @@ mod sync_tests {
             match next(&link) {
                 Event::Labels { updates: u, .. } => updates.extend(u),
                 Event::CheckFinished(_) => break,
-                Event::Body { .. } | Event::Progress { .. } | Event::IdleState(_) => {}
+                Event::Body { .. }
+                | Event::Progress { .. }
+                | Event::LabelList(_)
+                | Event::IdleState(_) => {}
                 other => panic!("unexpected event: {}", name(&other)),
             }
         }
@@ -1359,10 +1383,47 @@ mod sync_tests {
                     assert!(updates[0].labels.contains("Done"));
                     break;
                 }
-                Event::Body { .. } | Event::Progress { .. } | Event::CheckFinished(_) => {}
+                Event::Body { .. }
+                | Event::Progress { .. }
+                | Event::LabelList(_)
+                | Event::CheckFinished(_) => {}
                 other => panic!("unexpected event: {}", name(&other)),
             }
         }
+    }
+
+    #[test]
+    fn the_full_label_list_reaches_the_gui() {
+        let source = MockSource::demo();
+        let pushing = Pushing {
+            inner: source.clone(),
+            script: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut slot = Some(pushing);
+        let link = spawn(
+            egui::Context::default(),
+            Box::new(move || Ok(Box::new(slot.take().unwrap()) as Box<dyn MailSource>)),
+            KEEPALIVE,
+            Duration::from_millis(1),
+            None,
+            Vec::new(),
+        );
+        assert!(matches!(next(&link), Event::Connected));
+        link.commands.send(Command::Load { limit: 500 }).unwrap();
+        let mut saw_list = false;
+        loop {
+            match next(&link) {
+                Event::LabelList(labels) => {
+                    assert!(labels.contains(&"Unused".to_string()), "{labels:?}");
+                    assert!(labels.contains(&"Work/Projects".to_string()), "{labels:?}");
+                    assert!(!labels.iter().any(|l| l.starts_with('\\')), "{labels:?}");
+                    saw_list = true;
+                }
+                Event::LoadFinished => break,
+                _ => {}
+            }
+        }
+        assert!(saw_list, "the label list arrives before the load finishes");
     }
 
     #[test]
@@ -1418,6 +1479,7 @@ mod sync_tests {
                 }
                 Event::Body { .. }
                 | Event::Progress { .. }
+                | Event::LabelList(_)
                 | Event::CheckFinished(_)
                 | Event::IdleState(_)
                 | Event::Labels { .. } => {}

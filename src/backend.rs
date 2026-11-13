@@ -187,6 +187,11 @@ pub trait MailSource: Send {
         labels: &[String],
     ) -> Result<(String, Vec<MessageUpdate>), SourceError>;
 
+    /// Every label on the account, including ones with no messages yet.
+    fn list_labels(&mut self) -> Result<Vec<String>, SourceError> {
+        Ok(Vec::new())
+    }
+
     /// Whether the server reports changes since a modseq (CONDSTORE).
     fn supports_condstore(&self) -> bool {
         false
@@ -421,6 +426,21 @@ impl MockSource {
         }
     }
 
+    /// Labels in the mailbox, including one that has no messages.
+    fn all_labels(&self) -> Vec<String> {
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<String> = st
+            .entries
+            .iter()
+            .flat_map(|e| e.labels.iter().cloned())
+            .collect();
+        out.push("Unused".into());
+        out.retain(|l| !l.starts_with('\\'));
+        out.sort();
+        out.dedup();
+        out
+    }
+
     fn update_of(e: &MockEntry) -> MessageUpdate {
         MessageUpdate {
             uid: e.uid,
@@ -522,6 +542,10 @@ impl MailSource for MockSource {
             }
         }
         Ok((command, updates))
+    }
+
+    fn list_labels(&mut self) -> Result<Vec<String>, SourceError> {
+        Ok(self.all_labels())
     }
 
     fn supports_condstore(&self) -> bool {

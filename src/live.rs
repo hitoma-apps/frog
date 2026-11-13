@@ -157,6 +157,10 @@ impl<S: Read + Write + Send + SetReadTimeout> MailSource for LiveSession<S> {
         Ok((command, updates))
     }
 
+    fn list_labels(&mut self) -> Result<Vec<String>, SourceError> {
+        self.conn.list_labels().map_err(to_source_error)
+    }
+
     fn supports_condstore(&self) -> bool {
         self.condstore
     }

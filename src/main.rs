@@ -162,6 +162,8 @@ struct App {
     messages: BTreeMap<u32, Message>,
     /// Label name to number of messages with it. Kept in step with `messages`.
     counts: BTreeMap<String, usize>,
+    /// Every label on the account, from the server. Includes labels with no cached messages.
+    known_labels: BTreeSet<String>,
     /// UIDs in display order, after the filter. Rebuilt when `view_dirty` is set.
     view: Vec<u32>,
     view_dirty: bool,
@@ -226,6 +228,7 @@ impl App {
             login,
             messages: BTreeMap::new(),
             counts: BTreeMap::new(),
+            known_labels: BTreeSet::new(),
             view: Vec::new(),
             view_dirty: true,
             loading: None,
@@ -360,6 +363,7 @@ impl App {
                 self.view_dirty = true;
             }
             Event::IdleState(on) => self.idle_on = on,
+            Event::LabelList(labels) => self.known_labels = labels.into_iter().collect(),
             Event::NewArrivals(msgs) => {
                 if self.settings.notifications {
                     let items: Vec<notify::NewMail> = msgs
@@ -697,6 +701,7 @@ impl App {
         ui.separator();
         // Clone the counts so the rows can call `&mut self` methods.
         let counts = self.counts.clone();
+        let known = self.known_labels.clone();
         egui::ScrollArea::vertical()
             .id_salt("sidebar")
             .auto_shrink([false, false])
@@ -720,14 +725,19 @@ impl App {
                     self.label_row(ui, key, name, count);
                 }
 
-                let user: Vec<(&String, &usize)> = counts
+                // Labels from the server, plus any seen in the cache, with counts.
+                let mut user: BTreeMap<String, usize> = counts
                     .iter()
                     .filter(|(k, _)| !k.starts_with('\\'))
+                    .map(|(k, c)| (k.clone(), *c))
                     .collect();
+                for label in &known {
+                    user.entry(label.clone()).or_insert(0);
+                }
                 if !user.is_empty() {
                     ui.separator();
                     ui.weak("Labels");
-                    for (k, count) in user {
+                    for (k, count) in &user {
                         self.label_row(ui, Some(k), k, *count);
                     }
                 }
