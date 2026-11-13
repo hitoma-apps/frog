@@ -25,7 +25,7 @@ pub const DEFAULT_BODY_CAP: u64 = 1 << 30;
 /// zstd level. Mail is text, so a low level compresses well and stays fast.
 const ZSTD_LEVEL: i32 = 3;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -96,6 +96,8 @@ pub struct CachedMessage {
     pub uid: Option<u32>,
     pub labels: BTreeSet<String>,
     pub from: String,
+    /// The sender's address, as the message gives it. Empty if there isn't one.
+    pub from_email: String,
     pub subject: String,
     pub date: String,
     /// The sent time (Unix seconds) from the Date header, or 0 if there isn't one.
@@ -214,12 +216,27 @@ fn cached_from_row(r: &rusqlite::Row) -> rusqlite::Result<CachedMessage> {
         uid: r.get(2)?,
         labels: BTreeSet::new(),
         from: r.get(3)?,
+        from_email: r.get(8)?,
         subject: r.get(4)?,
         date: r.get(5)?,
         headers: Vec::new(),
         seen: r.get(6)?,
         sent: r.get(7)?,
     })
+}
+
+/// The sender's address from a header block's From line, lowercased. Empty if there
+/// isn't one.
+pub fn sender_address(headers: &[u8]) -> String {
+    mail_parser::MessageParser::default()
+        .parse(headers)
+        .and_then(|m| {
+            m.from()
+                .and_then(|a| a.first())
+                .and_then(|a| a.address())
+                .map(str::to_lowercase)
+        })
+        .unwrap_or_default()
 }
 
 fn to_i64(v: u64) -> Result<i64> {
@@ -396,6 +413,23 @@ impl Store {
                      JOIN message_labels l ON l.msgid = m.msgid WHERE m.uid IS NOT NULL;",
             )?;
         }
+        if version < 6 {
+            // The sender's address, filled in from the stored headers once.
+            tx.execute_batch(
+                "ALTER TABLE messages ADD COLUMN from_email TEXT NOT NULL DEFAULT '';",
+            )?;
+            let rows: Vec<(i64, Vec<u8>)> = {
+                let mut stmt = tx.prepare("SELECT msgid, headers FROM messages")?;
+                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<std::result::Result<_, _>>()?
+            };
+            for (msgid, headers) in rows {
+                tx.execute(
+                    "UPDATE messages SET from_email = ?2 WHERE msgid = ?1",
+                    params![msgid, sender_address(&headers)],
+                )?;
+            }
+        }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
@@ -446,13 +480,14 @@ impl Store {
             }
             affected.insert(m.thrid);
             tx.execute(
-                "INSERT INTO messages (msgid, thrid, uid, from_addr, subject, date, headers, seen, sent)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "INSERT INTO messages (msgid, thrid, uid, from_addr, subject, date, headers, seen, sent, from_email)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(msgid) DO UPDATE SET
                      thrid = excluded.thrid, uid = excluded.uid,
                      from_addr = excluded.from_addr, subject = excluded.subject,
                      date = excluded.date, headers = excluded.headers,
-                     seen = excluded.seen, sent = excluded.sent",
+                     seen = excluded.seen, sent = excluded.sent,
+                     from_email = excluded.from_email",
                 params![
                     msgid,
                     to_i64(m.thrid)?,
@@ -462,7 +497,8 @@ impl Store {
                     m.date,
                     m.headers,
                     m.seen,
-                    m.sent
+                    m.sent,
+                    m.from_email
                 ],
             )?;
             tx.execute(
@@ -568,7 +604,7 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<ThreadSummary>> {
         const COLUMNS: &str = "t.thrid, t.count, t.unread, m.msgid, m.thrid, m.uid,
-                               m.from_addr, m.subject, m.date, m.seen, m.sent";
+                               m.from_addr, m.subject, m.date, m.seen, m.sent, m.from_email";
         let (limit, offset) = (limit as i64, offset as i64);
         let rows: Vec<(u64, usize, usize, CachedMessage)> = match filter {
             ThreadFilter::All => {
@@ -638,6 +674,7 @@ impl Store {
                     uid: r.get(5)?,
                     labels: BTreeSet::new(),
                     from: r.get(6)?,
+                    from_email: r.get(11)?,
                     subject: r.get(7)?,
                     date: r.get(8)?,
                     headers: Vec::new(),
@@ -660,13 +697,13 @@ impl Store {
         // The header blocks are read too: a conversation is read in full, and they carry
         // the authentication results.
         let mut stmt = self.conn.prepare_cached(
-            "SELECT msgid, thrid, uid, from_addr, subject, date, seen, sent, headers FROM messages
+            "SELECT msgid, thrid, uid, from_addr, subject, date, seen, sent, from_email, headers FROM messages
              WHERE thrid = ?1 AND uid IS NOT NULL ORDER BY uid DESC",
         )?;
         let mut out = stmt
             .query_map(params![to_i64(thrid)?], |r| {
                 let mut m = cached_from_row(r)?;
-                m.headers = r.get(8)?;
+                m.headers = r.get(9)?;
                 Ok(m)
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -702,7 +739,7 @@ impl Store {
     /// `None`), newest first. Walking pages down the cache lists all of it.
     pub fn list_page(&self, before: Option<u32>, limit: usize) -> Result<Vec<CachedMessage>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT msgid, thrid, uid, from_addr, subject, date, seen, sent FROM messages
+            "SELECT msgid, thrid, uid, from_addr, subject, date, seen, sent, from_email FROM messages
              WHERE uid IS NOT NULL AND (?1 IS NULL OR uid < ?1)
              ORDER BY uid DESC LIMIT ?2",
         )?;
@@ -713,6 +750,7 @@ impl Store {
                 uid: r.get(2)?,
                 labels: BTreeSet::new(),
                 from: r.get(3)?,
+                from_email: r.get(8)?,
                 subject: r.get(4)?,
                 date: r.get(5)?,
                 headers: Vec::new(),
@@ -799,11 +837,11 @@ impl Store {
     pub fn list_messages(&self, label: Option<&str>, limit: usize) -> Result<Vec<CachedMessage>> {
         let sql = match label {
             None => {
-                "SELECT msgid, thrid, uid, from_addr, subject, date, seen, sent FROM messages
+                "SELECT msgid, thrid, uid, from_addr, subject, date, seen, sent, from_email FROM messages
                  WHERE uid IS NOT NULL ORDER BY uid DESC LIMIT ?2"
             }
             Some(_) => {
-                "SELECT msgid, thrid, uid, from_addr, subject, date, seen, sent FROM messages
+                "SELECT msgid, thrid, uid, from_addr, subject, date, seen, sent, from_email FROM messages
                  WHERE uid IS NOT NULL
                    AND EXISTS (SELECT 1 FROM message_labels l
                                WHERE l.msgid = messages.msgid AND l.label = ?1)
@@ -818,6 +856,7 @@ impl Store {
                 uid: r.get(2)?,
                 labels: BTreeSet::new(),
                 from: r.get(3)?,
+                from_email: r.get(8)?,
                 subject: r.get(4)?,
                 date: r.get(5)?,
                 headers: Vec::new(),
@@ -946,6 +985,7 @@ mod tests {
             subject: format!("Hello {uid}"),
             date: "Tue, 10 Nov 2026 09:30:00 +0000".into(),
             sent: 1_794_303_000 + i64::from(uid),
+            from_email: format!("sender{uid}@example.com"),
             headers: format!("Subject: Hello {uid}\r\n\r\n").into_bytes(),
             seen: false,
         }
@@ -1227,7 +1267,7 @@ mod tests {
     fn migrating_from_v3_builds_every_summary() {
         let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
         let mut m = msg(1, 1, &["Work"]);
-        m.headers = b"Date: Tue, 10 Nov 2026 09:30:00 +0000\r\nSubject: Hello 1\r\n\r\n".to_vec();
+        m.headers = b"From: Alice <Alice@Example.ORG>\r\nDate: Tue, 10 Nov 2026 09:30:00 +0000\r\nSubject: Hello 1\r\n\r\n".to_vec();
         m.sent = 0;
         s.upsert_messages(&[m]).unwrap();
         // Put the database back in its v3 shape: none of the v4 or v5 additions.
@@ -1245,6 +1285,7 @@ mod tests {
                  DROP TABLE cache_totals;
                  DROP INDEX messages_thread;
                  ALTER TABLE messages DROP COLUMN sent;
+                 ALTER TABLE messages DROP COLUMN from_email;
                  PRAGMA user_version = 3;",
             )
             .unwrap();
@@ -1252,6 +1293,10 @@ mod tests {
         assert_eq!(s.list_page(None, 10).unwrap()[0].sent, 1_794_303_000);
         assert_eq!(s.thread_count(&ThreadFilter::All).unwrap(), 1);
         assert_eq!(s.message_total().unwrap(), 1);
+        assert_eq!(
+            s.list_page(None, 10).unwrap()[0].from_email,
+            "alice@example.org"
+        );
         assert_eq!(
             s.thread_page(&ThreadFilter::Search("hello".into()), 0, 5)
                 .unwrap()
@@ -1380,6 +1425,7 @@ mod bulk_timing {
                     uid: Some(uid as u32),
                     labels: labels.clone(),
                     from: "a@example.com".into(),
+                    from_email: "a@example.com".into(),
                     subject: "Something".into(),
                     date: "Tue, 10 Nov 2026 09:30:00 +0000".into(),
                     headers: headers.clone(),

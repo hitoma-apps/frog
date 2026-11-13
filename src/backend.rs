@@ -83,6 +83,8 @@ pub struct Message {
     /// Whether the message has been read.
     pub seen: bool,
     pub from: String,
+    /// The sender's address, lowercased. Empty if the message has none.
+    pub from_email: String,
     pub subject: String,
     pub date: String,
     /// When the message was sent, as a Unix timestamp. 0 if the Date header is missing.
@@ -111,6 +113,13 @@ impl Message {
             .as_ref()
             .and_then(|m| m.date())
             .map_or(0, |d| d.to_timestamp());
+        let from_email = parsed
+            .as_ref()
+            .and_then(|m| m.from())
+            .and_then(|a| a.first())
+            .and_then(|a| a.address())
+            .map(str::to_lowercase)
+            .unwrap_or_default();
         let (from, subject, date) = match &parsed {
             Some(m) => (
                 m.from()
@@ -134,6 +143,7 @@ impl Message {
             labels: labels.into_iter().collect(),
             seen,
             from,
+            from_email,
             subject,
             date,
             sent,
@@ -151,6 +161,7 @@ impl Message {
             uid: Some(self.uid),
             labels: self.labels.clone(),
             from: self.from.clone(),
+            from_email: self.from_email.clone(),
             subject: self.subject.clone(),
             date: self.date.clone(),
             sent: self.sent,
@@ -171,6 +182,7 @@ impl Message {
             labels: c.labels,
             seen: c.seen,
             from: c.from,
+            from_email: c.from_email,
             subject: c.subject,
             date: c.date,
             sent: c.sent,

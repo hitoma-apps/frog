@@ -135,6 +135,26 @@ fn sender_color(from: &str) -> egui::Color32 {
     SENDER_COLORS[sender_slot(from)]
 }
 
+/// What a sender's colour is keyed on: the address when there is one. A display name
+/// can be anything, so a name that copies a known sender's doesn't get that sender's colour.
+fn sender_key(m: &Message) -> &str {
+    if m.from_email.is_empty() {
+        &m.from
+    } else {
+        &m.from_email
+    }
+}
+
+/// The sender as "Name <address>", so the address is in view next to the name. Only the
+/// name is shown when there's no address, or when the name is the address.
+fn sender_line(m: &Message) -> String {
+    if m.from_email.is_empty() || m.from.eq_ignore_ascii_case(&m.from_email) {
+        m.from.clone()
+    } else {
+        format!("{} <{}>", m.from, m.from_email)
+    }
+}
+
 /// Gap between the items of a row.
 const ROW_GAP: f32 = 4.0;
 /// Width of the checkbox column, on the far left of every row.
@@ -1182,7 +1202,10 @@ impl App {
                                 )
                             })
                             .inner;
-                        if title.on_hover_text(format!("thread {thrid}")).clicked() {
+                        if title
+                            .on_hover_text(format!("{}\nthread {thrid}", sender_line(m)))
+                            .clicked()
+                        {
                             opened = Some(thrid);
                         }
 
@@ -1325,7 +1348,7 @@ impl App {
                     let Some(m) = self.thread_msgs.get(&uid) else {
                         continue;
                     };
-                    let title = format!("{} — {}   {}", m.from, m.subject, m.date);
+                    let title = format!("{} — {}   {}", sender_line(m), m.subject, m.date);
                     // The accent colours each message's header line and its bar. Bodies keep the
                     // normal text colour, so header and body read as separate.
                     let accent = ui.visuals().hyperlink_color;
@@ -1386,7 +1409,9 @@ impl App {
                                                     ui.label("Loading message…");
                                                     ui.monospace(format!(
                                                         "From:    {}\nSubject: {}\nDate:    {}",
-                                                        m.from, m.subject, m.date
+                                                        sender_line(m),
+                                                        m.subject,
+                                                        m.date
                                                     ));
                                                 }
                                             }
@@ -1400,14 +1425,14 @@ impl App {
                     let sender_bar = egui::Rect::from_min_size(r.min, egui::vec2(ACCENT_WIDTH, h));
                     let accent_bar = sender_bar.translate(egui::vec2(ACCENT_WIDTH + 2.0, 0.0));
                     ui.painter()
-                        .rect_filled(sender_bar, 2.0, sender_color(&m.from));
+                        .rect_filled(sender_bar, 2.0, sender_color(sender_key(m)));
                     ui.painter().rect_filled(accent_bar, 2.0, accent);
                     ui.interact(
                         sender_bar,
                         ui.scope_id().with(("sender", uid)),
                         egui::Sense::hover(),
                     )
-                    .on_hover_text(&m.from);
+                    .on_hover_text(sender_line(m));
                 }
             });
         if pending.is_some() {
@@ -1598,6 +1623,23 @@ mod tests {
         assert!(sender_slot("Alice Smith") < SENDER_COLORS.len());
         // The hash is fixed, so a sender's colour doesn't change between runs.
         assert_eq!(sender_slot(""), (0xcbf2_9ce4_8422_2325u64 % 8) as usize);
+    }
+
+    #[test]
+    fn the_sender_key_is_the_address_when_there_is_one() {
+        let mut m = message_with(&[]);
+        m.from = "Alice Smith".into();
+        m.from_email = "alice@example.com".into();
+        assert_eq!(sender_key(&m), "alice@example.com");
+        // A spoofed name with a different address gets a different key.
+        let mut spoof = message_with(&[]);
+        spoof.from = "Alice Smith".into();
+        spoof.from_email = "alice@evil.example".into();
+        assert_ne!(sender_key(&m), sender_key(&spoof));
+        assert_eq!(sender_line(&m), "Alice Smith <alice@example.com>");
+        m.from_email = String::new();
+        assert_eq!(sender_key(&m), "Alice Smith");
+        assert_eq!(sender_line(&m), "Alice Smith");
     }
 
     #[test]
