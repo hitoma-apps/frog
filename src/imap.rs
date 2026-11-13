@@ -6,8 +6,9 @@
 
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
+use std::time::Duration;
 
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
@@ -17,6 +18,8 @@ use crate::labels::{LabelAction, LabelRef, uid_store_labels};
 #[derive(Debug)]
 pub enum ImapError {
     Io(io::Error),
+    /// The server closed the connection.
+    Closed,
     Tls(String),
     /// Tagged `NO` response.
     No(String),
@@ -30,6 +33,7 @@ impl fmt::Display for ImapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ImapError::Io(e) => write!(f, "I/O error: {e}"),
+            ImapError::Closed => write!(f, "connection closed by server"),
             ImapError::Tls(e) => write!(f, "TLS error: {e}"),
             ImapError::No(e) => write!(f, "server refused: {e}"),
             ImapError::Bad(e) => write!(f, "server rejected command: {e}"),
@@ -63,6 +67,11 @@ pub struct Selected {
 }
 
 /// Opens a TLS connection to `host:port` and reads the server greeting.
+/// How long to wait for the TCP connection to open.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long any single read or write may stall before the connection is treated as dead.
+pub const IO_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub fn connect_tls(
     host: &str,
     port: u16,
@@ -75,7 +84,13 @@ pub fn connect_tls(
     let name = ServerName::try_from(host.to_string()).map_err(|e| ImapError::Tls(e.to_string()))?;
     let conn =
         ClientConnection::new(Arc::new(config), name).map_err(|e| ImapError::Tls(e.to_string()))?;
-    let tcp = TcpStream::connect((host, port))?;
+    let addr = (host, port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| ImapError::Protocol(format!("no address for {host}")))?;
+    let tcp = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
+    tcp.set_read_timeout(Some(IO_TIMEOUT))?;
+    tcp.set_write_timeout(Some(IO_TIMEOUT))?;
     ImapConn::new(StreamOwned::new(conn, tcp))
 }
 
@@ -112,7 +127,7 @@ impl<S: Read + Write> ImapConn<S> {
     fn read_line(&mut self) -> Result<Vec<u8>> {
         let mut line = Vec::new();
         if self.reader.read_until(b'\n', &mut line)? == 0 {
-            return Err(ImapError::Protocol("connection closed by server".into()));
+            return Err(ImapError::Closed);
         }
         Ok(line)
     }
@@ -255,6 +270,12 @@ impl<S: Read + Write> ImapConn<S> {
         Ok(cmd)
     }
 
+    /// Does nothing on the server, but keeps the connection from going idle.
+    pub fn noop(&mut self) -> Result<()> {
+        self.command("NOOP")?;
+        Ok(())
+    }
+
     pub fn logout(&mut self) -> Result<()> {
         self.command("LOGOUT")?;
         Ok(())
@@ -328,5 +349,51 @@ mod select_tests {
     #[test]
     fn no_uidvalidity_is_none() {
         assert_eq!(parse_uidvalidity("* 3 EXISTS"), None);
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    #[test]
+    fn silent_server_times_out_instead_of_hanging() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept and then say nothing.
+        std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_secs(5));
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        match ImapConn::new(stream) {
+            Err(ImapError::Io(e)) => assert!(matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            )),
+            _ => panic!("expected a timeout error"),
+        }
+    }
+
+    #[test]
+    fn closed_connection_is_reported_as_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            s.write_all(b"* OK hi\r\n").unwrap();
+            // Drop the connection after the greeting.
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut conn = ImapConn::new(stream).unwrap();
+        assert!(matches!(
+            conn.noop(),
+            Err(ImapError::Closed) | Err(ImapError::Io(_))
+        ));
     }
 }

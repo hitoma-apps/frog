@@ -62,6 +62,8 @@ struct App {
     link: Option<Link>,
     connecting: bool,
     connected: bool,
+    /// The connection dropped and the worker is reconnecting.
+    reconnecting: bool,
     login: LoginForm,
 
     messages: Vec<Message>,
@@ -94,6 +96,7 @@ impl App {
             link: None,
             connecting: false,
             connected: false,
+            reconnecting: false,
             login: LoginForm::default(),
             messages: Vec::new(),
             loading: None,
@@ -163,6 +166,11 @@ impl App {
                 self.rendered = None;
                 self.open = None;
                 self.checked.clear();
+            }
+            Event::Reconnecting => self.reconnecting = true,
+            Event::Reconnected => {
+                self.reconnecting = false;
+                self.status = None;
             }
             Event::LoadStarted { total } => self.loading = Some((0, total)),
             Event::Batch(msgs) => {
@@ -348,6 +356,10 @@ impl App {
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
+            if self.reconnecting {
+                ui.spinner();
+                ui.colored_label(egui::Color32::YELLOW, "Connection lost. Reconnecting…");
+            }
             if let Some((loaded, total)) = self.loading {
                 ui.spinner();
                 if total == 0 {

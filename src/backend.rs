@@ -8,6 +8,35 @@ use std::collections::BTreeSet;
 use gmail_imap_proto::labels::{LabelAction, LabelRef, SystemLabel, uid_store_labels};
 use mail_parser::MessageParser;
 
+/// Why a mail operation failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceError {
+    /// The connection is gone. The worker can reconnect and retry.
+    Disconnected(String),
+    /// Anything else. Retrying the same request won't help.
+    Failed(String),
+}
+
+impl std::fmt::Display for SourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SourceError::Disconnected(m) | SourceError::Failed(m) => f.write_str(m),
+        }
+    }
+}
+
+impl From<String> for SourceError {
+    fn from(s: String) -> Self {
+        SourceError::Failed(s)
+    }
+}
+
+impl From<&str> for SourceError {
+    fn from(s: &str) -> Self {
+        SourceError::Failed(s.to_string())
+    }
+}
+
 /// One message as the GUI sees it. Headers are loaded with the list; the full
 /// body is loaded on demand.
 #[derive(Clone, Debug)]
@@ -75,13 +104,15 @@ pub type LabelUpdates = Vec<(u32, BTreeSet<String>)>;
 /// Everything the worker needs from a mailbox.
 pub trait MailSource: Send {
     /// Selects All Mail and returns its UIDVALIDITY.
-    fn select(&mut self) -> Result<u32, String>;
+    fn select(&mut self) -> Result<u32, SourceError>;
+    /// Keeps the connection alive. Does nothing else.
+    fn noop(&mut self) -> Result<(), SourceError>;
     /// UIDs at least `start`, ascending.
-    fn search_from(&mut self, start: u32) -> Result<Vec<u32>, String>;
+    fn search_from(&mut self, start: u32) -> Result<Vec<u32>, SourceError>;
     /// Header-only listing entries, in the order the server returns them.
-    fn fetch_headers(&mut self, uids: &[u32]) -> Result<Vec<Message>, String>;
+    fn fetch_headers(&mut self, uids: &[u32]) -> Result<Vec<Message>, SourceError>;
     /// The full RFC 5322 message.
-    fn fetch_body(&mut self, uid: u32) -> Result<Vec<u8>, String>;
+    fn fetch_body(&mut self, uid: u32) -> Result<Vec<u8>, SourceError>;
     /// Applies a label change. Returns the command for the log and the
     /// labels of each affected UID afterwards.
     fn modify_labels(
@@ -89,7 +120,7 @@ pub trait MailSource: Send {
         uids: &[u32],
         action: LabelAction,
         labels: &[String],
-    ) -> Result<(String, LabelUpdates), String>;
+    ) -> Result<(String, LabelUpdates), SourceError>;
 }
 
 /// Maps label names to IMAP label references, recognizing system labels.
@@ -207,11 +238,15 @@ impl MockSource {
 }
 
 impl MailSource for MockSource {
-    fn select(&mut self) -> Result<u32, String> {
+    fn select(&mut self) -> Result<u32, SourceError> {
         Ok(1)
     }
 
-    fn search_from(&mut self, start: u32) -> Result<Vec<u32>, String> {
+    fn noop(&mut self) -> Result<(), SourceError> {
+        Ok(())
+    }
+
+    fn search_from(&mut self, start: u32) -> Result<Vec<u32>, SourceError> {
         let mut uids: Vec<u32> = self
             .entries
             .iter()
@@ -222,7 +257,7 @@ impl MailSource for MockSource {
         Ok(uids)
     }
 
-    fn fetch_headers(&mut self, uids: &[u32]) -> Result<Vec<Message>, String> {
+    fn fetch_headers(&mut self, uids: &[u32]) -> Result<Vec<Message>, SourceError> {
         Ok(uids
             .iter()
             .filter_map(|&uid| self.entries.iter().find(|e| e.uid == uid))
@@ -238,12 +273,12 @@ impl MailSource for MockSource {
             .collect())
     }
 
-    fn fetch_body(&mut self, uid: u32) -> Result<Vec<u8>, String> {
+    fn fetch_body(&mut self, uid: u32) -> Result<Vec<u8>, SourceError> {
         self.entries
             .iter()
             .find(|e| e.uid == uid)
             .map(|e| e.raw.clone())
-            .ok_or_else(|| format!("no message with UID {uid}"))
+            .ok_or_else(|| format!("no message with UID {uid}").into())
     }
 
     fn modify_labels(
@@ -251,7 +286,7 @@ impl MailSource for MockSource {
         uids: &[u32],
         action: LabelAction,
         labels: &[String],
-    ) -> Result<(String, LabelUpdates), String> {
+    ) -> Result<(String, LabelUpdates), SourceError> {
         let found: Vec<u32> = uids
             .iter()
             .copied()

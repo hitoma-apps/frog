@@ -2,11 +2,11 @@
 
 use std::io::{Read, Write};
 
-use gmail_imap_proto::imap::{ImapConn, connect_tls};
+use gmail_imap_proto::imap::{ImapConn, ImapError, connect_tls};
 use gmail_imap_proto::labels::LabelAction;
 use gmail_imap_proto::parse_gmail_fetch;
 
-use crate::backend::{LabelUpdates, MailSource, Message, label_refs};
+use crate::backend::{LabelUpdates, MailSource, Message, SourceError, label_refs};
 
 /// Gmail's All Mail folder holds every message, whatever its labels.
 pub const ALL_MAIL: &str = "[Gmail]/All Mail";
@@ -33,38 +33,46 @@ impl<S: Read + Write> LiveSession<S> {
         })
     }
 
-    fn ensure_selected(&mut self) -> Result<(), String> {
+    fn ensure_selected(&mut self) -> Result<(), SourceError> {
         if !self.selected {
-            self.conn.select(ALL_MAIL).map_err(|e| e.to_string())?;
+            self.conn.select(ALL_MAIL).map_err(to_source_error)?;
             self.selected = true;
         }
         Ok(())
     }
 }
 
+/// A dropped or timed-out connection can be retried. Everything else can't.
+fn to_source_error(e: ImapError) -> SourceError {
+    match e {
+        ImapError::Io(_) | ImapError::Closed => SourceError::Disconnected(e.to_string()),
+        other => SourceError::Failed(other.to_string()),
+    }
+}
+
 impl<S: Read + Write + Send> MailSource for LiveSession<S> {
-    fn select(&mut self) -> Result<u32, String> {
-        let sel = self.conn.select(ALL_MAIL).map_err(|e| e.to_string())?;
+    fn select(&mut self) -> Result<u32, SourceError> {
+        let sel = self.conn.select(ALL_MAIL).map_err(to_source_error)?;
         self.selected = true;
         Ok(sel.uidvalidity)
     }
 
-    fn search_from(&mut self, start: u32) -> Result<Vec<u32>, String> {
-        self.ensure_selected()?;
-        self.conn.uid_search_from(start).map_err(|e| e.to_string())
+    fn noop(&mut self) -> Result<(), SourceError> {
+        self.conn.noop().map_err(to_source_error)
     }
 
-    fn fetch_headers(&mut self, uids: &[u32]) -> Result<Vec<Message>, String> {
+    fn search_from(&mut self, start: u32) -> Result<Vec<u32>, SourceError> {
+        self.ensure_selected()?;
+        self.conn.uid_search_from(start).map_err(to_source_error)
+    }
+
+    fn fetch_headers(&mut self, uids: &[u32]) -> Result<Vec<Message>, SourceError> {
         self.ensure_selected()?;
         let mut out = Vec::with_capacity(uids.len());
         for chunk in uids.chunks(FETCH_CHUNK) {
             let items = "UID X-GM-MSGID X-GM-THRID X-GM-LABELS BODY.PEEK[HEADER]";
-            for raw in self
-                .conn
-                .uid_fetch(chunk, items)
-                .map_err(|e| e.to_string())?
-            {
-                let f = parse_gmail_fetch(&raw).map_err(|e| e.to_string())?;
+            for raw in self.conn.uid_fetch(chunk, items).map_err(to_source_error)? {
+                let f = parse_gmail_fetch(&raw).map_err(|e| SourceError::Failed(e.to_string()))?;
                 let (Some(uid), Some(msgid)) = (f.uid, f.msgid) else {
                     continue;
                 };
@@ -81,19 +89,21 @@ impl<S: Read + Write + Send> MailSource for LiveSession<S> {
         Ok(out)
     }
 
-    fn fetch_body(&mut self, uid: u32) -> Result<Vec<u8>, String> {
+    fn fetch_body(&mut self, uid: u32) -> Result<Vec<u8>, SourceError> {
         self.ensure_selected()?;
         for raw in self
             .conn
             .uid_fetch(&[uid], "BODY.PEEK[]")
-            .map_err(|e| e.to_string())?
+            .map_err(to_source_error)?
         {
-            let f = parse_gmail_fetch(&raw).map_err(|e| e.to_string())?;
+            let f = parse_gmail_fetch(&raw).map_err(|e| SourceError::Failed(e.to_string()))?;
             if let Some(body) = f.body {
                 return Ok(body.to_vec());
             }
         }
-        Err(format!("server returned no body for UID {uid}"))
+        Err(SourceError::Failed(format!(
+            "server returned no body for UID {uid}"
+        )))
     }
 
     fn modify_labels(
@@ -101,21 +111,21 @@ impl<S: Read + Write + Send> MailSource for LiveSession<S> {
         uids: &[u32],
         action: LabelAction,
         labels: &[String],
-    ) -> Result<(String, LabelUpdates), String> {
+    ) -> Result<(String, LabelUpdates), SourceError> {
         self.ensure_selected()?;
         let command = self
             .conn
             .uid_store(uids, action, &label_refs(labels))
-            .map_err(|e| e.to_string())?;
+            .map_err(to_source_error)?;
 
         // Re-read labels so the view matches the server, not our guess.
         let mut updates = Vec::new();
         for raw in self
             .conn
             .uid_fetch(uids, "UID X-GM-LABELS")
-            .map_err(|e| e.to_string())?
+            .map_err(to_source_error)?
         {
-            let f = parse_gmail_fetch(&raw).map_err(|e| e.to_string())?;
+            let f = parse_gmail_fetch(&raw).map_err(|e| SourceError::Failed(e.to_string()))?;
             if let Some(uid) = f.uid {
                 updates.push((uid, f.labels.into_iter().collect()));
             }
@@ -223,6 +233,7 @@ mod tests {
                 "* 3 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 42] UIDs valid\r\n{tag} OK [READ-WRITE] SELECT completed\r\n"
             ),
             c if c.starts_with("UID STORE") => format!("{tag} OK STORE completed\r\n"),
+            "NOOP" => format!("{tag} OK NOOP completed\r\n"),
             "LOGOUT" => format!("* BYE bye\r\n{tag} OK LOGOUT completed\r\n"),
             _ => format!("{tag} BAD unknown command\r\n"),
         }
