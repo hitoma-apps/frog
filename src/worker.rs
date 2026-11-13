@@ -189,6 +189,9 @@ struct State {
     uidvalidity: Option<u32>,
     /// Highest UID known to exist.
     highest: Option<u32>,
+    /// Where the background show of cached headers continues: the next page is
+    /// those with UID below this. `None` when the GUI has them all.
+    show_cursor: Option<u32>,
     /// Last synced HIGHESTMODSEQ, for CONDSTORE. `None` until the server reports one.
     modseq: Option<u64>,
     /// An expunge was seen, so the next check must reconcile UIDs.
@@ -300,7 +303,9 @@ impl Worker {
     }
 
     fn idle_work_pending(&self) -> bool {
-        !self.state.pending_headers.is_empty() || !self.state.prefetch.is_empty()
+        !self.state.pending_headers.is_empty()
+            || !self.state.prefetch.is_empty()
+            || self.state.show_cursor.is_some()
     }
 
     /// Runs `f` with the source taken out of the worker. A dropped connection is
@@ -354,6 +359,10 @@ impl Worker {
     /// One unit of background work: a batch of headers if any are pending,
     /// otherwise one body.
     fn idle_step(&mut self) {
+        if self.state.show_cursor.is_some() {
+            self.show_next_page();
+            return;
+        }
         let result = self.with_source(|w, src| {
             if w.state.pending_headers.is_empty() {
                 w.op_prefetch_one(src)
@@ -440,6 +449,7 @@ impl Worker {
             self.state.cached = 0;
             self.state.highest = None;
             self.state.modseq = None;
+            self.state.show_cursor = None;
             self.emit.send(Event::Reset);
         }
 
@@ -619,6 +629,12 @@ impl Worker {
             total: limit.min(all.len()),
         });
         let shown = self.cached_messages(limit);
+        // If the cache holds more, the rest are shown in the background.
+        self.state.show_cursor = if shown.len() >= limit {
+            shown.last().map(|m| m.uid)
+        } else {
+            None
+        };
         if !shown.is_empty() {
             self.emit.send(Event::Batch(shown));
         }
@@ -793,6 +809,33 @@ impl Worker {
         }
         self.emit_progress();
         Ok(())
+    }
+
+    /// Sends the next page of cached headers to the GUI, continuing down the cache.
+    fn show_next_page(&mut self) {
+        let Some(cursor) = self.state.show_cursor.take() else {
+            return;
+        };
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        match store.list_page(Some(cursor), BATCH) {
+            Ok(page) => {
+                let full = page.len() == BATCH;
+                let last = page.last().and_then(|c| c.uid);
+                let msgs: Vec<Message> =
+                    page.into_iter().filter_map(Message::from_cached).collect();
+                if full {
+                    self.state.show_cursor = last;
+                }
+                if !msgs.is_empty() {
+                    self.emit.send(Event::Batch(msgs));
+                }
+            }
+            Err(e) => self
+                .emit
+                .send(Event::Error(format!("cache read failed: {e}"))),
+        }
     }
 
     /// Fetches the next batch of pending headers. On failure the batch goes back
@@ -1122,6 +1165,60 @@ mod tests {
             _ => panic!("expected the cached batch first"),
         }
         assert!(matches!(next_significant(&second), Event::LoadFinished));
+        drop(second);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cached_headers_beyond_the_first_page_reach_the_gui() {
+        let dir =
+            std::env::temp_dir().join(format!("gmail-worker-page-test-{}", std::process::id()));
+        let path = dir.join("cache.sqlite");
+        let _ = std::fs::remove_file(&path);
+
+        // First session: cache all six headers.
+        let first = spawn(
+            egui::Context::default(),
+            Box::new(|| Ok(Box::new(MockSource::demo()) as Box<dyn MailSource>)),
+            KEEPALIVE,
+            FAST,
+            Some(Store::open(&path).unwrap()),
+            Vec::new(),
+        );
+        assert!(matches!(next_significant(&first), Event::Connected));
+        first.commands.send(Command::Load { limit: 500 }).unwrap();
+        loop {
+            if matches!(
+                next(&first),
+                Event::Progress {
+                    cached: 6,
+                    total: 6
+                }
+            ) {
+                break;
+            }
+        }
+        drop(first);
+
+        // Second session: a page of two, then the rest from the cache in the background.
+        let second = spawn(
+            egui::Context::default(),
+            Box::new(|| Ok(Box::new(MockSource::demo()) as Box<dyn MailSource>)),
+            KEEPALIVE,
+            FAST,
+            Some(Store::open(&path).unwrap()),
+            Vec::new(),
+        );
+        assert!(matches!(next_significant(&second), Event::Connected));
+        second.commands.send(Command::Load { limit: 2 }).unwrap();
+        let mut shown: Vec<u32> = Vec::new();
+        while shown.len() < 6 {
+            if let Event::Batch(m) = next_significant(&second) {
+                shown.extend(m.iter().map(|x| x.uid));
+            }
+        }
+        shown.sort_unstable();
+        assert_eq!(shown, vec![1, 2, 3, 4, 5, 6]);
         drop(second);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -293,6 +293,36 @@ impl Store {
         Ok(())
     }
 
+    /// One page of cached headers with UID below `before` (or the newest, if
+    /// `None`), newest first. Walking pages down the cache lists all of it.
+    pub fn list_page(&self, before: Option<u32>, limit: usize) -> Result<Vec<CachedMessage>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT msgid, thrid, uid, from_addr, subject, date, headers, seen FROM messages
+             WHERE uid IS NOT NULL AND (?1 IS NULL OR uid < ?1)
+             ORDER BY uid DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![before, limit as i64], |r| {
+            Ok(CachedMessage {
+                msgid: r.get::<_, i64>(0)? as u64,
+                thrid: r.get::<_, i64>(1)? as u64,
+                uid: r.get(2)?,
+                labels: BTreeSet::new(),
+                from: r.get(3)?,
+                subject: r.get(4)?,
+                date: r.get(5)?,
+                headers: r.get(6)?,
+                seen: r.get(7)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let mut m = row?;
+            m.labels = self.labels_of(m.msgid)?;
+            out.push(m);
+        }
+        Ok(out)
+    }
+
     /// UIDs that have a cached header, newest first.
     pub fn cached_uids(&self) -> Result<Vec<u32>> {
         let mut stmt = self
@@ -590,6 +620,29 @@ mod tests {
         assert_eq!(s.cached_uids().unwrap(), vec![2]);
         let work = s.list_messages(Some("Work"), 10).unwrap();
         assert_eq!(work.iter().map(|m| m.msgid).collect::<Vec<_>>(), vec![2]);
+    }
+
+    #[test]
+    fn pages_walk_the_whole_cache_newest_first() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        let all: Vec<CachedMessage> = (1..=5).map(|uid| msg(uid as u64, uid, &[])).collect();
+        s.upsert_messages(&all).unwrap();
+        let first = s.list_page(None, 2).unwrap();
+        assert_eq!(
+            first.iter().map(|m| m.uid).collect::<Vec<_>>(),
+            vec![Some(5), Some(4)]
+        );
+        let second = s.list_page(first.last().unwrap().uid, 2).unwrap();
+        assert_eq!(
+            second.iter().map(|m| m.uid).collect::<Vec<_>>(),
+            vec![Some(3), Some(2)]
+        );
+        let last = s.list_page(second.last().unwrap().uid, 2).unwrap();
+        assert_eq!(
+            last.iter().map(|m| m.uid).collect::<Vec<_>>(),
+            vec![Some(1)]
+        );
+        assert!(s.list_page(last.last().unwrap().uid, 2).unwrap().is_empty());
     }
 
     #[test]

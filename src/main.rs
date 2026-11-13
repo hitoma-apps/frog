@@ -167,6 +167,8 @@ struct App {
     /// UIDs in display order, after the filter. Rebuilt when `view_dirty` is set.
     view: Vec<u32>,
     view_dirty: bool,
+    /// When the visible order was last rebuilt. Large lists are rebuilt at most a few times a second.
+    view_built: Instant,
 
     /// `(loaded, total)` while the initial list is loading.
     loading: Option<(usize, usize)>,
@@ -233,6 +235,7 @@ impl App {
             known_labels: BTreeSet::new(),
             view: Vec::new(),
             view_dirty: true,
+            view_built: Instant::now(),
             loading: None,
             idle_on: false,
             checking: false,
@@ -403,6 +406,8 @@ impl App {
             return;
         }
         for mut m in msgs {
+            // The list doesn't need raw headers. Dropping them keeps a whole mailbox in memory.
+            m.headers = Vec::new();
             match self.messages.get_mut(&m.uid) {
                 Some(existing) => {
                     adjust_counts(&mut self.counts, &existing.labels, false);
@@ -425,6 +430,13 @@ impl App {
         if !self.view_dirty {
             return;
         }
+        // While a large mailbox streams in, rebuilding on every batch would stall
+        // frames. Rebuild at most every 250 ms, and make sure a last rebuild happens.
+        if self.messages.len() > 50_000 && self.view_built.elapsed() < Duration::from_millis(250) {
+            self.ctx.request_repaint_after(Duration::from_millis(250));
+            return;
+        }
+        self.view_built = Instant::now();
         self.view_dirty = false;
         let filter = self.filter.as_deref();
         self.view = self
@@ -960,7 +972,10 @@ impl App {
                                 None => {
                                     ui.spinner();
                                     ui.label("Loading message…");
-                                    ui.monospace(String::from_utf8_lossy(&m.headers));
+                                    ui.monospace(format!(
+                                        "From:    {}\nSubject: {}\nDate:    {}",
+                                        m.from, m.subject, m.date
+                                    ));
                                 }
                             });
                     });
