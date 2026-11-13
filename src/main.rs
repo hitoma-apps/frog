@@ -3,6 +3,10 @@
 //! With `GMAIL_USER` and `GMAIL_APP_PASSWORD` set, it signs in at startup.
 //! Otherwise it shows a sign-in dialog.
 //! Mail access runs on a worker thread (see `worker.rs`).
+//!
+//! The list is sized for large mailboxes. Messages live in a map keyed by UID,
+//! label counts are kept up to date as messages change, the visible order is
+//! rebuilt only when something changes, and only the rows on screen are drawn.
 
 mod backend;
 mod live;
@@ -19,7 +23,7 @@ use gmail_imap_proto::render_plaintext;
 use backend::Message;
 use worker::{Command, Event, Link};
 
-/// Newest messages to list from All Mail on load.
+/// Newest messages to show on load, before the rest of the cache fills in.
 const LIVE_LIMIT: usize = 500;
 /// How often the auto-check toggle looks for new mail.
 const AUTO_CHECK_INTERVAL: Duration = Duration::from_secs(60);
@@ -49,6 +53,20 @@ fn display_label(raw: &str) -> String {
     }
 }
 
+/// Adds (`add = true`) or removes one count per label in `labels`.
+fn adjust_counts(counts: &mut BTreeMap<String, usize>, labels: &BTreeSet<String>, add: bool) {
+    for label in labels {
+        if add {
+            *counts.entry(label.clone()).or_insert(0) += 1;
+        } else if let Some(n) = counts.get_mut(label) {
+            *n -= 1;
+            if *n == 0 {
+                counts.remove(label);
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct LoginForm {
     email: String,
@@ -72,7 +90,14 @@ struct App {
     info: Option<String>,
     login: LoginForm,
 
-    messages: Vec<Message>,
+    /// Messages keyed by UID. Iterating in reverse gives newest first.
+    messages: BTreeMap<u32, Message>,
+    /// Label name to number of messages with it. Kept in step with `messages`.
+    counts: BTreeMap<String, usize>,
+    /// UIDs in display order, after the filter. Rebuilt when `view_dirty` is set.
+    view: Vec<u32>,
+    view_dirty: bool,
+
     /// `(loaded, total)` while the initial list is loading.
     loading: Option<(usize, usize)>,
     checking: bool,
@@ -80,15 +105,15 @@ struct App {
     last_check: Instant,
     /// UIDs whose body has been asked for and not yet delivered.
     requested_bodies: HashSet<u32>,
-    /// Cached plaintext of the open message: `(msgid, text)`.
-    rendered: Option<(u64, String)>,
+    /// Cached plaintext of the open message: `(uid, text)`.
+    rendered: Option<(u32, String)>,
 
     /// `None` shows All Mail, `Some(label)` filters by one raw label.
     filter: Option<String>,
-    /// Checked messages, by `X-GM-MSGID`.
-    checked: BTreeSet<u64>,
-    /// The open message, by `X-GM-MSGID`.
-    open: Option<u64>,
+    /// Checked messages, by UID.
+    checked: BTreeSet<u32>,
+    /// The open message, by UID.
+    open: Option<u32>,
     label_input: String,
     /// IMAP commands issued this session, newest last.
     log: Vec<String>,
@@ -107,7 +132,10 @@ impl App {
             cached_count: 0,
             info: None,
             login: LoginForm::default(),
-            messages: Vec::new(),
+            messages: BTreeMap::new(),
+            counts: BTreeMap::new(),
+            view: Vec::new(),
+            view_dirty: true,
             loading: None,
             checking: false,
             auto_check: false,
@@ -165,6 +193,8 @@ impl App {
             }
             Event::Reset => {
                 self.messages.clear();
+                self.counts.clear();
+                self.view_dirty = true;
                 self.cached_count = 0;
                 self.requested_bodies.clear();
                 self.rendered = None;
@@ -199,14 +229,17 @@ impl App {
             }
             Event::Body { uid, raw } => {
                 self.requested_bodies.remove(&uid);
-                if let Some(m) = self.messages.iter_mut().find(|m| m.uid == uid) {
+                if let Some(m) = self.messages.get_mut(&uid) {
                     m.body = Some(raw);
                 }
             }
             Event::Labels { updates, command } => {
                 for (uid, labels) in updates {
-                    if let Some(m) = self.messages.iter_mut().find(|m| m.uid == uid) {
-                        m.labels = labels;
+                    if let Some(m) = self.messages.get_mut(&uid) {
+                        let old = std::mem::replace(&mut m.labels, labels);
+                        adjust_counts(&mut self.counts, &old, false);
+                        adjust_counts(&mut self.counts, &m.labels, true);
+                        self.view_dirty = true;
                     }
                 }
                 self.log.push(command);
@@ -219,19 +252,42 @@ impl App {
         }
     }
 
-    /// Adds messages, replacing any with the same UID, and keeps newest first.
+    /// Adds messages, replacing any with the same UID. Bodies already fetched are kept.
     fn insert(&mut self, msgs: Vec<Message>) {
-        for m in msgs {
-            match self.messages.iter_mut().find(|x| x.uid == m.uid) {
+        if msgs.is_empty() {
+            return;
+        }
+        for mut m in msgs {
+            match self.messages.get_mut(&m.uid) {
                 Some(existing) => {
-                    let body = existing.body.take();
+                    adjust_counts(&mut self.counts, &existing.labels, false);
+                    m.body = existing.body.take();
                     *existing = m;
-                    existing.body = body;
+                    adjust_counts(&mut self.counts, &existing.labels, true);
                 }
-                None => self.messages.push(m),
+                None => {
+                    adjust_counts(&mut self.counts, &m.labels, true);
+                    self.messages.insert(m.uid, m);
+                }
             }
         }
-        self.messages.sort_by_key(|m| std::cmp::Reverse(m.uid));
+        self.view_dirty = true;
+    }
+
+    /// Rebuilds the visible order if anything changed since the last frame.
+    fn refresh_view(&mut self) {
+        if !self.view_dirty {
+            return;
+        }
+        self.view_dirty = false;
+        let filter = self.filter.as_deref();
+        self.view = self
+            .messages
+            .values()
+            .rev()
+            .filter(|m| filter.is_none_or(|l| m.labels.contains(l)))
+            .map(|m| m.uid)
+            .collect();
     }
 
     fn check_now(&mut self) {
@@ -245,10 +301,7 @@ impl App {
 
     /// Asks the worker for a message's body unless it is already here or on its way.
     fn request_body(&mut self, uid: u32) {
-        let has_body = self
-            .messages
-            .iter()
-            .any(|m| m.uid == uid && m.body.is_some());
+        let has_body = self.messages.get(&uid).is_some_and(|m| m.body.is_some());
         if has_body || self.requested_bodies.contains(&uid) {
             return;
         }
@@ -258,16 +311,11 @@ impl App {
 
     /// Checked messages if any, otherwise the open message. Returns UIDs.
     fn target_uids(&self) -> Vec<u32> {
-        let msgids: Vec<u64> = if !self.checked.is_empty() {
+        if !self.checked.is_empty() {
             self.checked.iter().copied().collect()
         } else {
             self.open.into_iter().collect()
-        };
-        self.messages
-            .iter()
-            .filter(|m| msgids.contains(&m.msgid))
-            .map(|m| m.uid)
-            .collect()
+        }
     }
 
     fn apply(&mut self, action: LabelAction, labels: Vec<String>) {
@@ -282,27 +330,6 @@ impl App {
             action,
             labels,
         });
-    }
-
-    /// Label name to count, including system labels, for the sidebar.
-    fn label_counts(&self) -> BTreeMap<String, usize> {
-        let mut counts = BTreeMap::new();
-        for m in &self.messages {
-            for l in &m.labels {
-                *counts.entry(l.clone()).or_insert(0) += 1;
-            }
-        }
-        counts
-    }
-
-    fn visible(&self) -> Vec<&Message> {
-        self.messages
-            .iter()
-            .filter(|m| match &self.filter {
-                None => true,
-                Some(l) => m.labels.contains(l),
-            })
-            .collect()
     }
 
     fn login_dialog(&mut self, ui: &mut egui::Ui) {
@@ -344,7 +371,6 @@ impl App {
                 let pass = self.login.password.clone();
                 self.start_gmail(user, pass);
             }
-
 
             if busy {
                 ui.add_space(8.0);
@@ -407,15 +433,16 @@ impl App {
             .clicked()
         {
             self.filter = None;
+            self.view_dirty = true;
         }
-        let counts = self.label_counts();
-        for (raw, count) in &counts {
+        for (raw, count) in &self.counts {
             let text = format!("{} ({count})", display_label(raw));
             if ui
                 .selectable_label(self.filter.as_deref() == Some(raw.as_str()), text)
                 .clicked()
             {
                 self.filter = Some(raw.clone());
+                self.view_dirty = true;
             }
         }
     }
@@ -467,83 +494,77 @@ impl App {
         }
     }
 
+    /// The message list. Only the rows on screen are drawn.
     fn message_list(&mut self, ui: &mut egui::Ui) {
-        let rows: Vec<(u64, u64, String, String, String, Vec<String>)> = self
-            .visible()
-            .into_iter()
-            .map(|m| {
-                (
-                    m.msgid,
-                    m.thrid,
-                    m.from.clone(),
-                    m.subject.clone(),
-                    m.date.clone(),
-                    m.labels.iter().map(|l| display_label(l)).collect(),
-                )
-            })
-            .collect();
-
+        if self.view.is_empty() {
+            ui.label(if self.loading.is_some() {
+                "Waiting for messages…"
+            } else {
+                "No messages with this label."
+            });
+            return;
+        }
+        let row_height = ui.text_style_height(&egui::TextStyle::Body);
+        // Take the order out of `self` so rows can borrow the rest of it.
+        let view = std::mem::take(&mut self.view);
         egui::ScrollArea::vertical()
             .id_salt("message_list")
-            .show(ui, |ui| {
-                if rows.is_empty() {
-                    ui.label(if self.loading.is_some() {
-                        "Waiting for messages…"
-                    } else {
-                        "No messages with this label."
-                    });
-                }
-                for (msgid, thrid, from, subject, date, labels) in rows {
+            .show_rows(ui, row_height, view.len(), |ui, range| {
+                for &uid in &view[range] {
+                    let Some(m) = self.messages.get(&uid) else {
+                        continue;
+                    };
                     ui.horizontal(|ui| {
-                        let mut checked = self.checked.contains(&msgid);
+                        let mut checked = self.checked.contains(&uid);
                         if ui.checkbox(&mut checked, "").changed() {
                             if checked {
-                                self.checked.insert(msgid);
+                                self.checked.insert(uid);
                             } else {
-                                self.checked.remove(&msgid);
+                                self.checked.remove(&uid);
                             }
                         }
-                        let open = self.open == Some(msgid);
+                        let open = self.open == Some(uid);
                         if ui
-                            .selectable_label(open, format!("{from} — {subject}"))
-                            .on_hover_text(format!("thread {thrid}"))
+                            .selectable_label(open, format!("{} — {}", m.from, m.subject))
+                            .on_hover_text(format!("thread {}", m.thrid))
                             .clicked()
                         {
-                            self.open = Some(msgid);
+                            self.open = Some(uid);
                             self.rendered = None;
                         }
-                        ui.weak(date);
+                        ui.weak(&m.date);
+                        let labels: Vec<String> =
+                            m.labels.iter().map(|l| display_label(l)).collect();
                         ui.weak(labels.join(", "));
                     });
                 }
             });
+        self.view = view;
     }
 
     fn reader(&mut self, ui: &mut egui::Ui) {
-        let Some(msgid) = self.open else {
+        let Some(uid) = self.open else {
             ui.label("Open a message to read it.");
             return;
         };
-        let Some((uid, thrid, has_body)) = self
+        let Some((msgid, thrid, has_body)) = self
             .messages
-            .iter()
-            .find(|m| m.msgid == msgid)
-            .map(|m| (m.uid, m.thrid, m.body.is_some()))
+            .get(&uid)
+            .map(|m| (m.msgid, m.thrid, m.body.is_some()))
         else {
             return;
         };
 
         if !has_body {
             self.request_body(uid);
-        } else if self.rendered.as_ref().map(|(id, _)| *id) != Some(msgid) {
+        } else if self.rendered.as_ref().map(|(id, _)| *id) != Some(uid) {
             let text = self
                 .messages
-                .iter()
-                .find(|m| m.msgid == msgid)
+                .get(&uid)
                 .and_then(|m| m.body.as_deref())
                 .map(|b| render_plaintext(b).unwrap_or_else(|| "(could not parse message)".into()))
                 .unwrap_or_default();
-            self.rendered = Some((msgid, text));
+            self.rendered = Some((uid, text));
         }
 
         let open_url = (thrid != 0).then(|| gmail_thread_url(thrid));
@@ -557,24 +578,21 @@ impl App {
                 ui.ctx().open_url(egui::OpenUrl::new_tab(url));
             }
         });
-        if let Some(m) = self.messages.iter().find(|m| m.msgid == msgid) {
-            ui.monospace(format!(
-                "msgid  {} (0x{:x})\nthrid  {} (0x{:x})",
-                m.msgid, m.msgid, m.thrid, m.thrid
-            ));
-        }
+        ui.monospace(format!(
+            "msgid  {msgid} (0x{msgid:x})\nthrid  {thrid} (0x{thrid:x})"
+        ));
         ui.separator();
 
         egui::ScrollArea::vertical()
             .id_salt("reader")
             .show(ui, |ui| match &self.rendered {
-                Some((id, text)) if *id == msgid => {
+                Some((id, text)) if *id == uid => {
                     ui.monospace(text);
                 }
                 _ => {
                     ui.spinner();
                     ui.label("Loading message…");
-                    if let Some(m) = self.messages.iter().find(|m| m.msgid == msgid) {
+                    if let Some(m) = self.messages.get(&uid) {
                         ui.monospace(String::from_utf8_lossy(&m.headers));
                     }
                 }
@@ -602,6 +620,7 @@ impl eframe::App for App {
             egui::CentralPanel::default().show(ui, |ui| self.login_dialog(ui));
             return;
         }
+        self.refresh_view();
 
         // Auto-check: a timer that only runs while the toggle is on and nothing else is busy.
         if self.auto_check {
@@ -637,5 +656,25 @@ impl eframe::App for App {
                 .show(ui, |ui| self.message_list(ui));
             egui::CentralPanel::default().show(ui, |ui| self.reader(ui));
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn label_counts_track_adds_and_removes() {
+        let mut counts = BTreeMap::new();
+        let a: BTreeSet<String> = ["Work".to_string(), "\\Inbox".to_string()].into();
+        let b: BTreeSet<String> = ["Work".to_string()].into();
+        adjust_counts(&mut counts, &a, true);
+        adjust_counts(&mut counts, &b, true);
+        assert_eq!(counts.get("Work"), Some(&2));
+        assert_eq!(counts.get("\\Inbox"), Some(&1));
+
+        adjust_counts(&mut counts, &a, false);
+        assert_eq!(counts.get("Work"), Some(&1));
+        assert_eq!(counts.get("\\Inbox"), None, "zero counts are dropped");
     }
 }

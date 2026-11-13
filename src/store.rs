@@ -307,14 +307,22 @@ impl Store {
     }
 
     /// Cached headers, newest first, optionally limited to one label.
+    /// Messages with no UID (after a UIDVALIDITY change) are left out.
     pub fn list_messages(&self, label: Option<&str>, limit: usize) -> Result<Vec<CachedMessage>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT msgid, thrid, uid, from_addr, subject, date, headers FROM messages m
-             WHERE ?1 IS NULL OR EXISTS (
-                 SELECT 1 FROM message_labels l WHERE l.msgid = m.msgid AND l.label = ?1)
-             ORDER BY uid IS NULL, uid DESC
-             LIMIT ?2",
-        )?;
+        let sql = match label {
+            None => {
+                "SELECT msgid, thrid, uid, from_addr, subject, date, headers FROM messages
+                 WHERE uid IS NOT NULL ORDER BY uid DESC LIMIT ?2"
+            }
+            Some(_) => {
+                "SELECT msgid, thrid, uid, from_addr, subject, date, headers FROM messages
+                 WHERE uid IS NOT NULL
+                   AND EXISTS (SELECT 1 FROM message_labels l
+                               WHERE l.msgid = messages.msgid AND l.label = ?1)
+                 ORDER BY uid DESC LIMIT ?2"
+            }
+        };
+        let mut stmt = self.conn.prepare_cached(sql)?;
         let rows = stmt.query_map(params![label, limit as i64], |r| {
             Ok(CachedMessage {
                 msgid: r.get::<_, i64>(0)? as u64,
@@ -339,7 +347,7 @@ impl Store {
     fn labels_of(&self, msgid: u64) -> Result<BTreeSet<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT label FROM message_labels WHERE msgid = ?1")?;
+            .prepare_cached("SELECT label FROM message_labels WHERE msgid = ?1")?;
         let labels = stmt
             .query_map(params![to_i64(msgid)?], |r| r.get::<_, String>(0))?
             .collect::<std::result::Result<BTreeSet<_>, _>>()?;
@@ -521,9 +529,12 @@ mod tests {
         s.upsert_messages(&[msg(1, 1, &["\\Inbox"])]).unwrap();
         s.invalidate_uids().unwrap();
         assert_eq!(s.mailbox_state().unwrap(), None);
-        let listed = s.list_messages(None, 10).unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].uid, None);
+        // Without a UID a message can't be acted on, so it's left out of listings.
+        assert!(s.list_messages(None, 10).unwrap().is_empty());
+        assert_eq!(s.msgid_for_uid(1).unwrap(), None);
+        // The next sync assigns a UID again and the message comes back.
+        s.upsert_messages(&[msg(1, 4, &["\\Inbox"])]).unwrap();
+        assert_eq!(s.list_messages(None, 10).unwrap().len(), 1);
     }
 
     #[test]
@@ -624,5 +635,65 @@ mod tests {
         let name = p.file_name().unwrap().to_string_lossy().into_owned();
         assert_eq!(name, "me_test_.._x@gmail.com.sqlite");
         assert!(p.to_string_lossy().contains("accounts"));
+    }
+}
+
+#[cfg(test)]
+mod bulk_timing {
+    use super::*;
+    use std::time::Instant;
+
+    /// Measures the cache at real-world size. Run with:
+    /// `cargo test --release bulk_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn quarter_million_headers() {
+        let n: u64 = 250_000;
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        let labels: BTreeSet<String> = ["\\Inbox".to_string(), "Work".to_string()].into();
+        let headers = b"From: a@example.com\r\nSubject: Something\r\n\r\n".to_vec();
+
+        let t = Instant::now();
+        for start in (1..=n).step_by(200) {
+            let batch: Vec<CachedMessage> = (start..(start + 200).min(n + 1))
+                .map(|uid| CachedMessage {
+                    msgid: 1_000_000_000_000 + uid,
+                    thrid: 9_000_000_000 + uid,
+                    uid: Some(uid as u32),
+                    labels: labels.clone(),
+                    from: "a@example.com".into(),
+                    subject: "Something".into(),
+                    date: "Tue, 10 Nov 2026 09:30:00 +0000".into(),
+                    headers: headers.clone(),
+                })
+                .collect();
+            s.upsert_messages(&batch).unwrap();
+        }
+        println!("insert 250k headers: {:?}", t.elapsed());
+
+        let t = Instant::now();
+        let uids = s.cached_uids().unwrap();
+        println!("cached_uids ({} rows): {:?}", uids.len(), t.elapsed());
+
+        let t = Instant::now();
+        let newest = s.list_messages(None, 500).unwrap();
+        println!(
+            "list_messages(500): {:?} ({} rows)",
+            t.elapsed(),
+            newest.len()
+        );
+
+        let t = Instant::now();
+        let work = s.list_messages(Some("Work"), 500).unwrap();
+        println!(
+            "list_messages(Work, 500): {:?} ({} rows)",
+            t.elapsed(),
+            work.len()
+        );
+
+        let t = Instant::now();
+        let stale: Vec<u32> = (1..=1000).collect();
+        s.remove_uids(&stale).unwrap();
+        println!("remove 1000 stale uids: {:?}", t.elapsed());
     }
 }

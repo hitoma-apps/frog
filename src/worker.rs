@@ -21,7 +21,7 @@ use crate::backend::{MailSource, MailboxInfo, Message, SourceError};
 use crate::live;
 
 /// Messages per header FETCH, so the list fills in steadily.
-const BATCH: usize = 50;
+const BATCH: usize = 200;
 /// Quiet time before a NOOP keeps the connection open.
 pub const KEEPALIVE: Duration = Duration::from_secs(240);
 /// Reconnect attempts before giving up.

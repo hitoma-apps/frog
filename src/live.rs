@@ -11,7 +11,7 @@ use crate::backend::{LabelUpdates, MailSource, MailboxInfo, Message, SourceError
 /// Gmail's All Mail folder holds every message, whatever its labels.
 pub const ALL_MAIL: &str = "[Gmail]/All Mail";
 /// How many UIDs go into one FETCH.
-const FETCH_CHUNK: usize = 50;
+const FETCH_CHUNK: usize = 200;
 
 pub struct LiveSession<S: Read + Write> {
     conn: ImapConn<S>,
