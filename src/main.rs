@@ -103,7 +103,37 @@ const WINDOW_PAD: usize = 100;
 /// Width of the accent bar beside each message in the reader.
 const ACCENT_WIDTH: f32 = 3.0;
 /// Space between the accent bar and the message.
-const ACCENT_GAP: f32 = 8.0;
+const ACCENT_GAP: f32 = 12.0;
+
+/// Colours for senders. A sender's colour is picked from these by a hash of the name,
+/// so each sender keeps the same colour from run to run. They're mid-tone, so they show
+/// on both light and dark backgrounds.
+const SENDER_COLORS: [egui::Color32; 8] = [
+    egui::Color32::from_rgb(231, 111, 81),
+    egui::Color32::from_rgb(42, 157, 143),
+    egui::Color32::from_rgb(233, 196, 106),
+    egui::Color32::from_rgb(138, 177, 125),
+    egui::Color32::from_rgb(106, 137, 204),
+    egui::Color32::from_rgb(199, 125, 187),
+    egui::Color32::from_rgb(244, 162, 97),
+    egui::Color32::from_rgb(120, 144, 156),
+];
+
+/// Index into `SENDER_COLORS` for a sender. Case and surrounding space don't count.
+fn sender_slot(from: &str) -> usize {
+    // FNV-1a: the same hash on every run and every platform, unlike the std hasher.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in from.trim().to_lowercase().bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (hash % SENDER_COLORS.len() as u64) as usize
+}
+
+/// The colour for a sender's stripe in the reader.
+fn sender_color(from: &str) -> egui::Color32 {
+    SENDER_COLORS[sender_slot(from)]
+}
 
 /// Gap between the items of a row.
 const ROW_GAP: f32 = 4.0;
@@ -1364,12 +1394,20 @@ impl App {
                                 });
                             });
                         });
+                    // Two bars in the gutter: the sender's colour, then the accent.
                     let r = block.response.rect;
-                    ui.painter().rect_filled(
-                        egui::Rect::from_min_size(r.min, egui::vec2(ACCENT_WIDTH, r.height())),
-                        2.0,
-                        accent,
-                    );
+                    let h = r.height();
+                    let sender_bar = egui::Rect::from_min_size(r.min, egui::vec2(ACCENT_WIDTH, h));
+                    let accent_bar = sender_bar.translate(egui::vec2(ACCENT_WIDTH + 2.0, 0.0));
+                    ui.painter()
+                        .rect_filled(sender_bar, 2.0, sender_color(&m.from));
+                    ui.painter().rect_filled(accent_bar, 2.0, accent);
+                    ui.interact(
+                        sender_bar,
+                        ui.scope_id().with(("sender", uid)),
+                        egui::Sense::hover(),
+                    )
+                    .on_hover_text(&m.from);
                 }
             });
         if pending.is_some() {
@@ -1551,6 +1589,25 @@ mod tests {
             true,
             b"From: a@example.com\r\nSubject: hi\r\n\r\n".to_vec(),
         )
+    }
+
+    #[test]
+    fn a_sender_always_gets_the_same_colour() {
+        assert_eq!(sender_slot("Alice Smith"), sender_slot("  alice smith "));
+        assert_eq!(sender_color("Bob"), sender_color("bob"));
+        assert!(sender_slot("Alice Smith") < SENDER_COLORS.len());
+        // The hash is fixed, so a sender's colour doesn't change between runs.
+        assert_eq!(sender_slot(""), (0xcbf2_9ce4_8422_2325u64 % 8) as usize);
+    }
+
+    #[test]
+    fn senders_are_spread_over_the_palette() {
+        let names = [
+            "Alice", "Bob", "Carol", "Dan", "Erin", "Frank", "Grace", "Heidi", "Ivan", "Judy",
+        ];
+        let used: std::collections::BTreeSet<usize> =
+            names.iter().map(|n| sender_slot(n)).collect();
+        assert!(used.len() >= 4, "{used:?}");
     }
 
     #[test]
