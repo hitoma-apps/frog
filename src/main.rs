@@ -683,8 +683,14 @@ impl App {
                     toggle = true;
                 }
             }
+            // Truncate to the space the sidebar has, so a long name can't stop it shrinking.
+            let width = ui.available_width().max(40.0);
+            let height = ui.spacing().interact_size.y;
+            let text = format!("{name} ({count})");
+            let row = egui::Button::selectable(selected, text.clone()).truncate();
             if ui
-                .selectable_label(selected, format!("{name} ({count})"))
+                .add_sized([width, height], row)
+                .on_hover_text(text)
                 .clicked()
             {
                 self.filter = key.map(str::to_owned);
@@ -1015,6 +1021,7 @@ impl eframe::App for App {
         egui::Panel::left("sidebar")
             .resizable(true)
             .default_size(200.0)
+            .min_size(120.0)
             .show(ui, |ui| self.sidebar(ui));
 
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
