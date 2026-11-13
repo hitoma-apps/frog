@@ -79,8 +79,6 @@ pub enum Event {
         updates: Vec<MessageUpdate>,
         command: String,
     },
-    /// A notice for the user, not an error (for example, where the cache lives).
-    Info(String),
     /// Messages were removed on the server. Drop them from the view.
     Removed(Vec<u32>),
     /// Whether live updates (IDLE) are running, so the GUI can stop polling.
@@ -106,13 +104,10 @@ pub fn open_cache(email: &str) -> Result<(Store, PathBuf), String> {
     Ok((store, path))
 }
 
-/// The account's cache, plus the startup notices to send once connected.
+/// The account's cache, plus any startup errors to send once connected.
 fn cache_for(email: &str) -> (Option<Store>, Vec<Event>) {
     match open_cache(email) {
-        Ok((store, path)) => (
-            Some(store),
-            vec![Event::Info(format!("Cache file: {}", path.display()))],
-        ),
+        Ok((store, _path)) => (Some(store), Vec::new()),
         Err(e) => (None, vec![Event::Error(e)]),
     }
 }
@@ -1390,7 +1385,6 @@ mod sync_tests {
             Event::Removed(_) => "Removed",
             Event::IdleState(_) => "IdleState",
             Event::Error(_) => "Error",
-            Event::Info(_) => "Info",
         }
     }
 

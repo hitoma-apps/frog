@@ -16,15 +16,15 @@ mod reader;
 mod worker;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 use gmail_imap_proto::labels::{LabelAction, SystemLabel};
 use gmail_imap_proto::linkcheck::{self, LinkInfo};
-use gmail_imap_proto::links::gmail_thread_url;
+use gmail_imap_proto::links::{gmail_original_url, gmail_thread_url};
 use gmail_imap_proto::render_plaintext;
 use gmail_imap_proto::settings::{self, CHECK_INTERVAL_RANGE, PAGE_SIZE_RANGE, Settings};
-use std::path::PathBuf;
 
 use backend::Message;
 use reader::{Block, Segment};
@@ -88,7 +88,7 @@ fn row_chips(m: &Message, filter: Option<&str>) -> Vec<String> {
         .filter(|l| !(mailbox_view && l.as_str() == inbox))
         .collect();
     labels.sort_by_key(|l| (!l.starts_with('\\'), l.to_lowercase()));
-    labels.into_iter().map(|l| display_label(l)).collect()
+    labels.into_iter().cloned().collect()
 }
 
 /// Gap between the items of a row.
@@ -270,6 +270,15 @@ struct App {
     settings: Settings,
     settings_path: Option<PathBuf>,
     settings_open: bool,
+    /// The IMAP command log is open in its own window.
+    log_open: bool,
+    /// The signed-in account, shown in the window title.
+    account: Option<String>,
+    /// The account the window title was last set for.
+    title_for: Option<String>,
+    /// Size of the cache file on disk, refreshed every few seconds.
+    cache_bytes: u64,
+    cache_checked: Option<Instant>,
     /// The worker, once a connection attempt has started.
     link: Option<Link>,
     connecting: bool,
@@ -280,8 +289,6 @@ struct App {
     mailbox_total: usize,
     /// Headers held locally, out of `mailbox_total`.
     cached_count: usize,
-    /// A notice such as where the cache lives.
-    info: Option<String>,
     login: LoginForm,
 
     /// Messages keyed by UID. Iterating in reverse gives newest first.
@@ -348,13 +355,17 @@ impl App {
             settings,
             settings_path,
             settings_open: false,
+            log_open: false,
+            account: None,
+            title_for: None,
+            cache_bytes: 0,
+            cache_checked: None,
             link: None,
             connecting: false,
             connected: false,
             reconnecting: false,
             mailbox_total: 0,
             cached_count: 0,
-            info: None,
             login,
             messages: BTreeMap::new(),
             counts: BTreeMap::new(),
@@ -386,6 +397,7 @@ impl App {
 
     fn start_gmail(&mut self, user: String, password: String) {
         self.login.error = None;
+        self.account = Some(user.clone());
         if self.settings.email.as_deref() != Some(user.as_str()) {
             self.settings.email = Some(user.clone());
             self.save_settings();
@@ -437,7 +449,6 @@ impl App {
                 self.open = None;
                 self.checked.clear();
             }
-            Event::Info(msg) => self.info = Some(msg),
             Event::Progress { cached, total } => {
                 self.cached_count = cached;
                 self.mailbox_total = total;
@@ -685,6 +696,22 @@ impl App {
                     &mut self.settings.notifications,
                     "Show desktop notifications for new mail",
                 );
+                ui.add_space(8.0);
+                ui.label(
+                    "Gmail session key, for \"View original\" (the ik= value from a Gmail URL):",
+                );
+                let mut key = self.settings.gmail_session_key.clone().unwrap_or_default();
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut key)
+                            .hint_text("optional")
+                            .desired_width(240.0),
+                    )
+                    .changed()
+                {
+                    let key = key.trim();
+                    self.settings.gmail_session_key = (!key.is_empty()).then(|| key.to_string());
+                }
                 ui.weak("The page size applies the next time the mailbox loads.");
                 ui.add_space(8.0);
                 if let Some(email) = self.settings.email.clone()
@@ -762,6 +789,13 @@ impl App {
         });
     }
 
+    /// Where this account's cache file lives, if the account is known.
+    fn cache_path(&self) -> Option<PathBuf> {
+        self.account
+            .as_deref()
+            .and_then(gmail_imap_proto::store::account_cache_path)
+    }
+
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if self.reconnecting {
@@ -785,26 +819,34 @@ impl App {
                     ui.spinner();
                     ui.label("Checking…");
                 }
-                if self.idle_on {
-                    ui.weak("Live updates on");
-                } else {
+                if !self.idle_on {
                     ui.checkbox(&mut self.auto_check, "Check every 60s");
                 }
             }
-            if let Some(info) = &self.info {
-                ui.weak(info);
-            }
-            ui.weak(format!(
-                "{} in mailbox · {} cached",
-                self.mailbox_total, self.cached_count
+
+            let cached = ui.label(format!(
+                "{} cached ({}) / {} in mailbox",
+                self.cached_count,
+                fmt_bytes(self.cache_bytes),
+                self.mailbox_total
             ));
+            if let Some(path) = self.cache_path() {
+                cached.on_hover_text(format!("Cache file: {}", path.display()));
+            }
             if self.cached_count < self.mailbox_total {
                 ui.spinner();
                 ui.label("Caching headers…");
             }
-            if ui.button("Settings").clicked() {
-                self.settings_open = true;
-            }
+
+            // Right-aligned: the first button added sits at the far right.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Settings").clicked() {
+                    self.settings_open = true;
+                }
+                if ui.button("Log").clicked() {
+                    self.log_open = !self.log_open;
+                }
+            });
         });
     }
 
@@ -965,6 +1007,7 @@ impl App {
         // without measuring them. Long text is truncated, never wrapped.
         let row_height = ui.spacing().interact_size.y;
         // Take the order out of `self` so rows can borrow the rest of it.
+        let mut clicked_label: Option<String> = None;
         let view = std::mem::take(&mut self.view);
         egui::ScrollArea::vertical()
             .id_salt("message_list")
@@ -998,14 +1041,21 @@ impl App {
                         let title_text = row_title(m, row.count, row.unread);
                         let chips = row_chips(m, self.filter.as_deref());
                         let (shown, hidden) = chips.split_at(chips.len().min(MAX_CHIPS));
-                        let mut tags: Vec<(String, String)> =
-                            shown.iter().map(|n| (n.clone(), n.clone())).collect();
+                        // (raw label to filter by, shown text, tooltip). The "+N" chip has no label.
+                        let mut tags: Vec<(Option<String>, String, String)> = shown
+                            .iter()
+                            .map(|raw| (Some(raw.clone()), display_label(raw), display_label(raw)))
+                            .collect();
                         if !hidden.is_empty() {
-                            tags.push((format!("+{}", hidden.len()), hidden.join("\n")));
+                            let names: Vec<String> =
+                                hidden.iter().map(|r| display_label(r)).collect();
+                            tags.push((None, format!("+{}", hidden.len()), names.join("\n")));
                         }
                         let font = egui::TextStyle::Small.resolve(ui.style());
-                        let widths: Vec<f32> =
-                            tags.iter().map(|(t, _)| chip_width(ui, t, &font)).collect();
+                        let widths: Vec<f32> = tags
+                            .iter()
+                            .map(|(_, t, _)| chip_width(ui, t, &font))
+                            .collect();
                         // Gaps: subject to first chip, between chips, last chip to date.
                         // Items in order: checkbox, subject, chips, date. That's one gap
                         // between each pair.
@@ -1036,13 +1086,17 @@ impl App {
                             self.open = Some(row.rep);
                         }
 
-                        for ((text, tip), w) in tags.iter().zip(&widths) {
+                        for ((raw, text, tip), w) in tags.iter().zip(&widths) {
                             let (rect, resp) = ui.allocate_exact_size(
                                 egui::vec2(*w, row_height),
-                                egui::Sense::hover(),
+                                egui::Sense::click(),
                             );
                             paint_chip(ui, rect, text, &font);
-                            resp.on_hover_text(tip);
+                            if resp.on_hover_text(tip).clicked()
+                                && let Some(label) = raw
+                            {
+                                clicked_label = Some(label.clone());
+                            }
                         }
 
                         let date = egui::RichText::new(&m.date).weak();
@@ -1051,6 +1105,11 @@ impl App {
                 }
             });
         self.view = view;
+        // Clicking a label chip shows the conversations with that label.
+        if let Some(label) = clicked_label {
+            self.filter = Some(label);
+            self.view_dirty = true;
+        }
     }
 
     /// The reader: the whole conversation the open message belongs to, newest first.
@@ -1085,7 +1144,10 @@ impl App {
         }
         let mut sorted_labels: Vec<&String> = labels.iter().collect();
         sorted_labels.sort_by_key(|l| (!l.starts_with('\\'), l.to_lowercase()));
-        let chip_names: Vec<String> = sorted_labels.iter().map(|l| display_label(l)).collect();
+        let chip_names: Vec<(String, String)> = sorted_labels
+            .iter()
+            .map(|l| ((*l).clone(), display_label(l)))
+            .collect();
 
         // Bodies for the whole conversation, fetched in the background, and
         // each one rendered once.
@@ -1125,19 +1187,27 @@ impl App {
         // The conversation's labels, as chips. A chip that's cut short has the full name on hover.
         let font = egui::TextStyle::Small.resolve(ui.style());
         let chip_h = ui.text_style_height(&egui::TextStyle::Small) + 6.0;
+        let mut clicked_label: Option<String> = None;
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-            for name in &chip_names {
+            for (raw, name) in &chip_names {
                 let w = chip_width(ui, name, &font);
                 let (rect, resp) =
-                    ui.allocate_exact_size(egui::vec2(w, chip_h), egui::Sense::hover());
+                    ui.allocate_exact_size(egui::vec2(w, chip_h), egui::Sense::click());
                 paint_chip(ui, rect, name, &font);
-                resp.on_hover_text(name);
+                if resp.on_hover_text(name).clicked() {
+                    clicked_label = Some(raw.clone());
+                }
             }
         });
+        if let Some(label) = clicked_label {
+            self.filter = Some(label);
+            self.view_dirty = true;
+        }
         ui.separator();
 
         let newest = thread.first().copied();
+        let session_key = self.settings.gmail_session_key.clone();
         let mut pending: Option<LinkInfo> = None;
         egui::ScrollArea::vertical()
             .id_salt("reader")
@@ -1158,7 +1228,14 @@ impl App {
                         egui::CollapsingHeader::new(title)
                             .default_open(expanded)
                             .show(ui, |ui| {
-                                ui.monospace(format!("msgid {} (0x{:x})", m.msgid, m.msgid));
+                                ui.horizontal(|ui| {
+                                    ui.monospace(format!("msgid {} (0x{:x})", m.msgid, m.msgid));
+                                    if ui.small_button("View original").clicked() {
+                                        let url =
+                                            gmail_original_url(m.msgid, session_key.as_deref());
+                                        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                                    }
+                                });
                                 match self.rendered.get(&uid) {
                                     Some(blocks) => {
                                         for (i, block) in blocks.iter().enumerate() {
@@ -1243,17 +1320,53 @@ impl App {
         }
     }
 
-    fn command_log(&self, ui: &mut egui::Ui) {
-        ui.label("IMAP commands sent:");
-        egui::ScrollArea::vertical()
-            .id_salt("log")
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                for line in &self.log {
-                    ui.monospace(line);
-                }
+    /// The IMAP commands sent this session, in their own window.
+    fn log_window(&mut self, ctx: &egui::Context) {
+        if !self.log_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("IMAP log")
+            .default_size([720.0, 420.0])
+            .resizable(true)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("log")
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for line in &self.log {
+                            ui.monospace(line);
+                        }
+                    });
             });
+        if !open {
+            self.log_open = false;
+        }
     }
+}
+
+/// Bytes as a size for people: GB with one decimal, otherwise MB.
+fn fmt_bytes(bytes: u64) -> String {
+    const MB: f64 = 1_048_576.0;
+    const GB: f64 = 1_073_741_824.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else {
+        format!("{:.0} MB", b / MB)
+    }
+}
+
+/// The size of a SQLite cache on disk, including its write-ahead log.
+fn cache_file_bytes(path: &Path) -> u64 {
+    let wal = path.with_extension("sqlite-wal");
+    [path.to_path_buf(), wal]
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum()
 }
 
 impl eframe::App for App {
@@ -1265,6 +1378,27 @@ impl eframe::App for App {
             return;
         }
         self.refresh_view();
+
+        // Window title: the app name and the signed-in account.
+        if self.connected
+            && let Some(account) = &self.account
+            && self.title_for.as_deref() != Some(account.as_str())
+        {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Title(format!(
+                    "Gmail Labels Prototype — {account}"
+                )));
+            self.title_for = Some(account.clone());
+        }
+        // The cache file's size, checked every few seconds.
+        if self.connected
+            && self
+                .cache_checked
+                .is_none_or(|t| t.elapsed() >= Duration::from_secs(5))
+        {
+            self.cache_checked = Some(Instant::now());
+            self.cache_bytes = self.cache_path().map_or(0, |p| cache_file_bytes(&p));
+        }
 
         // Auto-check: a timer that only runs while the toggle is on and nothing else is busy.
         if self.auto_check && !self.idle_on {
@@ -1291,11 +1425,6 @@ impl eframe::App for App {
 
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
 
-        egui::Panel::bottom("log")
-            .resizable(true)
-            .default_size(120.0)
-            .show(ui, |ui| self.command_log(ui));
-
         egui::CentralPanel::default().show(ui, |ui| {
             egui::Panel::top("list")
                 .resizable(true)
@@ -1306,6 +1435,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.link_confirmation(&ctx);
         self.settings_window(&ctx);
+        self.log_window(&ctx);
     }
 }
 
@@ -1364,7 +1494,7 @@ mod tests {
     #[test]
     fn chips_leave_out_the_current_label() {
         let m = message_with(&["Work", "\\Starred", "Home"]);
-        assert_eq!(row_chips(&m, Some("Work")), vec!["Starred", "Home"]);
+        assert_eq!(row_chips(&m, Some("Work")), vec!["\\Starred", "Home"]);
     }
 
     #[test]
@@ -1374,13 +1504,13 @@ mod tests {
         assert_eq!(row_chips(&m, None), vec!["Work"]);
         assert_eq!(row_chips(&m, Some("\\Starred")), vec!["Work"]);
         // A label view keeps Inbox.
-        assert_eq!(row_chips(&m, Some("Work")), vec!["Inbox"]);
+        assert_eq!(row_chips(&m, Some("Work")), vec!["\\Inbox"]);
     }
 
     #[test]
     fn system_labels_come_first() {
         let m = message_with(&["Zeta", "\\Important", "Alpha"]);
-        assert_eq!(row_chips(&m, None), vec!["Important", "Alpha", "Zeta"]);
+        assert_eq!(row_chips(&m, None), vec!["\\Important", "Alpha", "Zeta"]);
     }
 
     #[test]
