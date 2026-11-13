@@ -15,7 +15,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 /// Default body cache size, in compressed bytes.
 pub const DEFAULT_BODY_CAP: u64 = 1 << 30;
@@ -23,7 +23,7 @@ pub const DEFAULT_BODY_CAP: u64 = 1 << 30;
 /// zstd level. Mail is text, so a low level compresses well and stays fast.
 const ZSTD_LEVEL: i32 = 3;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -59,6 +59,29 @@ impl From<std::io::Error> for StoreError {
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
+
+/// Which threads a list shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadFilter {
+    /// Every thread.
+    All,
+    /// Threads with at least one message carrying this raw label. Whole threads are shown.
+    Label(String),
+    /// Threads with a message whose sender or subject matches the text.
+    Search(String),
+}
+
+/// One row of the thread list: a conversation and its newest message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadSummary {
+    pub thrid: u64,
+    /// Cached messages in the thread, with a UID.
+    pub count: usize,
+    /// How many of them are unread.
+    pub unread: usize,
+    /// The newest message, with its labels.
+    pub head: CachedMessage,
+}
 
 /// A cached message header.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +147,77 @@ pub fn sent_timestamp(headers: &[u8]) -> i64 {
         .parse(headers)
         .and_then(|m| m.date().map(|d| d.to_timestamp()))
         .unwrap_or(0)
+}
+
+/// The thread of a stored message, by its `X-GM-MSGID`.
+fn thread_of(conn: &Connection, msgid: i64) -> Result<Option<u64>> {
+    let thrid: Option<i64> = conn
+        .query_row(
+            "SELECT thrid FROM messages WHERE msgid = ?1",
+            params![msgid],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(thrid.map(|t| t as u64))
+}
+
+/// Recomputes the summaries of the given threads from their cached messages.
+/// A thread with no cached UIDs left drops out of the summaries.
+fn refresh_threads(tx: &Transaction, thrids: &BTreeSet<u64>) -> Result<()> {
+    for &thrid in thrids {
+        let thrid = to_i64(thrid)?;
+        let (count, unread, newest): (i64, i64, Option<i64>) = tx.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(seen = 0), 0), MAX(uid) FROM messages
+             WHERE thrid = ?1 AND uid IS NOT NULL",
+            params![thrid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        tx.execute("DELETE FROM thread_labels WHERE thrid = ?1", params![thrid])?;
+        if count == 0 {
+            tx.execute("DELETE FROM threads WHERE thrid = ?1", params![thrid])?;
+            continue;
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO threads (thrid, count, unread, newest_uid)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![thrid, count, unread, newest],
+        )?;
+        tx.execute(
+            "INSERT INTO thread_labels (label, thrid)
+             SELECT DISTINCT l.label, m.thrid FROM messages m
+             JOIN message_labels l ON l.msgid = m.msgid
+             WHERE m.thrid = ?1 AND m.uid IS NOT NULL",
+            params![thrid],
+        )?;
+    }
+    Ok(())
+}
+
+/// Turns search text into an FTS5 query. Each word must match the start of a word in
+/// the sender or subject. Returns `None` if the text has no words.
+pub fn fts_query(text: &str) -> Option<String> {
+    let terms: Vec<String> = text
+        .split_whitespace()
+        .map(|w| format!("\"{}\"*", w.replace('"', "\"\"")))
+        .collect();
+    (!terms.is_empty()).then(|| terms.join(" "))
+}
+
+/// Reads a message row with the columns: msgid, thrid, uid, from, subject, date, seen, sent.
+/// Labels are left empty, and the header block is left out.
+fn cached_from_row(r: &rusqlite::Row) -> rusqlite::Result<CachedMessage> {
+    Ok(CachedMessage {
+        msgid: r.get::<_, i64>(0)? as u64,
+        thrid: r.get::<_, i64>(1)? as u64,
+        uid: r.get(2)?,
+        labels: BTreeSet::new(),
+        from: r.get(3)?,
+        subject: r.get(4)?,
+        date: r.get(5)?,
+        headers: Vec::new(),
+        seen: r.get(6)?,
+        sent: r.get(7)?,
+    })
 }
 
 fn to_i64(v: u64) -> Result<i64> {
@@ -235,6 +329,71 @@ impl Store {
                 )?;
             }
         }
+        if version < 5 {
+            // Thread summaries, whole-thread label membership, a message total, and
+            // full-text search over sender and subject. All are kept in step with the
+            // messages by the write methods below and by the triggers here.
+            tx.execute_batch(
+                "CREATE INDEX messages_thread ON messages(thrid, uid);
+                 CREATE TABLE threads (
+                     thrid INTEGER PRIMARY KEY,
+                     count INTEGER NOT NULL,
+                     unread INTEGER NOT NULL,
+                     newest_uid INTEGER NOT NULL
+                 );
+                 CREATE INDEX threads_newest ON threads(newest_uid);
+                 CREATE TABLE thread_labels (
+                     label TEXT NOT NULL,
+                     thrid INTEGER NOT NULL,
+                     PRIMARY KEY (label, thrid)
+                 );
+                 CREATE INDEX thread_labels_by_thread ON thread_labels(thrid);
+                 CREATE TABLE cache_totals (
+                     id INTEGER PRIMARY KEY CHECK (id = 1),
+                     messages INTEGER NOT NULL
+                 );
+                 INSERT INTO cache_totals (id, messages)
+                     SELECT 1, COUNT(*) FROM messages WHERE uid IS NOT NULL;
+                 CREATE TRIGGER cached_messages_added AFTER INSERT ON messages
+                     WHEN NEW.uid IS NOT NULL BEGIN
+                     UPDATE cache_totals SET messages = messages + 1;
+                 END;
+                 CREATE TRIGGER cached_messages_removed AFTER DELETE ON messages
+                     WHEN OLD.uid IS NOT NULL BEGIN
+                     UPDATE cache_totals SET messages = messages - 1;
+                 END;
+                 CREATE TRIGGER cached_messages_uid AFTER UPDATE OF uid ON messages
+                     WHEN (OLD.uid IS NULL) != (NEW.uid IS NULL) BEGIN
+                     UPDATE cache_totals
+                         SET messages = messages + (CASE WHEN NEW.uid IS NULL THEN -1 ELSE 1 END);
+                 END;
+                 CREATE VIRTUAL TABLE messages_fts USING fts5(
+                     from_addr, subject, content='messages', content_rowid='msgid'
+                 );
+                 CREATE TRIGGER messages_fts_added AFTER INSERT ON messages BEGIN
+                     INSERT INTO messages_fts (rowid, from_addr, subject)
+                         VALUES (NEW.msgid, NEW.from_addr, NEW.subject);
+                 END;
+                 CREATE TRIGGER messages_fts_removed AFTER DELETE ON messages BEGIN
+                     INSERT INTO messages_fts (messages_fts, rowid, from_addr, subject)
+                         VALUES ('delete', OLD.msgid, OLD.from_addr, OLD.subject);
+                 END;
+                 CREATE TRIGGER messages_fts_changed AFTER UPDATE OF from_addr, subject ON messages
+                 BEGIN
+                     INSERT INTO messages_fts (messages_fts, rowid, from_addr, subject)
+                         VALUES ('delete', OLD.msgid, OLD.from_addr, OLD.subject);
+                     INSERT INTO messages_fts (rowid, from_addr, subject)
+                         VALUES (NEW.msgid, NEW.from_addr, NEW.subject);
+                 END;
+                 INSERT INTO messages_fts (messages_fts) VALUES ('rebuild');
+                 INSERT INTO threads (thrid, count, unread, newest_uid)
+                     SELECT thrid, COUNT(*), SUM(seen = 0), MAX(uid) FROM messages
+                     WHERE uid IS NOT NULL GROUP BY thrid;
+                 INSERT INTO thread_labels (label, thrid)
+                     SELECT DISTINCT l.label, m.thrid FROM messages m
+                     JOIN message_labels l ON l.msgid = m.msgid WHERE m.uid IS NOT NULL;",
+            )?;
+        }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
@@ -277,8 +436,13 @@ impl Store {
     /// Inserts or updates headers and labels. Labels are replaced, not merged.
     pub fn upsert_messages(&mut self, msgs: &[CachedMessage]) -> Result<()> {
         let tx = self.conn.transaction()?;
+        let mut affected: BTreeSet<u64> = BTreeSet::new();
         for m in msgs {
             let msgid = to_i64(m.msgid)?;
+            if let Some(old) = thread_of(&tx, msgid)? {
+                affected.insert(old);
+            }
+            affected.insert(m.thrid);
             tx.execute(
                 "INSERT INTO messages (msgid, thrid, uid, from_addr, subject, date, headers, seen, sent)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
@@ -310,6 +474,7 @@ impl Store {
                 )?;
             }
         }
+        refresh_threads(&tx, &affected)?;
         tx.commit()?;
         Ok(())
     }
@@ -318,6 +483,7 @@ impl Store {
     pub fn set_labels(&mut self, msgid: u64, labels: &BTreeSet<String>) -> Result<()> {
         let msgid = to_i64(msgid)?;
         let tx = self.conn.transaction()?;
+        let thread = thread_of(&tx, msgid)?;
         tx.execute(
             "DELETE FROM message_labels WHERE msgid = ?1",
             params![msgid],
@@ -328,16 +494,26 @@ impl Store {
                 params![msgid, label],
             )?;
         }
+        if let Some(t) = thread {
+            refresh_threads(&tx, &BTreeSet::from([t]))?;
+        }
         tx.commit()?;
         Ok(())
     }
 
     /// Records whether a message has been read.
     pub fn set_seen(&mut self, msgid: u64, seen: bool) -> Result<()> {
-        self.conn.execute(
+        let msgid = to_i64(msgid)?;
+        let tx = self.conn.transaction()?;
+        let thread = thread_of(&tx, msgid)?;
+        tx.execute(
             "UPDATE messages SET seen = ?2 WHERE msgid = ?1",
-            params![to_i64(msgid)?, seen],
+            params![msgid, seen],
         )?;
+        if let Some(t) = thread {
+            refresh_threads(&tx, &BTreeSet::from([t]))?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -353,6 +529,165 @@ impl Store {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Which threads a list shows.
+    pub fn thread_count(&self, filter: &ThreadFilter) -> Result<usize> {
+        let n: i64 = match filter {
+            ThreadFilter::All => self
+                .conn
+                .query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0))?,
+            ThreadFilter::Label(label) => self.conn.query_row(
+                "SELECT COUNT(*) FROM thread_labels WHERE label = ?1",
+                params![label],
+                |r| r.get(0),
+            )?,
+            ThreadFilter::Search(text) => match fts_query(text) {
+                None => 0,
+                Some(query) => self.conn.query_row(
+                    "SELECT COUNT(DISTINCT m.thrid) FROM messages_fts
+                     JOIN messages m ON m.msgid = messages_fts.rowid
+                     WHERE messages_fts MATCH ?1 AND m.uid IS NOT NULL",
+                    params![query],
+                    |r| r.get(0),
+                )?,
+            },
+        };
+        Ok(n as usize)
+    }
+
+    /// The threads a list shows, newest first, from `offset` on. Each comes with its
+    /// newest message. A label or search shows whole threads: every message of a
+    /// thread counts, whichever labels it carries.
+    pub fn thread_page(
+        &self,
+        filter: &ThreadFilter,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<ThreadSummary>> {
+        const COLUMNS: &str = "t.thrid, t.count, t.unread, m.msgid, m.thrid, m.uid,
+                               m.from_addr, m.subject, m.date, m.seen, m.sent";
+        let (limit, offset) = (limit as i64, offset as i64);
+        let rows: Vec<(u64, usize, usize, CachedMessage)> = match filter {
+            ThreadFilter::All => {
+                let sql = format!(
+                    "SELECT {COLUMNS} FROM threads t
+                     JOIN messages m ON m.thrid = t.thrid AND m.uid = t.newest_uid
+                     ORDER BY t.newest_uid DESC LIMIT ?1 OFFSET ?2"
+                );
+                self.thread_rows(&sql, params![limit, offset])?
+            }
+            ThreadFilter::Label(label) => {
+                // Walk the threads newest first, and stop once a window is full. A
+                // label that most threads carry fills its window at once.
+                let sql = format!(
+                    "SELECT {COLUMNS} FROM threads t
+                     JOIN messages m ON m.thrid = t.thrid AND m.uid = t.newest_uid
+                     WHERE EXISTS (SELECT 1 FROM thread_labels tl
+                                   WHERE tl.label = ?1 AND tl.thrid = t.thrid)
+                     ORDER BY t.newest_uid DESC LIMIT ?2 OFFSET ?3"
+                );
+                self.thread_rows(&sql, params![label, limit, offset])?
+            }
+            ThreadFilter::Search(text) => match fts_query(text) {
+                None => Vec::new(),
+                Some(query) => {
+                    let sql = format!(
+                        "WITH hits AS (
+                             SELECT DISTINCT m.thrid FROM messages_fts
+                             JOIN messages m ON m.msgid = messages_fts.rowid
+                             WHERE messages_fts MATCH ?1 AND m.uid IS NOT NULL)
+                         SELECT {COLUMNS} FROM hits h
+                         JOIN threads t ON t.thrid = h.thrid
+                         JOIN messages m ON m.thrid = t.thrid AND m.uid = t.newest_uid
+                         ORDER BY t.newest_uid DESC LIMIT ?2 OFFSET ?3"
+                    );
+                    self.thread_rows(&sql, params![query, limit, offset])?
+                }
+            },
+        };
+        let (meta, mut heads): (Vec<(u64, usize, usize)>, Vec<CachedMessage>) =
+            rows.into_iter().map(|(t, c, u, m)| ((t, c, u), m)).unzip();
+        self.attach_labels(&mut heads)?;
+        Ok(meta
+            .into_iter()
+            .zip(heads)
+            .map(|((thrid, count, unread), head)| ThreadSummary {
+                thrid,
+                count,
+                unread,
+                head,
+            })
+            .collect())
+    }
+
+    /// Runs a thread-list query. Each row is the thread's summary and its newest message.
+    fn thread_rows(
+        &self,
+        sql: &str,
+        params: impl rusqlite::Params,
+    ) -> Result<Vec<(u64, usize, usize, CachedMessage)>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt
+            .query_map(params, |r| {
+                let head = CachedMessage {
+                    msgid: r.get::<_, i64>(3)? as u64,
+                    thrid: r.get::<_, i64>(4)? as u64,
+                    uid: r.get(5)?,
+                    labels: BTreeSet::new(),
+                    from: r.get(6)?,
+                    subject: r.get(7)?,
+                    date: r.get(8)?,
+                    headers: Vec::new(),
+                    seen: r.get(9)?,
+                    sent: r.get(10)?,
+                };
+                Ok((
+                    r.get::<_, i64>(0)? as u64,
+                    r.get::<_, i64>(1)? as usize,
+                    r.get::<_, i64>(2)? as usize,
+                    head,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Every cached message of one thread, newest first, with labels.
+    pub fn thread_messages(&self, thrid: u64) -> Result<Vec<CachedMessage>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT msgid, thrid, uid, from_addr, subject, date, seen, sent FROM messages
+             WHERE thrid = ?1 AND uid IS NOT NULL ORDER BY uid DESC",
+        )?;
+        let mut out = stmt
+            .query_map(params![to_i64(thrid)?], cached_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        self.attach_labels(&mut out)?;
+        Ok(out)
+    }
+
+    /// The UIDs of every cached message in the given threads.
+    pub fn uids_for_threads(&self, thrids: &[u64]) -> Result<Vec<u32>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT uid FROM messages WHERE thrid = ?1 AND uid IS NOT NULL")?;
+        let mut out = Vec::new();
+        for &thrid in thrids {
+            for uid in stmt.query_map(params![to_i64(thrid)?], |r| r.get::<_, u32>(0))? {
+                out.push(uid?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// How many messages are cached with a UID. Kept as a running total.
+    pub fn message_total(&self) -> Result<usize> {
+        let n: i64 =
+            self.conn
+                .query_row("SELECT messages FROM cache_totals WHERE id = 1", [], |r| {
+                    r.get(0)
+                })?;
+        Ok(n as usize)
     }
 
     /// One page of cached headers with UID below `before` (or the newest, if
@@ -409,18 +744,33 @@ impl Store {
     /// Removes cached messages by UID, for messages deleted on the server.
     pub fn remove_uids(&mut self, uids: &[u32]) -> Result<()> {
         let tx = self.conn.transaction()?;
+        let mut affected: BTreeSet<u64> = BTreeSet::new();
         for uid in uids {
+            let thread: Option<i64> = tx
+                .query_row(
+                    "SELECT thrid FROM messages WHERE uid = ?1",
+                    params![uid],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            affected.extend(thread.map(|t| t as u64));
             tx.execute("DELETE FROM messages WHERE uid = ?1", params![uid])?;
         }
+        refresh_threads(&tx, &affected)?;
         tx.commit()?;
         Ok(())
     }
 
     /// Clears every UID. Call this when UIDVALIDITY changes. The messages
-    /// themselves are kept, and the next sync assigns new UIDs.
+    /// themselves are kept, and the next sync assigns new UIDs. Threads have no
+    /// cached UIDs until the sync assigns them, so their summaries are cleared too.
     pub fn invalidate_uids(&mut self) -> Result<()> {
-        self.conn.execute("UPDATE messages SET uid = NULL", [])?;
-        self.conn.execute("DELETE FROM sync", [])?;
+        let tx = self.conn.transaction()?;
+        tx.execute("UPDATE messages SET uid = NULL", [])?;
+        tx.execute("DELETE FROM sync", [])?;
+        tx.execute("DELETE FROM threads", [])?;
+        tx.execute("DELETE FROM thread_labels", [])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -746,18 +1096,149 @@ mod tests {
     }
 
     #[test]
-    fn migrating_from_v3_fills_in_sent_times() {
+    fn thread_summaries_follow_every_write() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        // Two messages in thread 100 (msgid + 100), one in thread 101.
+        let mut a = msg(1, 1, &["Work"]);
+        a.thrid = 100;
+        let mut b = msg(2, 2, &["Home"]);
+        b.thrid = 100;
+        let mut c = msg(3, 3, &["Work"]);
+        c.thrid = 101;
+        s.upsert_messages(&[a, b, c]).unwrap();
+
+        assert_eq!(s.thread_count(&ThreadFilter::All).unwrap(), 2);
+        // Newest first: thread 101 holds uid 3, thread 100's newest is uid 2.
+        let all = s.thread_page(&ThreadFilter::All, 0, 10).unwrap();
+        assert_eq!(all[0].thrid, 101);
+        assert_eq!(all[1].thrid, 100);
+        assert_eq!(all[1].count, 2);
+        assert_eq!(all[1].unread, 2);
+        assert_eq!(all[1].head.uid, Some(2));
+        assert_eq!(all[1].head.labels, BTreeSet::from(["Home".to_string()]));
+
+        // A label shows the whole thread, even messages without that label.
+        let work = s
+            .thread_page(&ThreadFilter::Label("Work".into()), 0, 10)
+            .unwrap();
+        assert_eq!(work.len(), 2);
+        assert_eq!(work[1].thrid, 100, "thread 100 has a Work message (uid 1)");
+        assert_eq!(work[1].count, 2, "and it counts all of its messages");
+        assert_eq!(
+            s.thread_count(&ThreadFilter::Label("Work".into())).unwrap(),
+            2
+        );
+
+        // Reading a message lowers the unread count.
+        s.set_seen(2, true).unwrap();
+        assert_eq!(
+            s.thread_page(&ThreadFilter::All, 0, 10).unwrap()[1].unread,
+            1
+        );
+
+        // Relabelling moves the thread in and out of a label's list.
+        s.set_labels(3, &BTreeSet::from(["Home".to_string()]))
+            .unwrap();
+        assert_eq!(
+            s.thread_count(&ThreadFilter::Label("Work".into())).unwrap(),
+            1
+        );
+        assert_eq!(
+            s.thread_count(&ThreadFilter::Label("Home".into())).unwrap(),
+            2
+        );
+
+        // Removing a thread's last cached message removes the thread.
+        s.remove_uids(&[3]).unwrap();
+        assert_eq!(s.thread_count(&ThreadFilter::All).unwrap(), 1);
+        assert_eq!(s.message_total().unwrap(), 2);
+        assert_eq!(s.uids_for_threads(&[100, 101]).unwrap().len(), 2);
+
+        // Invalidating UIDs empties the lists, and the next sync brings them back.
+        s.invalidate_uids().unwrap();
+        assert_eq!(s.thread_count(&ThreadFilter::All).unwrap(), 0);
+        assert_eq!(s.message_total().unwrap(), 0);
+    }
+
+    #[test]
+    fn search_matches_sender_and_subject_words() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        let mut a = msg(1, 1, &[]);
+        a.from = "Alice Smith <alice@example.com>".into();
+        a.subject = "Quarterly invoice".into();
+        let mut b = msg(2, 2, &[]);
+        b.from = "bob@example.org".into();
+        b.subject = "Lunch on Friday".into();
+        s.upsert_messages(&[a, b]).unwrap();
+
+        let find = |text: &str| {
+            s.thread_page(&ThreadFilter::Search(text.into()), 0, 10)
+                .unwrap()
+                .iter()
+                .map(|t| t.head.uid.unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(find("invoice"), vec![1]);
+        assert_eq!(find("inv"), vec![1], "prefixes of words match");
+        assert_eq!(find("alice quarterly"), vec![1], "every word must match");
+        assert_eq!(find("friday lunch"), vec![2]);
+        assert!(find("nothing here").is_empty());
+        assert!(find("   ").is_empty());
+        assert_eq!(
+            s.thread_count(&ThreadFilter::Search("invoice".into()))
+                .unwrap(),
+            1
+        );
+        // Quotes in the text can't break the query.
+        assert!(find("\"quoted\" 'text").is_empty());
+    }
+
+    #[test]
+    fn fts_query_quotes_each_word() {
+        assert_eq!(fts_query("  a  b ").as_deref(), Some("\"a\"* \"b\"*"));
+        assert_eq!(
+            fts_query("say \"hi\"").as_deref(),
+            Some("\"say\"* \"\"\"hi\"\"\"*")
+        );
+        assert_eq!(fts_query(""), None);
+    }
+
+    #[test]
+    fn migrating_from_v3_builds_every_summary() {
         let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
         let mut m = msg(1, 1, &["Work"]);
         m.headers = b"Date: Tue, 10 Nov 2026 09:30:00 +0000\r\nSubject: Hello 1\r\n\r\n".to_vec();
         m.sent = 0;
         s.upsert_messages(&[m]).unwrap();
-        // Put the database back in its v3 shape: no sent column, version 3.
+        // Put the database back in its v3 shape: none of the v4 or v5 additions.
         s.conn
-            .execute_batch("ALTER TABLE messages DROP COLUMN sent; PRAGMA user_version = 3;")
+            .execute_batch(
+                "DROP TRIGGER messages_fts_added;
+                 DROP TRIGGER messages_fts_removed;
+                 DROP TRIGGER messages_fts_changed;
+                 DROP TRIGGER cached_messages_added;
+                 DROP TRIGGER cached_messages_removed;
+                 DROP TRIGGER cached_messages_uid;
+                 DROP TABLE messages_fts;
+                 DROP TABLE threads;
+                 DROP TABLE thread_labels;
+                 DROP TABLE cache_totals;
+                 DROP INDEX messages_thread;
+                 ALTER TABLE messages DROP COLUMN sent;
+                 PRAGMA user_version = 3;",
+            )
             .unwrap();
         s.migrate().unwrap();
         assert_eq!(s.list_page(None, 10).unwrap()[0].sent, 1_794_303_000);
+        assert_eq!(s.thread_count(&ThreadFilter::All).unwrap(), 1);
+        assert_eq!(s.message_total().unwrap(), 1);
+        assert_eq!(
+            s.thread_page(&ThreadFilter::Search("hello".into()), 0, 5)
+                .unwrap()
+                .len(),
+            1,
+            "the rebuilt search index finds the subject \"Hello 1\""
+        );
     }
 
     #[test]
@@ -874,7 +1355,8 @@ mod bulk_timing {
             let batch: Vec<CachedMessage> = (start..(start + 200).min(n + 1))
                 .map(|uid| CachedMessage {
                     msgid: 1_000_000_000_000 + uid,
-                    thrid: 9_000_000_000 + uid,
+                    // Threads of three messages, so the thread lists have real grouping.
+                    thrid: 9_000_000_000 + uid / 3,
                     uid: Some(uid as u32),
                     labels: labels.clone(),
                     from: "a@example.com".into(),
@@ -893,20 +1375,68 @@ mod bulk_timing {
         let uids = s.cached_uids().unwrap();
         println!("cached_uids ({} rows): {:?}", uids.len(), t.elapsed());
 
-        // The startup show: walk the whole cache in pages of 5000, as the worker does.
+        // The list the GUI shows: walk every thread a window at a time, as it scrolls.
         let t = Instant::now();
-        let (mut before, mut seen) = (None, 0usize);
+        let total = s.thread_count(&ThreadFilter::All).unwrap();
+        println!("thread_count(All): {:?} ({total} threads)", t.elapsed());
+        let t = Instant::now();
+        let (mut offset, mut seen) = (0usize, 0usize);
         loop {
-            let page = s.list_page(before, 5000).unwrap();
+            let page = s.thread_page(&ThreadFilter::All, offset, 200).unwrap();
             if page.is_empty() {
                 break;
             }
-            seen += page.len();
-            before = page.last().and_then(|m| m.uid);
+            seen += page.iter().map(|x| x.count).sum::<usize>();
+            offset += page.len();
         }
         println!(
-            "list_page walk ({seen} rows, pages of 5000): {:?}",
+            "thread_page walk ({seen} messages, windows of 200): {:?}",
             t.elapsed()
+        );
+
+        // A rare label, on ten messages in ten threads.
+        for msgid in 1_000_000_000_001..=1_000_000_000_010u64 {
+            let labels: BTreeSet<String> = [
+                "\\Inbox".to_string(),
+                "Work".to_string(),
+                "Rare".to_string(),
+            ]
+            .into();
+            s.set_labels(msgid, &labels).unwrap();
+        }
+        let t = Instant::now();
+        let rare_total = s.thread_count(&ThreadFilter::Label("Rare".into())).unwrap();
+        let rare_page = s
+            .thread_page(&ThreadFilter::Label("Rare".into()), 0, 200)
+            .unwrap();
+        println!(
+            "label Rare: count + first window: {:?} ({rare_total} threads, {} shown)",
+            t.elapsed(),
+            rare_page.len()
+        );
+
+        let t = Instant::now();
+        let work_total = s.thread_count(&ThreadFilter::Label("Work".into())).unwrap();
+        let work_page = s
+            .thread_page(&ThreadFilter::Label("Work".into()), 0, 200)
+            .unwrap();
+        println!(
+            "label Work: count + first window: {:?} ({work_total} threads, {} shown)",
+            t.elapsed(),
+            work_page.len()
+        );
+
+        let t = Instant::now();
+        let hits = s
+            .thread_count(&ThreadFilter::Search("something".into()))
+            .unwrap();
+        let hit_page = s
+            .thread_page(&ThreadFilter::Search("something".into()), 0, 200)
+            .unwrap();
+        println!(
+            "search \"something\" (every message matches): count + first window: {:?} ({hits} threads, {} shown)",
+            t.elapsed(),
+            hit_page.len()
         );
 
         let t = Instant::now();

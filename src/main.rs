@@ -4,9 +4,10 @@
 //! Otherwise it shows a sign-in dialog.
 //! Mail access runs on a worker thread (see `worker.rs`).
 //!
-//! The list is sized for large mailboxes. Messages live in a map keyed by UID,
-//! label totals come from the cache, the visible order is
-//! rebuilt only when something changes, and only the rows on screen are drawn.
+//! The thread list is read from the cache a window at a time, so only the rows
+//! near the screen are held in memory. Labels and search are answered by the
+//! cache's indexes, and only the open conversation's messages are kept whole.
+//! Only the rows on screen are drawn.
 
 mod backend;
 mod credentials;
@@ -28,8 +29,9 @@ use gmail_imap_proto::render_plaintext;
 use gmail_imap_proto::settings::{self, CHECK_INTERVAL_RANGE, PAGE_SIZE_RANGE, Settings};
 
 use backend::Message;
+use gmail_imap_proto::store::ThreadFilter;
 use reader::{Block, Segment};
-use worker::{Command, Event, Link};
+use worker::{Command, Event, Link, ThreadEntry};
 
 fn main() -> eframe::Result {
     let creds = match (
@@ -92,6 +94,11 @@ fn row_chips(m: &Message, filter: Option<&str>) -> Vec<String> {
     labels.into_iter().cloned().collect()
 }
 
+/// Thread rows read per request. Rows near the screen are read in chunks this size.
+const WINDOW_CHUNK: usize = 200;
+/// Rows read on each side of the visible rows, so a little scrolling needs no wait.
+const WINDOW_PAD: usize = 100;
+
 /// Gap between the items of a row.
 const ROW_GAP: f32 = 4.0;
 /// Width of the checkbox column, on the far left of every row.
@@ -143,38 +150,6 @@ fn paint_chip(ui: &mut egui::Ui, rect: egui::Rect, text: &str, font: &egui::Font
         font.clone(),
         color,
     );
-}
-
-/// Groups messages into one row per conversation, in the order given (newest
-/// first). Each row is shown by its first message, with the count and unread
-/// state of the conversation's messages in the view.
-fn conversation_rows<'a>(
-    messages: impl Iterator<Item = &'a Message>,
-    filter: Option<&str>,
-) -> Vec<ThreadRow> {
-    let mut rows: Vec<ThreadRow> = Vec::new();
-    let mut index: HashMap<u64, usize> = HashMap::new();
-    for m in messages {
-        if !filter.is_none_or(|l| m.labels.contains(l)) {
-            continue;
-        }
-        match index.get(&m.thrid) {
-            Some(&i) => {
-                rows[i].count += 1;
-                rows[i].unread |= !m.seen;
-            }
-            None => {
-                index.insert(m.thrid, rows.len());
-                rows.push(ThreadRow {
-                    thrid: m.thrid,
-                    rep: m.uid,
-                    count: 1,
-                    unread: !m.seen,
-                });
-            }
-        }
-    }
-    rows
 }
 
 /// The title of a conversation row: the newest message's sender and subject, with
@@ -240,18 +215,6 @@ struct LoginForm {
     error: Option<String>,
 }
 
-/// One row of the message list: a conversation, shown by its newest message in the view.
-#[derive(Clone, Copy)]
-struct ThreadRow {
-    thrid: u64,
-    /// UID of the newest message in the view with this thread ID.
-    rep: u32,
-    /// How many messages of the conversation are in the view.
-    count: usize,
-    /// Whether any of them is unread.
-    unread: bool,
-}
-
 struct App {
     ctx: egui::Context,
     settings: Settings,
@@ -278,18 +241,26 @@ struct App {
     cached_count: usize,
     login: LoginForm,
 
-    /// Messages keyed by UID. Iterating in reverse gives newest first.
-    messages: BTreeMap<u32, Message>,
-    /// Label name to number of cached messages with it, from the cache. Shared, so
-    /// the sidebar can hold it each frame without copying.
+    /// Cached messages per label, from the cache. Shared, so the sidebar can hold it each frame.
     counts: Arc<BTreeMap<String, usize>>,
+    /// Cached messages overall, for All Mail.
+    messages_total: usize,
     /// Every label on the account, from the server. Includes labels with no cached messages.
     known_labels: Arc<BTreeSet<String>>,
-    /// Conversations in display order, after the filter. Rebuilt when `view_dirty` is set.
-    view: Vec<ThreadRow>,
-    view_dirty: bool,
-    /// When the visible order was last rebuilt. Large lists are rebuilt at most a few times a second.
-    view_built: Instant,
+
+    /// Rows of the thread list, from `window_start` on, read from the cache.
+    window_rows: Vec<ThreadEntry>,
+    window_start: usize,
+    /// Threads in the list the window belongs to.
+    window_total: usize,
+    /// The list the window rows belong to. `None` until the first answer for a list.
+    window_filter: Option<ThreadFilter>,
+    /// The last window asked for, so the same one isn't asked for twice.
+    sent_window: Option<(ThreadFilter, usize, usize)>,
+    /// Something on screen has changed. Refreshes are throttled.
+    view_stale: bool,
+    /// When the list and conversation were last refreshed.
+    view_asked: Instant,
 
     /// `(loaded, total)` while the initial list is loading.
     loading: Option<(usize, usize)>,
@@ -302,17 +273,19 @@ struct App {
     requested_bodies: HashSet<u32>,
     /// Rendered blocks of messages in the reader, by UID.
     rendered: HashMap<u32, Vec<Block>>,
-    /// UIDs of cached messages, grouped by `X-GM-THRID`.
-    threads: HashMap<u64, BTreeSet<u32>>,
     /// A suspicious link waiting for the user to confirm it.
     pending_link: Option<LinkInfo>,
 
+    /// Search text. A non-empty search replaces the label list.
+    search: String,
     /// `None` shows All Mail, `Some(label)` filters by one raw label.
     filter: Option<String>,
     /// Checked conversations, by thread ID. An action on one applies to all its messages.
     checked: BTreeSet<u64>,
-    /// The open message, by UID.
-    open: Option<u32>,
+    /// The open conversation, by thread ID.
+    open_thread: Option<u64>,
+    /// The messages of the open conversation, by UID. Bodies arrive separately.
+    thread_msgs: BTreeMap<u32, Message>,
     label_input: String,
     /// IMAP commands issued this session, newest last.
     log: Vec<String>,
@@ -355,12 +328,16 @@ impl App {
             mailbox_total: 0,
             cached_count: 0,
             login,
-            messages: BTreeMap::new(),
             counts: Arc::default(),
+            messages_total: 0,
             known_labels: Arc::default(),
-            view: Vec::new(),
-            view_dirty: true,
-            view_built: Instant::now(),
+            window_rows: Vec::new(),
+            window_start: 0,
+            window_total: 0,
+            window_filter: None,
+            sent_window: None,
+            view_stale: false,
+            view_asked: Instant::now(),
             loading: None,
             idle_on: false,
             checking: false,
@@ -368,11 +345,12 @@ impl App {
             last_check: Instant::now(),
             requested_bodies: HashSet::new(),
             rendered: HashMap::new(),
-            threads: HashMap::new(),
             pending_link: None,
+            search: String::new(),
             filter: None,
             checked: BTreeSet::new(),
-            open: None,
+            open_thread: None,
+            thread_msgs: BTreeMap::new(),
             label_input: String::new(),
             log: Vec::new(),
             status: None,
@@ -427,79 +405,41 @@ impl App {
                 self.login.error = Some(e);
             }
             Event::Reset => {
-                self.messages.clear();
                 self.counts = Arc::default();
-                self.view_dirty = true;
+                self.messages_total = 0;
                 self.cached_count = 0;
+                self.change_list();
+                self.thread_msgs.clear();
                 self.requested_bodies.clear();
                 self.rendered.clear();
-                self.threads.clear();
-                self.open = None;
+                self.open_thread = None;
                 self.checked.clear();
+                self.view_stale = true;
             }
             Event::Progress { cached, total } => {
                 self.cached_count = cached;
                 self.mailbox_total = total;
+                if self.loading.is_some() {
+                    self.loading = Some((cached, total));
+                }
+                self.view_stale = true;
             }
-            // The cache's totals cover the whole mailbox, not just the loaded rows.
-            Event::LabelCounts(counts) => self.counts = Arc::new(counts.into_iter().collect()),
             Event::Reconnecting => self.reconnecting = true,
             Event::Reconnected => {
                 self.reconnecting = false;
                 self.status = None;
             }
-            Event::LoadStarted { total } => self.loading = Some((0, total)),
-            Event::Batch(msgs) => {
-                if let Some((loaded, _)) = &mut self.loading {
-                    *loaded += msgs.len();
-                }
-                self.insert(msgs);
-            }
+            Event::LoadStarted { total } => self.loading = Some((self.cached_count, total)),
             Event::LoadFinished => {
                 self.loading = None;
                 self.last_check = Instant::now();
+                self.view_stale = true;
             }
-            Event::CheckFinished(msgs) => {
+            Event::CheckFinished => {
                 self.checking = false;
                 self.last_check = Instant::now();
-                self.insert(msgs);
+                self.view_stale = true;
             }
-            Event::Body { uid, raw } => {
-                self.requested_bodies.remove(&uid);
-                if let Some(m) = self.messages.get_mut(&uid) {
-                    m.body = Some(raw);
-                }
-            }
-            Event::Labels { updates, command } => {
-                for u in updates {
-                    if let Some(m) = self.messages.get_mut(&u.uid) {
-                        m.labels = u.labels;
-                        m.seen = u.seen;
-                        self.view_dirty = true;
-                    }
-                }
-                self.log.push(command);
-            }
-            Event::Removed(uids) => {
-                for uid in uids {
-                    if let Some(m) = self.messages.remove(&uid)
-                        && let Some(set) = self.threads.get_mut(&m.thrid)
-                    {
-                        set.remove(&uid);
-                        if set.is_empty() {
-                            self.threads.remove(&m.thrid);
-                        }
-                    }
-                    self.requested_bodies.remove(&uid);
-                    if self.open == Some(uid) {
-                        self.open = None;
-                        self.rendered.remove(&uid);
-                    }
-                }
-                self.view_dirty = true;
-            }
-            Event::IdleState(on) => self.idle_on = on,
-            Event::LabelList(labels) => self.known_labels = Arc::new(labels.into_iter().collect()),
             Event::NewArrivals(msgs) => {
                 if self.settings.notifications {
                     let items: Vec<notify::NewMail> = msgs
@@ -515,6 +455,64 @@ impl App {
                     }
                 }
             }
+            Event::Body { uid, raw } => {
+                self.requested_bodies.remove(&uid);
+                if let Some(m) = self.thread_msgs.get_mut(&uid) {
+                    m.body = Some(raw);
+                }
+            }
+            Event::Labels { updates, command } => {
+                for u in updates {
+                    if let Some(m) = self.thread_msgs.get_mut(&u.uid) {
+                        m.labels = u.labels;
+                        m.seen = u.seen;
+                    }
+                }
+                self.log.push(command);
+                self.view_stale = true;
+            }
+            Event::Removed(uids) => {
+                for uid in uids {
+                    self.thread_msgs.remove(&uid);
+                    self.requested_bodies.remove(&uid);
+                    self.rendered.remove(&uid);
+                }
+                self.view_stale = true;
+            }
+            Event::IdleState(on) => self.idle_on = on,
+            Event::LabelList(labels) => self.known_labels = Arc::new(labels.into_iter().collect()),
+            Event::LabelCounts { labels, messages } => {
+                self.counts = Arc::new(labels.into_iter().collect());
+                self.messages_total = messages;
+            }
+            Event::Window {
+                filter,
+                start,
+                threads,
+                total,
+            } => {
+                // An answer for a list that has since changed is out of date, so it's dropped.
+                if filter == self.thread_filter() {
+                    self.window_filter = Some(filter);
+                    self.window_start = start;
+                    self.window_rows = threads;
+                    self.window_total = total;
+                }
+            }
+            Event::Thread { thrid, messages } => {
+                if self.open_thread == Some(thrid) {
+                    // Bodies already fetched are kept: they aren't in the cache's headers.
+                    let mut old = std::mem::take(&mut self.thread_msgs);
+                    for mut m in messages {
+                        if let Some(prev) = old.remove(&m.uid) {
+                            m.body = prev.body;
+                        }
+                        self.thread_msgs.insert(m.uid, m);
+                    }
+                    let present = &self.thread_msgs;
+                    self.rendered.retain(|uid, _| present.contains_key(uid));
+                }
+            }
             Event::Error(e) => {
                 self.checking = false;
                 self.loading = None;
@@ -523,46 +521,108 @@ impl App {
         }
     }
 
-    /// Adds messages, replacing any with the same UID. Bodies already fetched are kept.
-    fn insert(&mut self, msgs: Vec<Message>) {
-        if msgs.is_empty() {
-            return;
+    /// The threads the list shows: the search, if there is one, else the label.
+    fn thread_filter(&self) -> ThreadFilter {
+        let text = self.search.trim();
+        if !text.is_empty() {
+            return ThreadFilter::Search(text.to_string());
         }
-        for mut m in msgs {
-            // The list doesn't need raw headers. Dropping them keeps a whole mailbox in memory.
-            m.headers = Vec::new();
-            match self.messages.get_mut(&m.uid) {
-                Some(existing) => {
-                    m.body = existing.body.take();
-                    *existing = m;
-                }
-                None => {
-                    self.threads.entry(m.thrid).or_default().insert(m.uid);
-                    self.messages.insert(m.uid, m);
-                }
-            }
+        match &self.filter {
+            None => ThreadFilter::All,
+            Some(label) => ThreadFilter::Label(label.clone()),
         }
-        self.view_dirty = true;
     }
 
-    /// Rebuilds the visible order if anything changed since the last frame.
-    fn refresh_view(&mut self) {
-        if !self.view_dirty {
+    /// Drops the list rows, so the next list is read from the cache.
+    fn change_list(&mut self) {
+        self.window_filter = None;
+        self.window_rows.clear();
+        self.window_total = 0;
+        self.sent_window = None;
+    }
+
+    /// Shows the threads with one label, or All Mail for `None`. Clears the search.
+    fn set_label_filter(&mut self, key: Option<String>) {
+        self.filter = key;
+        self.search.clear();
+        self.change_list();
+    }
+
+    /// Asks the worker for rows of the thread list, unless that exact range was just asked for.
+    fn request_window(&mut self, start: usize, count: usize) {
+        let filter = self.thread_filter();
+        let key = (filter.clone(), start, count);
+        if self.sent_window.as_ref() == Some(&key) {
             return;
         }
-        // While a large mailbox streams in, rebuilding on every batch would stall
-        // frames. Rebuild at most every 250 ms, and make sure a last rebuild happens.
-        if self.messages.len() > 50_000 && self.view_built.elapsed() < Duration::from_millis(250) {
+        self.sent_window = Some(key);
+        self.send(Command::Window {
+            filter,
+            start,
+            count,
+        });
+    }
+
+    /// Opens a conversation. Its messages are read from the cache, and their bodies follow.
+    fn open_conversation(&mut self, thrid: u64) {
+        self.open_thread = Some(thrid);
+        self.thread_msgs.clear();
+        self.rendered.clear();
+        self.requested_bodies.clear();
+        self.send(Command::Thread { thrid });
+    }
+
+    /// Re-reads the rows on screen and the open conversation after a change. Repeats are
+    /// throttled, so a long load doesn't ask for a refresh on every batch.
+    fn refresh_views(&mut self) {
+        if !self.view_stale {
+            return;
+        }
+        if self.view_asked.elapsed() < Duration::from_millis(250) {
             self.ctx.request_repaint_after(Duration::from_millis(250));
             return;
         }
-        self.view_built = Instant::now();
-        self.view_dirty = false;
-        let filter = self.filter.as_deref();
-        self.view = conversation_rows(self.messages.values().rev(), filter);
-        // Drop checks on conversations that no longer exist.
-        let threads = &self.threads;
-        self.checked.retain(|t| threads.contains_key(t));
+        self.view_stale = false;
+        self.view_asked = Instant::now();
+        if let Some((_, start, count)) = self.sent_window.take() {
+            self.request_window(start, count);
+        }
+        if let Some(thrid) = self.open_thread {
+            self.send(Command::Thread { thrid });
+        }
+    }
+
+    /// Asks the worker for a message's body unless it is already here or on its way.
+    fn request_body(&mut self, uid: u32) {
+        let has_body = self.thread_msgs.get(&uid).is_some_and(|m| m.body.is_some());
+        if has_body || self.requested_bodies.contains(&uid) {
+            return;
+        }
+        self.requested_bodies.insert(uid);
+        self.send(Command::FetchBody { uid });
+    }
+
+    /// The conversations an action applies to: the checked ones, or else the open one.
+    fn target_thrids(&self) -> Vec<u64> {
+        if !self.checked.is_empty() {
+            self.checked.iter().copied().collect()
+        } else {
+            self.open_thread.into_iter().collect()
+        }
+    }
+
+    fn apply(&mut self, action: LabelAction, labels: Vec<String>) {
+        let thrids = self.target_thrids();
+        if thrids.is_empty() {
+            self.status = Some("Select a message or check some boxes first.".into());
+            return;
+        }
+        self.status = None;
+        self.send(Command::Modify {
+            thrids,
+            action,
+            labels,
+        });
     }
 
     fn check_now(&mut self) {
@@ -572,48 +632,6 @@ impl App {
         self.checking = true;
         self.last_check = Instant::now();
         self.send(Command::CheckNew);
-    }
-
-    /// Asks the worker for a message's body unless it is already here or on its way.
-    fn request_body(&mut self, uid: u32) {
-        let has_body = self.messages.get(&uid).is_some_and(|m| m.body.is_some());
-        if has_body || self.requested_bodies.contains(&uid) {
-            return;
-        }
-        self.requested_bodies.insert(uid);
-        self.send(Command::FetchBody { uid });
-    }
-
-    /// The messages an action applies to: every message of the checked
-    /// conversations, or else of the open one. Returns UIDs.
-    fn target_uids(&self) -> Vec<u32> {
-        let thrids: Vec<u64> = if !self.checked.is_empty() {
-            self.checked.iter().copied().collect()
-        } else {
-            self.open
-                .and_then(|uid| self.messages.get(&uid))
-                .map(|m| vec![m.thrid])
-                .unwrap_or_default()
-        };
-        thrids
-            .iter()
-            .filter_map(|t| self.threads.get(t))
-            .flat_map(|set| set.iter().copied())
-            .collect()
-    }
-
-    fn apply(&mut self, action: LabelAction, labels: Vec<String>) {
-        let uids = self.target_uids();
-        if uids.is_empty() {
-            self.status = Some("Select a message or check some boxes first.".into());
-            return;
-        }
-        self.status = None;
-        self.send(Command::Modify {
-            uids,
-            action,
-            labels,
-        });
     }
 
     fn check_interval(&self) -> Duration {
@@ -873,8 +891,7 @@ impl App {
                 .on_hover_text(text)
                 .clicked()
             {
-                self.filter = key.map(str::to_owned);
-                self.view_dirty = true;
+                self.set_label_filter(key.map(str::to_owned));
             }
         });
         if toggle && let Some(k) = key {
@@ -905,7 +922,7 @@ impl App {
                 ui.weak("Mailboxes");
                 for (name, key) in MAILBOXES {
                     let count = match key {
-                        None => self.messages.len(),
+                        None => self.messages_total,
                         Some(k) => counts.get(k).copied().unwrap_or(0),
                     };
                     self.label_row(ui, key, name, count);
@@ -952,6 +969,15 @@ impl App {
                 );
             }
             ui.separator();
+            let search = ui.add(
+                egui::TextEdit::singleline(&mut self.search)
+                    .hint_text("Search mail")
+                    .desired_width(180.0),
+            );
+            if search.changed() {
+                self.change_list();
+            }
+            ui.separator();
             ui.add(
                 egui::TextEdit::singleline(&mut self.label_input)
                     .hint_text("label name")
@@ -977,35 +1003,61 @@ impl App {
         }
     }
 
-    /// The message list. Only the rows on screen are drawn.
+    /// The thread list. Rows are read from the cache a window at a time, and only
+    /// the rows on screen are drawn. Every row is exactly one widget tall, so the
+    /// virtual list can place rows without measuring them.
     fn message_list(&mut self, ui: &mut egui::Ui) {
-        if self.view.is_empty() {
-            ui.label(if self.loading.is_some() {
-                "Waiting for messages…"
-            } else {
-                "No messages with this label."
+        let filter = self.thread_filter();
+        if self.window_filter.as_ref() != Some(&filter) {
+            // A new list, or one that was reset: read its first rows.
+            self.request_window(0, WINDOW_CHUNK);
+            ui.label("Loading…");
+            return;
+        }
+        if self.window_total == 0 {
+            ui.label(match filter {
+                ThreadFilter::Search(_) => "No messages match this search.",
+                _ if self.loading.is_some() => "Waiting for messages…",
+                _ => "No messages with this label.",
             });
             return;
         }
-        // Every row is exactly one widget tall, so the virtual list can place rows
-        // without measuring them. Long text is truncated, never wrapped.
+
         let row_height = ui.spacing().interact_size.y;
-        // Take the order out of `self` so rows can borrow the rest of it.
+        let filter_label: Option<String> = match &filter {
+            ThreadFilter::Label(label) => Some(label.clone()),
+            _ => None,
+        };
+        let total = self.window_total;
+        let start = self.window_start;
+        // Take the rows out of `self` so they can be drawn while `self` is used.
+        let rows = std::mem::take(&mut self.window_rows);
+        let mut wanted: Option<(usize, usize)> = None;
         let mut clicked_label: Option<String> = None;
-        let view = std::mem::take(&mut self.view);
+        let mut opened: Option<u64> = None;
         egui::ScrollArea::vertical()
             .id_salt("message_list")
-            .show_rows(ui, row_height, view.len(), |ui, range| {
-                for &row in &view[range] {
-                    let Some(m) = self.messages.get(&row.rep) else {
+            .show_rows(ui, row_height, total, |ui, range| {
+                wanted = Some((range.start, range.len()));
+                for i in range {
+                    let Some(entry) = i.checked_sub(start).and_then(|k| rows.get(k)) else {
+                        // Not read yet. Keep the row's place so the list doesn't jump.
+                        let _ = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), row_height),
+                            egui::Sense::hover(),
+                        );
                         continue;
                     };
+                    let m = &entry.head;
+                    let thrid = entry.thrid;
+                    let count = entry.count;
+                    let unread = entry.unread > 0;
                     ui.horizontal(|ui| {
                         // The gap between items is set here, and the widths below assume it.
                         ui.spacing_mut().item_spacing.x = ROW_GAP;
                         // Leave room for the scrollbar, which can sit over the right edge.
                         let pane_w = ui.available_width() - ui.spacing().scroll.allocated_width();
-                        let mut checked = self.checked.contains(&row.thrid);
+                        let mut checked = self.checked.contains(&thrid);
                         let box_changed = ui
                             .add_sized(
                                 [CHECK_WIDTH, row_height],
@@ -1014,16 +1066,16 @@ impl App {
                             .changed();
                         if box_changed {
                             if checked {
-                                self.checked.insert(row.thrid);
+                                self.checked.insert(thrid);
                             } else {
-                                self.checked.remove(&row.thrid);
+                                self.checked.remove(&thrid);
                             }
                         }
-                        let open = self.open == Some(row.rep);
+                        let open = self.open_thread == Some(thrid);
                         // Every item has a fixed width, so the row can't grow frame to frame.
                         // The date is the fixed column on the right. The subject takes the rest.
-                        let title_text = row_title(m, row.count, row.unread);
-                        let chips = row_chips(m, self.filter.as_deref());
+                        let title_text = row_title(m, count, unread);
+                        let chips = row_chips(m, filter_label.as_deref());
                         let (shown, hidden) = chips.split_at(chips.len().min(MAX_CHIPS));
                         // (raw label to filter by, shown text, tooltip). The "+N" chip has no label.
                         let mut tags: Vec<(Option<String>, String, String)> = shown
@@ -1066,8 +1118,8 @@ impl App {
                                 )
                             })
                             .inner;
-                        if title.on_hover_text(format!("thread {}", m.thrid)).clicked() {
-                            self.open = Some(row.rep);
+                        if title.on_hover_text(format!("thread {thrid}")).clicked() {
+                            opened = Some(thrid);
                         }
 
                         for ((raw, text, tip), w) in tags.iter().zip(&widths) {
@@ -1088,32 +1140,37 @@ impl App {
                     });
                 }
             });
-        self.view = view;
-        // Clicking a label chip shows the conversations with that label.
+        self.window_rows = rows;
+
+        if let Some(thrid) = opened {
+            self.open_conversation(thrid);
+        }
+        // Clicking a label chip shows the threads with that label. Otherwise, read the
+        // rows on screen if they aren't held yet.
         if let Some(label) = clicked_label {
-            self.filter = Some(label);
-            self.view_dirty = true;
+            self.set_label_filter(Some(label));
+        } else if let Some((first, len)) = wanted {
+            let covered = first >= self.window_start
+                && first + len <= self.window_start + self.window_rows.len();
+            if !covered {
+                let from = first.saturating_sub(WINDOW_PAD);
+                let count = (len + 2 * WINDOW_PAD).max(WINDOW_CHUNK);
+                self.request_window(from, count);
+            }
         }
     }
 
-    /// The reader: the whole conversation the open message belongs to, newest first.
+    /// The reader: every message of the open conversation, newest first.
     fn reader(&mut self, ui: &mut egui::Ui) {
-        let Some(open) = self.open else {
+        let Some(thrid) = self.open_thread else {
             ui.label("Open a message to read it.");
             return;
         };
-        let Some(thrid) = self.messages.get(&open).map(|m| m.thrid) else {
-            return;
-        };
-        let mut thread: Vec<u32> = self
-            .threads
-            .get(&thrid)
-            .map(|set| set.iter().copied().collect())
-            .unwrap_or_else(|| vec![open]);
+        let mut thread: Vec<u32> = self.thread_msgs.keys().copied().collect();
         // Newest first, by when each message was sent.
         thread.sort_by_key(|uid| {
             std::cmp::Reverse(
-                self.messages
+                self.thread_msgs
                     .get(uid)
                     .map_or((0i64, 0u32), |m| (m.sent, m.uid)),
             )
@@ -1121,10 +1178,8 @@ impl App {
 
         // Every label on the conversation, system labels first.
         let mut labels: BTreeSet<String> = BTreeSet::new();
-        for uid in &thread {
-            if let Some(m) = self.messages.get(uid) {
-                labels.extend(m.labels.iter().cloned());
-            }
+        for m in self.thread_msgs.values() {
+            labels.extend(m.labels.iter().cloned());
         }
         let mut sorted_labels: Vec<&String> = labels.iter().collect();
         sorted_labels.sort_by_key(|l| (!l.starts_with('\\'), l.to_lowercase()));
@@ -1142,14 +1197,15 @@ impl App {
             if self.rendered.contains_key(&uid) {
                 continue;
             }
-            let Some(body) = self.messages.get(&uid).and_then(|m| m.body.as_deref()) else {
+            let Some(body) = self.thread_msgs.get(&uid).and_then(|m| m.body.as_deref()) else {
                 continue;
             };
             let text = render_plaintext(body).unwrap_or_else(|| "(could not parse message)".into());
             self.rendered.insert(uid, reader::blocks(&text));
         }
         if self.rendered.len() > 300 {
-            self.rendered.retain(|uid, _| thread.contains(uid));
+            let present = &self.thread_msgs;
+            self.rendered.retain(|uid, _| present.contains_key(uid));
         }
 
         let open_url = (thrid != 0).then(|| gmail_thread_url(thrid));
@@ -1185,10 +1241,14 @@ impl App {
             }
         });
         if let Some(label) = clicked_label {
-            self.filter = Some(label);
-            self.view_dirty = true;
+            self.set_label_filter(Some(label));
         }
         ui.separator();
+        if thread.is_empty() {
+            ui.spinner();
+            ui.label("Loading conversation…");
+            return;
+        }
 
         let newest = thread.first().copied();
         let session_key = self.settings.gmail_session_key.clone();
@@ -1198,7 +1258,7 @@ impl App {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for &uid in &thread {
-                    let Some(m) = self.messages.get(&uid) else {
+                    let Some(m) = self.thread_msgs.get(&uid) else {
                         continue;
                     };
                     let title = format!("{} — {}   {}", m.from, m.subject, m.date);
@@ -1207,7 +1267,7 @@ impl App {
                     } else {
                         egui::RichText::new(title).strong()
                     };
-                    let expanded = uid == open || Some(uid) == newest;
+                    let expanded = Some(uid) == newest;
                     ui.push_id(uid, |ui| {
                         egui::CollapsingHeader::new(title)
                             .default_open(expanded)
@@ -1361,7 +1421,7 @@ impl eframe::App for App {
             egui::CentralPanel::default().show(ui, |ui| self.login_dialog(ui));
             return;
         }
-        self.refresh_view();
+        self.refresh_views();
 
         // Window title: the app name and the signed-in account.
         if self.connected
@@ -1436,43 +1496,6 @@ mod tests {
             true,
             b"From: a@example.com\r\nSubject: hi\r\n\r\n".to_vec(),
         )
-    }
-
-    #[test]
-    fn conversations_are_one_row_with_a_count() {
-        let mut a = message_with(&["Work"]);
-        a.thrid = 10;
-        a.uid = 3;
-        let mut b = message_with(&["Work"]);
-        b.thrid = 10;
-        b.uid = 2;
-        b.seen = false;
-        let mut c = message_with(&["Other"]);
-        c.thrid = 20;
-        c.uid = 1;
-        // Newest first, as the view supplies them.
-        let rows = conversation_rows([&a, &b, &c].into_iter(), None);
-        assert_eq!(rows.len(), 2);
-        assert_eq!((rows[0].thrid, rows[0].rep, rows[0].count), (10, 3, 2));
-        assert!(
-            rows[0].unread,
-            "one unread message makes the conversation unread"
-        );
-        assert_eq!((rows[1].thrid, rows[1].count), (20, 1));
-    }
-
-    #[test]
-    fn filtered_count_only_counts_messages_in_the_view() {
-        let mut a = message_with(&["Work"]);
-        a.thrid = 10;
-        a.uid = 3;
-        let mut b = message_with(&["Other"]);
-        b.thrid = 10;
-        b.uid = 2;
-        let rows = conversation_rows([&a, &b].into_iter(), Some("Work"));
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].count, 1);
-        assert_eq!(rows[0].rep, 3);
     }
 
     #[test]

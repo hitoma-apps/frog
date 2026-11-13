@@ -15,7 +15,9 @@ use std::time::Duration;
 
 use eframe::egui;
 use gmail_imap_proto::labels::LabelAction;
-use gmail_imap_proto::store::{MailboxState, Store, account_cache_path};
+use gmail_imap_proto::store::{
+    DEFAULT_BODY_CAP, MailboxState, Store, ThreadFilter, account_cache_path,
+};
 
 use crate::backend::{IdleNotice, MailSource, MailboxInfo, Message, MessageUpdate, SourceError};
 use crate::live;
@@ -33,35 +35,54 @@ const RETRY_BASE: Duration = Duration::from_secs(1);
 
 /// Work for the worker, sent by the GUI.
 pub enum Command {
-    /// Drops the view and loads the newest `limit` messages, from the cache first.
+    /// Fetches the headers the cache lacks, newest first, after syncing changes.
     Load { limit: usize },
     /// Looks for messages newer than any already loaded.
     CheckNew,
     /// Fetches one body now, ahead of the background queues.
     FetchBody { uid: u32 },
-    /// Applies a label change to the given UIDs.
+    /// Applies a label change to every message in the given threads.
     Modify {
-        uids: Vec<u32>,
+        thrids: Vec<u64>,
         action: LabelAction,
         labels: Vec<String>,
     },
+    /// Reads one window of the thread list from the cache.
+    Window {
+        filter: ThreadFilter,
+        start: usize,
+        count: usize,
+    },
+    /// Reads every cached message of one thread.
+    Thread { thrid: u64 },
 }
 
-/// What the worker reports back.
+/// A row of the thread list: a conversation, its counts, and its newest message.
+pub struct ThreadEntry {
+    pub thrid: u64,
+    /// Cached messages in the thread.
+    pub count: usize,
+    /// How many of them are unread.
+    pub unread: usize,
+    pub head: Message,
+}
+
+/// What the worker reports back. Message data goes out only when the GUI asks for it.
 pub enum Event {
     Connected,
     ConnectFailed(String),
     /// The connection dropped, and the worker is trying to reconnect.
     Reconnecting,
     Reconnected,
-    /// The mailbox changed under us. The GUI must drop its view.
+    /// The mailbox changed under us. The GUI must drop what it shows.
     Reset,
+    /// A load has started. `total` is the number of messages in the mailbox.
     LoadStarted {
         total: usize,
     },
-    Batch(Vec<Message>),
     LoadFinished,
-    CheckFinished(Vec<Message>),
+    /// A check finished. Anything new is in the cache.
+    CheckFinished,
     /// Messages that arrived in a check, newer than anything we had. Used for notifications.
     NewArrivals(Vec<Message>),
     /// `cached` headers are held locally, out of `total` messages in the mailbox.
@@ -79,9 +100,24 @@ pub enum Event {
         updates: Vec<MessageUpdate>,
         command: String,
     },
-    /// The cache's label totals (label, number of cached messages with it).
-    LabelCounts(Vec<(String, usize)>),
-    /// Messages were removed on the server. Drop them from the view.
+    /// The cache's totals: cached messages per label, and cached messages overall.
+    LabelCounts {
+        labels: Vec<(String, usize)>,
+        messages: usize,
+    },
+    /// One window of the thread list, starting at `start`, out of `total` threads.
+    Window {
+        filter: ThreadFilter,
+        start: usize,
+        threads: Vec<ThreadEntry>,
+        total: usize,
+    },
+    /// Every cached message of one thread, newest first.
+    Thread {
+        thrid: u64,
+        messages: Vec<Message>,
+    },
+    /// Messages were removed on the server.
     Removed(Vec<u32>),
     /// Whether live updates (IDLE) are running, so the GUI can stop polling.
     IdleState(bool),
@@ -99,18 +135,24 @@ type Connector = Box<dyn FnMut() -> Result<Box<dyn MailSource>, String> + Send>;
 
 /// Opens the account's cache file, returning the path too. The error is for the user.
 pub fn open_cache(email: &str) -> Result<(Store, PathBuf), String> {
-    let path = account_cache_path(email)
-        .ok_or_else(|| "No data directory found; running without a cache.".to_string())?;
-    let store = Store::open(&path)
-        .map_err(|e| format!("Could not open the cache; running without it. {e}"))?;
+    let path = account_cache_path(email).ok_or_else(|| {
+        "No data directory found; the cache is kept in memory for this session.".to_string()
+    })?;
+    let store = Store::open(&path).map_err(|e| {
+        format!("Could not open the cache; it is kept in memory for this session. {e}")
+    })?;
     Ok((store, path))
 }
 
-/// The account's cache, plus any startup errors to send once connected.
+/// The account's cache, plus any startup errors to send once connected. If the cache
+/// file can't be used, a cache in memory keeps the list working for this session.
 fn cache_for(email: &str) -> (Option<Store>, Vec<Event>) {
     match open_cache(email) {
         Ok((store, _path)) => (Some(store), Vec::new()),
-        Err(e) => (None, vec![Event::Error(e)]),
+        Err(e) => (
+            Store::open_in_memory(DEFAULT_BODY_CAP).ok(),
+            vec![Event::Error(e)],
+        ),
     }
 }
 
@@ -186,9 +228,6 @@ struct State {
     uidvalidity: Option<u32>,
     /// Highest UID known to exist.
     highest: Option<u32>,
-    /// Where the background show of cached headers continues: the next page is
-    /// those with UID below this. `None` when the GUI has them all.
-    show_cursor: Option<u32>,
     /// Last synced HIGHESTMODSEQ, for CONDSTORE. `None` until the server reports one.
     modseq: Option<u64>,
     /// An expunge was seen, so the next check must reconcile UIDs.
@@ -301,9 +340,7 @@ impl Worker {
     }
 
     fn idle_work_pending(&self) -> bool {
-        !self.state.pending_headers.is_empty()
-            || !self.state.prefetch.is_empty()
-            || self.state.show_cursor.is_some()
+        !self.state.pending_headers.is_empty() || !self.state.prefetch.is_empty()
     }
 
     /// Runs `f` with the source taken out of the worker. A dropped connection is
@@ -325,6 +362,22 @@ impl Worker {
 
     /// Runs one command. A dropped connection gets one reconnect and one retry.
     fn dispatch(&mut self, cmd: Command) {
+        // Reads from the cache need no connection, so they never wait on a reconnect.
+        match &cmd {
+            Command::Window {
+                filter,
+                start,
+                count,
+            } => {
+                self.op_window(filter, *start, *count);
+                return;
+            }
+            Command::Thread { thrid } => {
+                self.op_thread(*thrid);
+                return;
+            }
+            _ => {}
+        }
         let mut retried = false;
         loop {
             if self.source.is_none() && !self.reconnect() {
@@ -347,20 +400,32 @@ impl Worker {
             Command::CheckNew => self.op_check(src),
             Command::FetchBody { uid } => self.op_fetch_body(src, *uid),
             Command::Modify {
-                uids,
+                thrids,
                 action,
                 labels,
-            } => self.op_modify(src, uids, *action, labels),
+            } => {
+                let uids = match self.store.as_ref() {
+                    Some(store) => store.uids_for_threads(thrids),
+                    None => Ok(Vec::new()),
+                };
+                match uids {
+                    Ok(uids) if uids.is_empty() => Ok(()),
+                    Ok(uids) => self.op_modify(src, &uids, *action, labels),
+                    Err(e) => {
+                        self.emit
+                            .send(Event::Error(format!("cache read failed: {e}")));
+                        Ok(())
+                    }
+                }
+            }
+            // Cache reads are answered in `dispatch`, before a connection is needed.
+            Command::Window { .. } | Command::Thread { .. } => Ok(()),
         }
     }
 
     /// One unit of background work: a batch of headers if any are pending,
     /// otherwise one body.
     fn idle_step(&mut self) {
-        if self.state.show_cursor.is_some() {
-            self.show_next_page();
-            return;
-        }
         let result = self.with_source(|w, src| {
             if w.state.pending_headers.is_empty() {
                 w.op_prefetch_one(src)
@@ -440,8 +505,11 @@ impl Worker {
         let Some(store) = self.store.as_ref() else {
             return;
         };
-        match store.label_counts() {
-            Ok(counts) => self.emit.send(Event::LabelCounts(counts)),
+        let totals = store
+            .label_counts()
+            .and_then(|labels| store.message_total().map(|messages| (labels, messages)));
+        match totals {
+            Ok((labels, messages)) => self.emit.send(Event::LabelCounts { labels, messages }),
             Err(e) => self
                 .emit
                 .send(Event::Error(format!("cache read failed: {e}"))),
@@ -461,7 +529,6 @@ impl Worker {
             self.state.cached = 0;
             self.state.highest = None;
             self.state.modseq = None;
-            self.state.show_cursor = None;
             self.emit.send(Event::Reset);
         }
 
@@ -541,21 +608,6 @@ impl Worker {
         }
     }
 
-    /// The newest cached messages, for showing before the network replies.
-    fn cached_messages(&mut self, limit: usize) -> Vec<Message> {
-        let Some(store) = self.store.as_ref() else {
-            return Vec::new();
-        };
-        match store.list_messages(None, limit) {
-            Ok(list) => list.into_iter().filter_map(Message::from_cached).collect(),
-            Err(e) => {
-                self.emit
-                    .send(Event::Error(format!("cache read failed: {e}")));
-                Vec::new()
-            }
-        }
-    }
-
     fn cached_body(&mut self, uid: u32) -> Option<Vec<u8>> {
         let store = self.store.as_mut()?;
         let result = store.msgid_for_uid(uid).and_then(|msgid| match msgid {
@@ -617,9 +669,9 @@ impl Worker {
         self.emit_label_counts();
     }
 
-    /// Shows the cache, applies changes made since the last sync, then fetches
-    /// whatever headers the cache lacks. The newest `limit` are fetched now. The
-    /// rest are queued for the background.
+    /// Applies changes made since the last sync, then fetches whatever headers the
+    /// cache lacks. The newest `limit` are fetched now. The rest are queued for the
+    /// background. The GUI reads the cache itself, so only progress is sent.
     fn op_load(&mut self, src: &mut dyn MailSource, limit: usize) -> Result<(), SourceError> {
         self.state.limit = limit;
         let info = src.select()?;
@@ -638,27 +690,11 @@ impl Worker {
             .collect();
         self.remove_cached(&stale);
 
-        self.emit.send(Event::LoadStarted {
-            total: limit.min(all.len()),
-        });
-        let shown = self.cached_messages(limit);
-        // If the cache holds more, the rest are shown in the background.
-        self.state.show_cursor = if shown.len() >= limit {
-            shown.last().map(|m| m.uid)
-        } else {
-            None
-        };
-        if !shown.is_empty() {
-            self.emit.send(Event::Batch(shown));
-        }
+        self.emit.send(Event::LoadStarted { total: all.len() });
 
         // Changes made since the last sync: labels and read state, from elsewhere.
         if let (Some(modseq), true) = (self.state.modseq, src.supports_condstore()) {
-            let mut fetched = Vec::new();
-            self.sync_changes(src, modseq, &mut fetched)?;
-            if !fetched.is_empty() {
-                self.emit.send(Event::Batch(fetched));
-            }
+            self.sync_changes(src, modseq)?;
         }
 
         let cached: HashSet<u32> = self
@@ -667,6 +703,7 @@ impl Worker {
             .filter(|u| server.contains(u))
             .collect();
         self.state.cached = cached.len();
+        self.emit_progress();
 
         // Headers we don't have, newest first.
         let mut missing: VecDeque<u32> = all
@@ -682,7 +719,7 @@ impl Worker {
             let msgs = src.fetch_headers(chunk)?;
             self.cache_upsert(&msgs);
             self.state.cached += msgs.len();
-            self.emit.send(Event::Batch(msgs));
+            self.emit_progress();
         }
         self.state.pending_headers = missing;
         self.state.prefetch = all.iter().rev().take(limit).copied().collect();
@@ -725,13 +762,13 @@ impl Worker {
             .into_iter()
             .filter(|&u| u > highest)
             .collect();
-        let mut msgs = if new.is_empty() {
+        let arrivals = if new.is_empty() {
             Vec::new()
         } else {
             src.fetch_headers(&new)?
         };
-        self.cache_upsert(&msgs);
-        self.state.cached += msgs.len();
+        self.cache_upsert(&arrivals);
+        self.state.cached += arrivals.len();
         if let Some(&max) = new.last() {
             self.state.highest = Some(max);
         }
@@ -740,10 +777,8 @@ impl Worker {
             self.state.prefetch.push_front(uid);
         }
 
-        // Before changes to older messages are folded in, `msgs` holds only arrivals.
-        let arrivals = msgs.clone();
         if let (Some(modseq), true) = (self.state.modseq, src.supports_condstore()) {
-            self.sync_changes(src, modseq, &mut msgs)?;
+            self.sync_changes(src, modseq)?;
         }
 
         if std::mem::take(&mut self.state.reconcile) {
@@ -756,7 +791,7 @@ impl Worker {
         if !arrivals.is_empty() {
             self.emit.send(Event::NewArrivals(arrivals));
         }
-        self.emit.send(Event::CheckFinished(msgs));
+        self.emit.send(Event::CheckFinished);
         self.emit_progress();
         self.save_sync();
         Ok(())
@@ -764,12 +799,7 @@ impl Worker {
 
     /// Applies changes made since `modseq`: labels and read state for messages
     /// we have, and full headers for messages we don't.
-    fn sync_changes(
-        &mut self,
-        src: &mut dyn MailSource,
-        modseq: u64,
-        msgs: &mut Vec<Message>,
-    ) -> Result<(), SourceError> {
+    fn sync_changes(&mut self, src: &mut dyn MailSource, modseq: u64) -> Result<(), SourceError> {
         let changes = match src.changed_since(modseq) {
             Ok(changes) => changes,
             Err(e @ SourceError::Disconnected(_)) => return Err(e),
@@ -790,7 +820,6 @@ impl Worker {
             self.state.cached += fetched.len();
             // Those messages are no longer waiting for a background header fetch.
             self.state.pending_headers.retain(|u| !uids.contains(u));
-            msgs.extend(fetched);
         }
         for c in &known {
             self.cache_update(c);
@@ -824,33 +853,6 @@ impl Worker {
         Ok(())
     }
 
-    /// Sends the next page of cached headers to the GUI, continuing down the cache.
-    fn show_next_page(&mut self) {
-        let Some(cursor) = self.state.show_cursor.take() else {
-            return;
-        };
-        let Some(store) = self.store.as_ref() else {
-            return;
-        };
-        match store.list_page(Some(cursor), BATCH) {
-            Ok(page) => {
-                let full = page.len() == BATCH;
-                let last = page.last().and_then(|c| c.uid);
-                let msgs: Vec<Message> =
-                    page.into_iter().filter_map(Message::from_cached).collect();
-                if full {
-                    self.state.show_cursor = last;
-                }
-                if !msgs.is_empty() {
-                    self.emit.send(Event::Batch(msgs));
-                }
-            }
-            Err(e) => self
-                .emit
-                .send(Event::Error(format!("cache read failed: {e}"))),
-        }
-    }
-
     /// Fetches the next batch of pending headers. On failure the batch goes back
     /// on the queue.
     fn op_fill_headers(&mut self, src: &mut dyn MailSource) -> Result<(), SourceError> {
@@ -860,7 +862,6 @@ impl Worker {
             Ok(msgs) => {
                 self.cache_upsert(&msgs);
                 self.state.cached += msgs.len();
-                self.emit.send(Event::Batch(msgs));
                 self.emit_progress();
                 Ok(())
             }
@@ -925,6 +926,65 @@ impl Worker {
         self.emit_label_counts();
         self.emit.send(Event::Labels { updates, command });
         Ok(())
+    }
+
+    /// Sends one window of the thread list, read from the cache.
+    fn op_window(&self, filter: &ThreadFilter, start: usize, count: usize) {
+        let Some(store) = self.store.as_ref() else {
+            self.emit.send(Event::Window {
+                filter: filter.clone(),
+                start,
+                threads: Vec::new(),
+                total: 0,
+            });
+            return;
+        };
+        let result = store.thread_count(filter).and_then(|total| {
+            store
+                .thread_page(filter, start, count)
+                .map(|page| (total, page))
+        });
+        match result {
+            Ok((total, page)) => {
+                let threads: Vec<ThreadEntry> = page
+                    .into_iter()
+                    .filter_map(|t| {
+                        let head = Message::from_cached(t.head)?;
+                        Some(ThreadEntry {
+                            thrid: t.thrid,
+                            count: t.count,
+                            unread: t.unread,
+                            head,
+                        })
+                    })
+                    .collect();
+                self.emit.send(Event::Window {
+                    filter: filter.clone(),
+                    start,
+                    threads,
+                    total,
+                });
+            }
+            Err(e) => self
+                .emit
+                .send(Event::Error(format!("cache read failed: {e}"))),
+        }
+    }
+
+    /// Sends every cached message of one thread.
+    fn op_thread(&self, thrid: u64) {
+        let messages: Vec<Message> = match self.store.as_ref() {
+            Some(store) => match store.thread_messages(thrid) {
+                Ok(list) => list.into_iter().filter_map(Message::from_cached).collect(),
+                Err(e) => {
+                    self.emit
+                        .send(Event::Error(format!("cache read failed: {e}")));
+                    return;
+                }
+            },
+            None => Vec::new(),
+        };
+        self.emit.send(Event::Thread { thrid, messages });
     }
 }
 
@@ -996,7 +1056,9 @@ mod tests {
     fn next_significant(link: &Link) -> Event {
         loop {
             match next(link) {
-                Event::Progress { .. } | Event::LabelList(_) | Event::LabelCounts(_) => continue,
+                Event::Progress { .. } | Event::LabelList(_) | Event::LabelCounts { .. } => {
+                    continue;
+                }
                 ev => return ev,
             }
         }
@@ -1014,8 +1076,58 @@ mod tests {
         )
     }
 
+    /// Reads one window of the thread list through the worker.
+    fn window(
+        link: &Link,
+        filter: ThreadFilter,
+        start: usize,
+        count: usize,
+    ) -> (Vec<ThreadEntry>, usize) {
+        link.commands
+            .send(Command::Window {
+                filter,
+                start,
+                count,
+            })
+            .unwrap();
+        loop {
+            if let Event::Window { threads, total, .. } = next(link) {
+                return (threads, total);
+            }
+        }
+    }
+
+    /// The whole thread list, read as one window.
+    fn threads(link: &Link) -> (Vec<ThreadEntry>, usize) {
+        window(link, ThreadFilter::All, 0, 500)
+    }
+
+    /// Cached messages in a list of threads.
+    fn cached_messages(threads: &[ThreadEntry]) -> usize {
+        threads.iter().map(|t| t.count).sum()
+    }
+
+    /// The thread that holds the message with this UID.
+    fn thread_of(link: &Link, uid: u32) -> u64 {
+        let (list, _) = threads(link);
+        for t in list {
+            link.commands
+                .send(Command::Thread { thrid: t.thrid })
+                .unwrap();
+            loop {
+                if let Event::Thread { thrid, messages } = next(link) {
+                    if messages.iter().any(|m| m.uid == uid) {
+                        return thrid;
+                    }
+                    break;
+                }
+            }
+        }
+        panic!("no thread holds uid {uid}");
+    }
+
     #[test]
-    fn loads_in_batches_then_prefetches_every_body() {
+    fn loads_then_prefetches_every_body() {
         let link = mock_link();
         assert!(matches!(next_significant(&link), Event::Connected));
         link.commands.send(Command::Load { limit: 500 }).unwrap();
@@ -1024,15 +1136,7 @@ mod tests {
             next_significant(&link),
             Event::LoadStarted { total: 6 }
         ));
-        let mut listed = 0;
-        loop {
-            match next_significant(&link) {
-                Event::Batch(m) => listed += m.len(),
-                Event::LoadFinished => break,
-                _ => panic!("unexpected event while loading"),
-            }
-        }
-        assert_eq!(listed, 6);
+        while !matches!(next_significant(&link), Event::LoadFinished) {}
 
         let mut bodies = HashSet::new();
         while bodies.len() < 6 {
@@ -1045,6 +1149,10 @@ mod tests {
             }
         }
         assert_eq!(bodies, (1..=6).collect());
+
+        // The headers went to the cache, and the list reads them from there.
+        let (list, _) = threads(&link);
+        assert_eq!(cached_messages(&list), 6);
     }
 
     #[test]
@@ -1055,23 +1163,23 @@ mod tests {
 
         assert!(matches!(
             next_significant(&link),
-            Event::LoadStarted { total: 2 }
+            Event::LoadStarted { total: 6 }
         ));
-        let mut first_page = 0;
+        // The newest two are cached before the load finishes.
+        let mut cached_at_finish = None;
         loop {
-            match next_significant(&link) {
-                Event::Batch(m) => first_page += m.len(),
+            match next(&link) {
+                Event::Progress { cached, .. } => cached_at_finish = Some(cached),
                 Event::LoadFinished => break,
+                Event::Body { .. } | Event::LabelList(_) | Event::LabelCounts { .. } => {}
                 _ => panic!("unexpected event while loading"),
             }
         }
-        assert_eq!(first_page, 2);
+        assert_eq!(cached_at_finish, Some(2));
 
         // The rest arrive in the background, and the count reaches the mailbox size.
-        let mut background = 0;
         loop {
             match next(&link) {
-                Event::Batch(m) => background += m.len(),
                 Event::Progress {
                     cached: 6,
                     total: 6,
@@ -1079,11 +1187,12 @@ mod tests {
                 Event::Body { .. }
                 | Event::Progress { .. }
                 | Event::LabelList(_)
-                | Event::LabelCounts(_) => {}
+                | Event::LabelCounts { .. } => {}
                 _ => panic!("unexpected event during background fill"),
             }
         }
-        assert_eq!(background, 4);
+        let (list, _) = threads(&link);
+        assert_eq!(cached_messages(&list), 6);
     }
 
     #[test]
@@ -1092,9 +1201,11 @@ mod tests {
         assert!(matches!(next_significant(&link), Event::Connected));
         link.commands.send(Command::Load { limit: 500 }).unwrap();
         while !matches!(next_significant(&link), Event::LoadFinished) {}
+
+        let thrid = thread_of(&link, 3);
         link.commands
             .send(Command::Modify {
-                uids: vec![3],
+                thrids: vec![thrid],
                 action: LabelAction::Remove,
                 labels: vec!["\\Inbox".to_string()],
             })
@@ -1102,9 +1213,9 @@ mod tests {
         loop {
             match next_significant(&link) {
                 Event::Labels { updates, command } => {
-                    assert_eq!(command, r#"UID STORE 3 -X-GM-LABELS ("\\Inbox")"#);
-                    assert_eq!(updates.len(), 1);
-                    assert!(!updates[0].labels.contains("\\Inbox"));
+                    assert!(command.starts_with("UID STORE"), "{command}");
+                    let three = updates.iter().find(|u| u.uid == 3).expect("uid 3 updated");
+                    assert!(!three.labels.contains("\\Inbox"));
                     break;
                 }
                 Event::Body { .. } => continue,
@@ -1114,26 +1225,25 @@ mod tests {
     }
 
     #[test]
-    fn check_with_nothing_new_reports_empty() {
+    fn check_with_nothing_new_reports_no_arrivals() {
         let link = mock_link();
         assert!(matches!(next_significant(&link), Event::Connected));
         link.commands.send(Command::Load { limit: 500 }).unwrap();
         while !matches!(next_significant(&link), Event::LoadFinished) {}
+
         link.commands.send(Command::CheckNew).unwrap();
         loop {
             match next_significant(&link) {
-                Event::CheckFinished(m) => {
-                    assert!(m.is_empty());
-                    break;
-                }
+                Event::CheckFinished => break,
                 Event::Body { .. } => continue,
+                Event::NewArrivals(_) => panic!("nothing is new"),
                 _ => panic!("unexpected event"),
             }
         }
     }
 
     #[test]
-    fn second_load_shows_cached_headers_before_fetching() {
+    fn a_later_session_reads_the_cache_before_any_load() {
         let dir = std::env::temp_dir().join(format!("gmail-worker-test-{}", std::process::id()));
         let path = dir.join("cache.sqlite");
         let _ = std::fs::remove_file(&path);
@@ -1162,7 +1272,7 @@ mod tests {
         }
         drop(first);
 
-        // Second session: the cached headers appear before any fetch.
+        // Second session: the list shows the cache at once, before any load.
         let second = spawn(
             egui::Context::default(),
             Box::new(|| Ok(Box::new(MockSource::demo()) as Box<dyn MailSource>)),
@@ -1172,22 +1282,14 @@ mod tests {
             Vec::new(),
         );
         assert!(matches!(next_significant(&second), Event::Connected));
-        second.commands.send(Command::Load { limit: 500 }).unwrap();
-        assert!(matches!(
-            next_significant(&second),
-            Event::LoadStarted { total: 6 }
-        ));
-        match next_significant(&second) {
-            Event::Batch(m) => assert_eq!(m.len(), 6, "all six come from the cache"),
-            _ => panic!("expected the cached batch first"),
-        }
-        assert!(matches!(next_significant(&second), Event::LoadFinished));
+        let (list, _) = threads(&second);
+        assert_eq!(cached_messages(&list), 6, "all six come from the cache");
         drop(second);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn cached_headers_beyond_the_first_page_reach_the_gui() {
+    fn the_list_reads_any_slice_of_the_cache() {
         let dir =
             std::env::temp_dir().join(format!("gmail-worker-page-test-{}", std::process::id()));
         let path = dir.join("cache.sqlite");
@@ -1217,7 +1319,7 @@ mod tests {
         }
         drop(first);
 
-        // Second session: a page of two, then the rest from the cache in the background.
+        // Second session: a window of two, then the rest, together making the whole list.
         let second = spawn(
             egui::Context::default(),
             Box::new(|| Ok(Box::new(MockSource::demo()) as Box<dyn MailSource>)),
@@ -1227,15 +1329,20 @@ mod tests {
             Vec::new(),
         );
         assert!(matches!(next_significant(&second), Event::Connected));
-        second.commands.send(Command::Load { limit: 2 }).unwrap();
-        let mut shown: Vec<u32> = Vec::new();
-        while shown.len() < 6 {
-            if let Event::Batch(m) = next_significant(&second) {
-                shown.extend(m.iter().map(|x| x.uid));
-            }
-        }
-        shown.sort_unstable();
-        assert_eq!(shown, vec![1, 2, 3, 4, 5, 6]);
+        let (all, total) = threads(&second);
+        assert_eq!(all.len(), total);
+        let (first_two, _) = window(&second, ThreadFilter::All, 0, 2);
+        let (rest, _) = window(&second, ThreadFilter::All, 2, 500);
+        assert_eq!(first_two.len(), total.min(2));
+        assert_eq!(rest.len(), total.saturating_sub(2));
+        let joined: Vec<u64> = first_two
+            .iter()
+            .chain(rest.iter())
+            .map(|t| t.thrid)
+            .collect();
+        let whole: Vec<u64> = all.iter().map(|t| t.thrid).collect();
+        assert_eq!(joined, whole);
+        assert_eq!(cached_messages(&all), 6);
         drop(second);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1396,15 +1503,16 @@ mod sync_tests {
             Event::Reconnected => "Reconnected",
             Event::Reset => "Reset",
             Event::LoadStarted { .. } => "LoadStarted",
-            Event::Batch(_) => "Batch",
             Event::LoadFinished => "LoadFinished",
-            Event::CheckFinished(_) => "CheckFinished",
+            Event::CheckFinished => "CheckFinished",
+            Event::Window { .. } => "Window",
+            Event::Thread { .. } => "Thread",
             Event::NewArrivals(_) => "NewArrivals",
             Event::Progress { .. } => "Progress",
             Event::Body { .. } => "Body",
             Event::Labels { .. } => "Labels",
             Event::LabelList(_) => "LabelList",
-            Event::LabelCounts(_) => "LabelCounts",
+            Event::LabelCounts { .. } => "LabelCounts",
             Event::Removed(_) => "Removed",
             Event::IdleState(_) => "IdleState",
             Event::Error(_) => "Error",
@@ -1458,11 +1566,11 @@ mod sync_tests {
         loop {
             match next(&link) {
                 Event::Labels { updates: u, .. } => updates.extend(u),
-                Event::CheckFinished(_) => break,
+                Event::CheckFinished => break,
                 Event::Body { .. }
                 | Event::Progress { .. }
                 | Event::LabelList(_)
-                | Event::LabelCounts(_)
+                | Event::LabelCounts { .. }
                 | Event::IdleState(_) => {}
                 other => panic!("unexpected event: {}", name(&other)),
             }
@@ -1501,8 +1609,8 @@ mod sync_tests {
                 Event::Body { .. }
                 | Event::Progress { .. }
                 | Event::LabelList(_)
-                | Event::LabelCounts(_)
-                | Event::CheckFinished(_) => {}
+                | Event::LabelCounts { .. }
+                | Event::CheckFinished => {}
                 other => panic!("unexpected event: {}", name(&other)),
             }
         }
@@ -1557,7 +1665,7 @@ mod sync_tests {
                     assert_eq!(msgs[0].subject, "Lunch?");
                     break;
                 }
-                Event::CheckFinished(_) => panic!("the arrival was not reported"),
+                Event::CheckFinished => panic!("the arrival was not reported"),
                 _ => {}
             }
         }
@@ -1572,7 +1680,7 @@ mod sync_tests {
         link.commands.send(Command::CheckNew).unwrap();
         loop {
             match next(&link) {
-                Event::CheckFinished(_) => break,
+                Event::CheckFinished => break,
                 Event::NewArrivals(_) => panic!("an old message was reported as new"),
                 _ => {}
             }
@@ -1596,8 +1704,8 @@ mod sync_tests {
                 Event::Body { .. }
                 | Event::Progress { .. }
                 | Event::LabelList(_)
-                | Event::LabelCounts(_)
-                | Event::CheckFinished(_)
+                | Event::LabelCounts { .. }
+                | Event::CheckFinished
                 | Event::IdleState(_)
                 | Event::Labels { .. } => {}
                 Event::Error(e) => panic!("error event: {e}"),
