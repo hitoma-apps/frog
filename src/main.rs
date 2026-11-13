@@ -100,6 +100,11 @@ const WINDOW_CHUNK: usize = 200;
 /// Rows read on each side of the visible rows, so a little scrolling needs no wait.
 const WINDOW_PAD: usize = 100;
 
+/// Width of the accent bar beside each message in the reader.
+const ACCENT_WIDTH: f32 = 3.0;
+/// Space between the accent bar and the message.
+const ACCENT_GAP: f32 = 8.0;
+
 /// Gap between the items of a row.
 const ROW_GAP: f32 = 4.0;
 /// Width of the checkbox column, on the far left of every row.
@@ -1291,34 +1296,46 @@ impl App {
                         continue;
                     };
                     let title = format!("{} — {}   {}", m.from, m.subject, m.date);
+                    // The accent colours each message's header line and its bar. Bodies keep the
+                    // normal text colour, so header and body read as separate.
+                    let accent = ui.visuals().hyperlink_color;
                     let title = if m.seen {
-                        egui::RichText::new(title)
+                        egui::RichText::new(title).color(accent)
                     } else {
-                        egui::RichText::new(title).strong()
+                        egui::RichText::new(title).strong().color(accent)
                     };
                     let expanded = Some(uid) == newest;
-                    ui.push_id(uid, |ui| {
-                        egui::CollapsingHeader::new(title)
-                            .default_open(expanded)
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.monospace(format!("msgid {} (0x{:x})", m.msgid, m.msgid));
-                                    if ui.small_button("View original").clicked() {
-                                        let url =
-                                            gmail_original_url(m.msgid, session_key.as_deref());
-                                        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
-                                    }
-                                });
-                                auth_line(ui, &m.auth);
-                                match self.rendered.get(&uid) {
-                                    Some(blocks) => {
-                                        for (i, block) in blocks.iter().enumerate() {
-                                            match block {
-                                                Block::Line(line) => {
-                                                    render_line(ui, line, &mut pending)
+                    let block =
+                        ui.horizontal_top(|ui| {
+                            ui.add_space(ACCENT_GAP);
+                            ui.vertical(|ui| {
+                                ui.push_id(uid, |ui| {
+                                    egui::CollapsingHeader::new(title)
+                                        .default_open(expanded)
+                                        .show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.monospace(format!(
+                                                    "msgid {} (0x{:x})",
+                                                    m.msgid, m.msgid
+                                                ));
+                                                if ui.small_button("View original").clicked() {
+                                                    let url = gmail_original_url(
+                                                        m.msgid,
+                                                        session_key.as_deref(),
+                                                    );
+                                                    ui.ctx().open_url(egui::OpenUrl::new_tab(url));
                                                 }
-                                                Block::Quote(lines) => {
-                                                    ui.push_id(i, |ui| {
+                                            });
+                                            auth_line(ui, &m.auth);
+                                            match self.rendered.get(&uid) {
+                                                Some(blocks) => {
+                                                    for (i, block) in blocks.iter().enumerate() {
+                                                        match block {
+                                                            Block::Line(line) => {
+                                                                render_line(ui, line, &mut pending)
+                                                            }
+                                                            Block::Quote(lines) => {
+                                                                ui.push_id(i, |ui| {
                                                         egui::CollapsingHeader::new(format!(
                                                             "▸ Quoted text ({} lines)",
                                                             lines.len()
@@ -1330,21 +1347,29 @@ impl App {
                                                             }
                                                         });
                                                     });
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                None => {
+                                                    ui.spinner();
+                                                    ui.label("Loading message…");
+                                                    ui.monospace(format!(
+                                                        "From:    {}\nSubject: {}\nDate:    {}",
+                                                        m.from, m.subject, m.date
+                                                    ));
                                                 }
                                             }
-                                        }
-                                    }
-                                    None => {
-                                        ui.spinner();
-                                        ui.label("Loading message…");
-                                        ui.monospace(format!(
-                                            "From:    {}\nSubject: {}\nDate:    {}",
-                                            m.from, m.subject, m.date
-                                        ));
-                                    }
-                                }
+                                        });
+                                });
                             });
-                    });
+                        });
+                    let r = block.response.rect;
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_size(r.min, egui::vec2(ACCENT_WIDTH, r.height())),
+                        2.0,
+                        accent,
+                    );
                 }
             });
         if pending.is_some() {
