@@ -7,6 +7,7 @@ pub mod linkcheck;
 pub mod links;
 pub mod render;
 pub mod response;
+pub mod settings;
 pub mod store;
 
 pub use labels::{Label, LabelAction, LabelRef, SystemLabel, uid_store_labels};

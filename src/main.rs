@@ -9,6 +9,7 @@
 //! rebuilt only when something changes, and only the rows on screen are drawn.
 
 mod backend;
+mod credentials;
 mod live;
 mod reader;
 mod worker;
@@ -21,15 +22,12 @@ use gmail_imap_proto::labels::{LabelAction, SystemLabel};
 use gmail_imap_proto::linkcheck::{self, LinkInfo};
 use gmail_imap_proto::links::gmail_thread_url;
 use gmail_imap_proto::render_plaintext;
+use gmail_imap_proto::settings::{self, CHECK_INTERVAL_RANGE, PAGE_SIZE_RANGE, Settings};
+use std::path::PathBuf;
 
 use backend::Message;
 use reader::{Block, Segment};
 use worker::{Command, Event, Link};
-
-/// Newest messages to show on load, before the rest of the cache fills in.
-const LIVE_LIMIT: usize = 500;
-/// How often the auto-check toggle looks for new mail.
-const AUTO_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 fn main() -> eframe::Result {
     let creds = match (
@@ -122,11 +120,16 @@ fn render_line(ui: &mut egui::Ui, line: &str, pending: &mut Option<LinkInfo>) {
 struct LoginForm {
     email: String,
     password: String,
+    /// Keep the password in the OS credential store after signing in.
+    remember: bool,
     error: Option<String>,
 }
 
 struct App {
     ctx: egui::Context,
+    settings: Settings,
+    settings_path: Option<PathBuf>,
+    settings_open: bool,
     /// The worker, once a connection attempt has started.
     link: Option<Link>,
     connecting: bool,
@@ -177,8 +180,28 @@ struct App {
 
 impl App {
     fn new(ctx: egui::Context, creds: Option<(String, String)>) -> Self {
+        let settings_path = settings::default_path();
+        let settings = settings_path
+            .as_deref()
+            .map(Settings::load_from)
+            .unwrap_or_default();
+        let mut login = LoginForm {
+            remember: settings.remember_password,
+            ..Default::default()
+        };
+        if let Some(email) = &settings.email {
+            login.email = email.clone();
+            if settings.remember_password
+                && let Some(password) = credentials::load_password(email)
+            {
+                login.password = password;
+            }
+        }
         let mut app = Self {
             ctx,
+            settings,
+            settings_path,
+            settings_open: false,
             link: None,
             connecting: false,
             connected: false,
@@ -186,7 +209,7 @@ impl App {
             mailbox_total: 0,
             cached_count: 0,
             info: None,
-            login: LoginForm::default(),
+            login,
             messages: BTreeMap::new(),
             counts: BTreeMap::new(),
             view: Vec::new(),
@@ -214,6 +237,10 @@ impl App {
 
     fn start_gmail(&mut self, user: String, password: String) {
         self.login.error = None;
+        if self.settings.email.as_deref() != Some(user.as_str()) {
+            self.settings.email = Some(user.clone());
+            self.save_settings();
+        }
         self.connecting = true;
         self.link = Some(worker::spawn_gmail(user, password, self.ctx.clone()));
     }
@@ -241,7 +268,9 @@ impl App {
                 self.connecting = false;
                 self.connected = true;
                 self.loading = Some((0, 0));
-                self.send(Command::Load { limit: LIVE_LIMIT });
+                self.send(Command::Load {
+                    limit: self.settings.page_size,
+                });
             }
             Event::ConnectFailed(e) => {
                 self.connecting = false;
@@ -405,6 +434,87 @@ impl App {
         });
     }
 
+    fn check_interval(&self) -> Duration {
+        Duration::from_secs(self.settings.check_interval_secs)
+    }
+
+    fn save_settings(&mut self) {
+        let Some(path) = self.settings_path.clone() else {
+            return;
+        };
+        if let Err(e) = self.settings.save_to(&path) {
+            self.status = Some(format!("Could not save settings: {e}"));
+        }
+    }
+
+    /// Saves or forgets the password after a sign-in, according to the checkbox.
+    fn remember_password(&mut self, user: &str, pass: &str) {
+        self.settings.remember_password = self.login.remember;
+        let result = if self.login.remember {
+            credentials::save_password(user, pass)
+        } else {
+            credentials::forget_password(user)
+        };
+        if let Err(e) = result {
+            self.status = Some(e);
+        }
+        self.save_settings();
+    }
+
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let mut open = true;
+        let mut forget = false;
+        egui::Window::new("Settings")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                egui::Grid::new("settings_grid")
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        ui.label("Check for new mail every (seconds)");
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings.check_interval_secs)
+                                .range(*CHECK_INTERVAL_RANGE.start()..=*CHECK_INTERVAL_RANGE.end()),
+                        );
+                        ui.end_row();
+
+                        ui.label("Messages per page");
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings.page_size)
+                                .range(*PAGE_SIZE_RANGE.start()..=*PAGE_SIZE_RANGE.end()),
+                        );
+                        ui.end_row();
+                    });
+                ui.add_space(8.0);
+                ui.checkbox(
+                    &mut self.settings.remember_password,
+                    "Remember password on this computer",
+                );
+                ui.weak("The page size applies the next time the mailbox loads.");
+                ui.add_space(8.0);
+                if let Some(email) = self.settings.email.clone()
+                    && ui.button("Forget saved password").clicked()
+                {
+                    forget = true;
+                    self.status = credentials::forget_password(&email).err();
+                }
+            });
+        if forget {
+            self.settings.remember_password = false;
+            self.login.remember = false;
+        }
+        self.settings = std::mem::take(&mut self.settings).clamped();
+        if !open {
+            self.settings_open = false;
+            self.login.remember = self.settings.remember_password;
+            self.save_settings();
+        }
+    }
+
     fn login_dialog(&mut self, ui: &mut egui::Ui) {
         let busy = self.connecting;
         ui.vertical_centered(|ui| {
@@ -431,6 +541,7 @@ impl App {
                     .desired_width(f32::INFINITY),
             );
             ui.weak("Needs 2-Step Verification. Create one under Google Account > Security > App passwords.");
+            ui.checkbox(&mut self.login.remember, "Remember password on this computer");
             ui.add_space(10.0);
 
             let can_submit = !busy
@@ -442,6 +553,7 @@ impl App {
             if (submit.clicked() || enter) && can_submit {
                 let user = self.login.email.trim().to_string();
                 let pass = self.login.password.clone();
+                self.remember_password(&user, &pass);
                 self.start_gmail(user, pass);
             }
 
@@ -498,6 +610,9 @@ impl App {
             if self.cached_count < self.mailbox_total {
                 ui.spinner();
                 ui.label("Caching headers…");
+            }
+            if ui.button("Settings").clicked() {
+                self.settings_open = true;
             }
         });
     }
@@ -779,11 +894,13 @@ impl eframe::App for App {
         if self.auto_check && !self.idle_on {
             if !self.checking
                 && self.loading.is_none()
-                && self.last_check.elapsed() >= AUTO_CHECK_INTERVAL
+                && self.last_check.elapsed() >= self.check_interval()
             {
                 self.check_now();
             }
-            let remaining = AUTO_CHECK_INTERVAL.saturating_sub(self.last_check.elapsed());
+            let remaining = self
+                .check_interval()
+                .saturating_sub(self.last_check.elapsed());
             ui.ctx()
                 .request_repaint_after(remaining.max(Duration::from_secs(1)));
         }
@@ -811,6 +928,7 @@ impl eframe::App for App {
         });
         let ctx = ui.ctx().clone();
         self.link_confirmation(&ctx);
+        self.settings_window(&ctx);
     }
 }
 
