@@ -55,6 +55,19 @@ fn display_label(raw: &str) -> String {
     }
 }
 
+/// Mailboxes always shown in the sidebar, even when the cache has none of their
+/// messages. `None` is All Mail, which is every message.
+const MAILBOXES: [(&str, Option<&str>); 8] = [
+    ("All Mail", None),
+    ("Inbox", Some("\\Inbox")),
+    ("Starred", Some("\\Starred")),
+    ("Important", Some("\\Important")),
+    ("Sent", Some("\\Sent")),
+    ("Drafts", Some("\\Draft")),
+    ("Spam", Some("\\Spam")),
+    ("Trash", Some("\\Trash")),
+];
+
 /// The list title for a message. Unread messages are emphasized.
 fn unread_title(m: &Message) -> egui::RichText {
     let title = egui::RichText::new(format!("{} — {}", m.from, m.subject));
@@ -637,26 +650,88 @@ impl App {
         });
     }
 
+    /// Pins a label to the top of the sidebar, or unpins it.
+    fn toggle_favorite(&mut self, key: &str) {
+        let favs = &mut self.settings.favorite_labels;
+        if let Some(i) = favs.iter().position(|f| f == key) {
+            favs.remove(i);
+        } else {
+            favs.push(key.to_string());
+        }
+        self.save_settings();
+    }
+
+    /// One sidebar row: a favorite toggle, then the label, which filters the list.
+    /// `key` is `None` for All Mail, which can't be favorited.
+    fn label_row(&mut self, ui: &mut egui::Ui, key: Option<&str>, name: &str, count: usize) {
+        let is_fav = key.is_some_and(|k| self.settings.favorite_labels.iter().any(|f| f == k));
+        let selected = self.filter.as_deref() == key;
+        let mut toggle = false;
+        ui.horizontal(|ui| {
+            if key.is_some() {
+                let star = if is_fav { "★" } else { "☆" };
+                let hover = if is_fav {
+                    "Unpin from favorites"
+                } else {
+                    "Pin to favorites"
+                };
+                if ui.small_button(star).on_hover_text(hover).clicked() {
+                    toggle = true;
+                }
+            }
+            if ui
+                .selectable_label(selected, format!("{name} ({count})"))
+                .clicked()
+            {
+                self.filter = key.map(str::to_owned);
+                self.view_dirty = true;
+            }
+        });
+        if toggle && let Some(k) = key {
+            self.toggle_favorite(k);
+        }
+    }
+
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         ui.heading("Labels");
         ui.separator();
-        if ui
-            .selectable_label(self.filter.is_none(), "All Mail")
-            .clicked()
-        {
-            self.filter = None;
-            self.view_dirty = true;
-        }
-        for (raw, count) in &self.counts {
-            let text = format!("{} ({count})", display_label(raw));
-            if ui
-                .selectable_label(self.filter.as_deref() == Some(raw.as_str()), text)
-                .clicked()
-            {
-                self.filter = Some(raw.clone());
-                self.view_dirty = true;
-            }
-        }
+        // Clone the counts so the rows can call `&mut self` methods.
+        let counts = self.counts.clone();
+        egui::ScrollArea::vertical()
+            .id_salt("sidebar")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let favorites = self.settings.favorite_labels.clone();
+                if !favorites.is_empty() {
+                    ui.weak("Favorites");
+                    for key in &favorites {
+                        let count = counts.get(key).copied().unwrap_or(0);
+                        self.label_row(ui, Some(key), &display_label(key), count);
+                    }
+                    ui.separator();
+                }
+
+                ui.weak("Mailboxes");
+                for (name, key) in MAILBOXES {
+                    let count = match key {
+                        None => self.messages.len(),
+                        Some(k) => counts.get(k).copied().unwrap_or(0),
+                    };
+                    self.label_row(ui, key, name, count);
+                }
+
+                let user: Vec<(&String, &usize)> = counts
+                    .iter()
+                    .filter(|(k, _)| !k.starts_with('\\'))
+                    .collect();
+                if !user.is_empty() {
+                    ui.separator();
+                    ui.weak("Labels");
+                    for (k, count) in user {
+                        self.label_row(ui, Some(k), k, *count);
+                    }
+                }
+            });
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {

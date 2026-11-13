@@ -28,6 +28,8 @@ pub struct Settings {
     pub page_size: usize,
     /// Show a desktop notification when new mail arrives.
     pub notifications: bool,
+    /// Raw label names pinned to the top of the sidebar, in the order they were added.
+    pub favorite_labels: Vec<String>,
 }
 
 impl Default for Settings {
@@ -38,6 +40,7 @@ impl Default for Settings {
             check_interval_secs: 60,
             page_size: 500,
             notifications: true,
+            favorite_labels: Vec::new(),
         }
     }
 }
@@ -107,6 +110,7 @@ mod tests {
             check_interval_secs: 120,
             page_size: 200,
             notifications: false,
+            favorite_labels: vec!["\\Starred".into(), "Work".into()],
         };
         s.save_to(&path).unwrap();
         assert_eq!(Settings::load_from(&path), s);
