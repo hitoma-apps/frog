@@ -70,10 +70,10 @@ const MAILBOXES: [(&str, Option<&str>); 8] = [
 
 /// Most label chips shown on a row. Any more become a "+N" chip.
 const MAX_CHIPS: usize = 3;
-/// Widest a label chip may be. Longer names are cut off, with the full name on hover.
-const CHIP_MAX_WIDTH: f32 = 80.0;
+/// Widest the text of a label chip may be. Longer names are cut off, with the full name on hover.
+const CHIP_TEXT_MAX: f32 = 80.0;
 /// Width of the date column, on the right of every row.
-const DATE_WIDTH: f32 = 190.0;
+const DATE_WIDTH: f32 = 210.0;
 
 /// The chips for a message row, in display order. Leaves out the label the view is
 /// filtered by. In a mailbox view (All Mail or a system folder) it also leaves out
@@ -91,18 +91,55 @@ fn row_chips(m: &Message, filter: Option<&str>) -> Vec<String> {
     labels.into_iter().map(|l| display_label(l)).collect()
 }
 
-/// One label chip: a small rounded tag. `tooltip` is shown on hover.
-fn label_chip(ui: &mut egui::Ui, text: &str, tooltip: &str) {
-    egui::Frame::new()
-        .fill(ui.visuals().widgets.inactive.weak_bg_fill)
-        .corner_radius(8)
-        .inner_margin(egui::Margin::symmetric(6, 1))
-        .show(ui, |ui| {
-            ui.set_max_width(CHIP_MAX_WIDTH);
-            ui.add(egui::Label::new(egui::RichText::new(text).small()).truncate());
+/// Gap between the items of a row.
+const ROW_GAP: f32 = 4.0;
+
+/// The width a chip needs: its text, cut to `CHIP_TEXT_MAX`, plus padding.
+fn chip_width(ui: &egui::Ui, text: &str, font: &egui::FontId) -> f32 {
+    let w = ui.ctx().fonts_mut(|f| {
+        f.layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::WHITE)
+            .size()
+            .x
+    });
+    w.min(CHIP_TEXT_MAX) + 12.0
+}
+
+/// `text`, cut short with an ellipsis so it fits in `max_w`.
+fn fit_text(ui: &egui::Ui, text: &str, font: &egui::FontId, max_w: f32) -> String {
+    let width = |s: &str| {
+        ui.ctx().fonts_mut(|f| {
+            f.layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::WHITE)
+                .size()
+                .x
         })
-        .response
-        .on_hover_text(tooltip);
+    };
+    if width(text) <= max_w {
+        return text.to_owned();
+    }
+    let mut chars: Vec<char> = text.chars().collect();
+    while chars.pop().is_some() {
+        let candidate: String = chars.iter().collect::<String>() + "…";
+        if width(&candidate) <= max_w {
+            return candidate;
+        }
+    }
+    "…".to_owned()
+}
+
+/// Paints one label chip into `rect`.
+fn paint_chip(ui: &mut egui::Ui, rect: egui::Rect, text: &str, font: &egui::FontId) {
+    let fill = ui.visuals().widgets.inactive.weak_bg_fill;
+    let color = ui.visuals().text_color();
+    ui.painter()
+        .rect_filled(rect.shrink2(egui::vec2(0.0, 2.0)), 8.0, fill);
+    let shown = fit_text(ui, text, font, rect.width() - 12.0);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        shown,
+        font.clone(),
+        color,
+    );
 }
 
 /// Groups messages into one row per conversation, in the order given (newest
@@ -944,59 +981,58 @@ impl App {
                             }
                         }
                         let open = self.open == Some(row.rep);
-                        // The date is a fixed column on the far right. The subject cell takes
-                        // the rest: chips against its right edge, the subject filling what's left.
-                        let date_w = DATE_WIDTH;
-                        let cell_w = (ui.available_width() - date_w).max(120.0);
-                        let chips = row_chips(m, self.filter.as_deref());
+                        // Every item has a fixed width, so the row can't grow frame to frame.
+                        // The date is the fixed column on the right. The subject takes the rest.
                         let title_text = row_title(m, row.count, row.unread);
-                        let open_band = open;
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(cell_w, row_height),
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                // Right to left: what's added first sits at the far right.
-                                let (shown, hidden) = chips.split_at(chips.len().min(MAX_CHIPS));
-                                if !hidden.is_empty() {
-                                    label_chip(
-                                        ui,
-                                        &format!("+{}", hidden.len()),
-                                        &hidden.join("\n"),
-                                    );
-                                }
-                                for name in shown.iter().rev() {
-                                    label_chip(ui, name, name);
-                                }
-                                // The subject takes whatever width the chips left.
-                                let title_w = ui.available_width().max(40.0);
-                                let title = ui
-                                    .allocate_ui_with_layout(
-                                        egui::vec2(title_w, row_height),
-                                        egui::Layout::left_to_right(egui::Align::Center),
-                                        |ui| {
-                                            if open_band {
-                                                ui.painter().rect_filled(
-                                                    ui.max_rect(),
-                                                    4.0,
-                                                    ui.visuals().selection.bg_fill,
-                                                );
-                                            }
-                                            ui.add(
-                                                egui::Label::new(title_text)
-                                                    .truncate()
-                                                    .sense(egui::Sense::click()),
-                                            )
-                                        },
-                                    )
-                                    .inner;
-                                if title.on_hover_text(format!("thread {}", m.thrid)).clicked() {
-                                    self.open = Some(row.rep);
-                                }
-                            },
-                        );
+                        let chips = row_chips(m, self.filter.as_deref());
+                        let (shown, hidden) = chips.split_at(chips.len().min(MAX_CHIPS));
+                        let mut tags: Vec<(String, String)> =
+                            shown.iter().map(|n| (n.clone(), n.clone())).collect();
+                        if !hidden.is_empty() {
+                            tags.push((format!("+{}", hidden.len()), hidden.join("\n")));
+                        }
+                        let font = egui::TextStyle::Small.resolve(ui.style());
+                        let widths: Vec<f32> =
+                            tags.iter().map(|(t, _)| chip_width(ui, t, &font)).collect();
+                        // Gaps: subject to first chip, between chips, last chip to date.
+                        let gaps = (tags.len() as f32 + 1.0) * ROW_GAP;
+                        let title_w =
+                            (ui.available_width() - DATE_WIDTH - widths.iter().sum::<f32>() - gaps)
+                                .max(80.0);
+
+                        let band = if open {
+                            ui.visuals().selection.bg_fill
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        };
+                        let title = egui::Frame::new()
+                            .fill(band)
+                            .corner_radius(4)
+                            .show(ui, |ui| {
+                                ui.set_min_size(egui::vec2(title_w, row_height));
+                                ui.set_max_width(title_w);
+                                ui.add(
+                                    egui::Label::new(title_text)
+                                        .truncate()
+                                        .sense(egui::Sense::click()),
+                                )
+                            })
+                            .inner;
+                        if title.on_hover_text(format!("thread {}", m.thrid)).clicked() {
+                            self.open = Some(row.rep);
+                        }
+
+                        for ((text, tip), w) in tags.iter().zip(&widths) {
+                            let (rect, resp) = ui.allocate_exact_size(
+                                egui::vec2(*w, row_height),
+                                egui::Sense::hover(),
+                            );
+                            paint_chip(ui, rect, text, &font);
+                            resp.on_hover_text(tip);
+                        }
 
                         let date = egui::RichText::new(&m.date).weak();
-                        ui.add_sized([date_w, row_height], egui::Label::new(date).truncate());
+                        ui.add_sized([DATE_WIDTH, row_height], egui::Label::new(date).truncate());
                     });
                 }
             });
