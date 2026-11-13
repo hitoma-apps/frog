@@ -48,6 +48,13 @@ impl From<io::Error> for ImapError {
 
 pub type Result<T> = std::result::Result<T, ImapError>;
 
+/// Reads the number after `UIDVALIDITY ` in a response line, if present.
+fn parse_uidvalidity(text: &str) -> Option<u32> {
+    let rest = text.split("UIDVALIDITY ").nth(1)?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
 /// What SELECT reports about a mailbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Selected {
@@ -182,12 +189,14 @@ impl<S: Read + Write> ImapConn<S> {
                 exists = n.parse().ok();
             }
         }
+        // UIDVALIDITY arrives as an untagged `* OK [UIDVALIDITY n]`. Some servers
+        // put it in the tagged status instead, so check both.
         let uidvalidity = resp
-            .text
-            .split("UIDVALIDITY ")
-            .nth(1)
-            .and_then(|rest| rest.split(']').next())
-            .and_then(|n| n.trim().parse().ok());
+            .untagged
+            .iter()
+            .map(|line| String::from_utf8_lossy(line).into_owned())
+            .chain(std::iter::once(resp.text.clone()))
+            .find_map(|text| parse_uidvalidity(&text));
         match (exists, uidvalidity) {
             (Some(exists), Some(uidvalidity)) => Ok(Selected {
                 exists,
@@ -293,5 +302,31 @@ mod tests {
     #[test]
     fn quoting_escapes_specials() {
         assert_eq!(quote(r#"a"b\c"#), r#""a\"b\\c""#);
+    }
+}
+
+#[cfg(test)]
+mod select_tests {
+    use super::*;
+
+    #[test]
+    fn uidvalidity_from_untagged_ok() {
+        assert_eq!(
+            parse_uidvalidity("* OK [UIDVALIDITY 1768] UIDs valid"),
+            Some(1768)
+        );
+    }
+
+    #[test]
+    fn uidvalidity_from_tagged_status() {
+        assert_eq!(
+            parse_uidvalidity("OK [UIDVALIDITY 7] [READ-WRITE] done"),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn no_uidvalidity_is_none() {
+        assert_eq!(parse_uidvalidity("* 3 EXISTS"), None);
     }
 }

@@ -220,7 +220,7 @@ mod tests {
                 format!("* CAPABILITY IMAP4rev1 X-GM-EXT-1 UIDPLUS\r\n{tag} OK done\r\n")
             }
             c if c.starts_with("SELECT") => format!(
-                "* 3 EXISTS\r\n* 0 RECENT\r\n{tag} OK [UIDVALIDITY 42] [READ-WRITE] SELECT completed\r\n"
+                "* 3 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 42] UIDs valid\r\n{tag} OK [READ-WRITE] SELECT completed\r\n"
             ),
             c if c.starts_with("UID STORE") => format!("{tag} OK STORE completed\r\n"),
             "LOGOUT" => format!("* BYE bye\r\n{tag} OK LOGOUT completed\r\n"),
