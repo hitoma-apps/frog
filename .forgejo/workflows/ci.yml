@@ -66,10 +66,37 @@ jobs:
       - name: Release build for Windows
         run: cargo build --release --locked --target x86_64-pc-windows-gnu
 
+      - name: Sign Windows binary
+        env:
+          CODESIGN_PFX_B64: ${{ secrets.CODESIGN_PFX_B64 }}
+          CODESIGN_PASSWORD: ${{ secrets.CODESIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          exe=target/x86_64-pc-windows-gnu/release/gmail-imap-proto.exe
+          if [ -z "$CODESIGN_PFX_B64" ]; then
+            echo "::warning::CODESIGN_PFX_B64 is not set; the Windows binary is unsigned"
+            exit 0
+          fi
+          sudo_cmd=""
+          if [ "$(id -u)" -ne 0 ]; then sudo_cmd="sudo"; fi
+          $sudo_cmd apt-get install -y -q osslsigncode
+          work=$(mktemp -d)
+          printf '%s' "$CODESIGN_PFX_B64" | base64 -d > "$work/codesign.pfx"
+          printf '%s' "$CODESIGN_PASSWORD" > "$work/pass.txt"
+          osslsigncode sign \
+            -pkcs12 "$work/codesign.pfx" -readpass "$work/pass.txt" \
+            -n "Gmail Labels Prototype" -h sha256 \
+            -in "$exe" -out "$work/signed.exe"
+          mv "$work/signed.exe" "$exe"
+          rm -rf "$work"
+          osslsigncode verify -in "$exe" || true
+
       - name: Upload Windows build
         uses: actions/upload-artifact@v3
         with:
           name: gmail-imap-proto-windows-x86_64
-          path: target/x86_64-pc-windows-gnu/release/gmail-imap-proto.exe
+          path: |
+            target/x86_64-pc-windows-gnu/release/gmail-imap-proto.exe
+            signing/gmail-labels-test-signing.cer
           if-no-files-found: error
           retention-days: 14
