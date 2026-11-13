@@ -1127,6 +1127,156 @@ mod tests {
         panic!("no thread holds uid {uid}");
     }
 
+    /// Resident memory of this process, in MB (Linux; 0 elsewhere).
+    fn rss_mb() -> f64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("VmRSS:"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|kb| kb.parse::<f64>().ok())
+            })
+            .map_or(0.0, |kb| kb / 1024.0)
+    }
+
+    /// Where the memory goes with a large cache: a 250k-message cache file, the worker
+    /// on it, and the GUI's reads. Run with `--ignored --nocapture`. Not a pass/fail test.
+    #[test]
+    #[ignore]
+    fn memory_breakdown_with_a_large_cache() {
+        const N: u32 = 250_000;
+        let dir = std::env::temp_dir().join(format!("gmail-memory-test-{}", std::process::id()));
+        let path = dir.join("cache.sqlite");
+        let _ = std::fs::remove_file(&path);
+        let headers = [
+            "Received: from mail.example.net (mail.example.net [203.0.113.5])\r\n\tby mx.example.com with ESMTPS id abc123\r\n\tfor <me@example.com>; Tue, 10 Nov 2026 09:29:58 +0000 (UTC)\r\n",
+            "Received-SPF: pass (google.com: domain of a@example.com designates 203.0.113.5 as permitted sender)\r\n",
+            "Authentication-Results: mx.example.com; spf=pass; dkim=pass header.i=@example.com; dmarc=pass\r\n",
+            "DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.com; s=sel; h=from:to:subject:date:message-id; bh=0123456789abcdefghijklmnopqrstuvwxyzABCDEF=; b=abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOP\r\n",
+            "Date: Tue, 10 Nov 2026 09:30:00 +0000\r\n",
+            "From: A Person <a@example.com>\r\n",
+            "To: Me <me@example.com>\r\n",
+            "Message-ID: <abc123@example.com>\r\n",
+            "Subject: Something\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: multipart/alternative; boundary=\"b1\"\r\n\r\n",
+        ]
+        .concat()
+        .into_bytes();
+
+        let start = rss_mb();
+        let sent = gmail_imap_proto::store::sent_timestamp(&headers);
+        {
+            let mut store = Store::open(&path).unwrap();
+            let labels: std::collections::BTreeSet<String> =
+                ["\\Inbox".to_string(), "Work".to_string()].into();
+            for first in (1..=N).step_by(200) {
+                let batch: Vec<gmail_imap_proto::store::CachedMessage> = (first
+                    ..(first + 200).min(N + 1))
+                    .map(|uid| gmail_imap_proto::store::CachedMessage {
+                        msgid: 1_000_000_000_000 + u64::from(uid),
+                        thrid: 9_000_000_000 + u64::from(uid / 3),
+                        uid: Some(uid),
+                        labels: labels.clone(),
+                        from: "A Person <a@example.com>".into(),
+                        subject: format!("Subject line for message {uid}"),
+                        date: "Tue, 10 Nov 2026 09:30:00 +0000".into(),
+                        headers: headers.clone(),
+                        sent,
+                        seen: uid % 3 == 0,
+                    })
+                    .collect();
+                store.upsert_messages(&batch).unwrap();
+            }
+        }
+        let after_fill = rss_mb();
+        let file_mb = std::fs::metadata(&path).map_or(0.0, |m| m.len() as f64 / 1_048_576.0);
+
+        // The worker on that cache. A mock source: this test never loads, so nothing is removed.
+        let link = spawn(
+            egui::Context::default(),
+            Box::new(|| Ok(Box::new(MockSource::demo()) as Box<dyn MailSource>)),
+            KEEPALIVE,
+            FAST,
+            Some(Store::open(&path).unwrap()),
+            Vec::new(),
+        );
+        assert!(matches!(next_significant(&link), Event::Connected));
+        let after_open = rss_mb();
+
+        // The GUI's first window, then a scroll through the whole list one window at a time.
+        let (first, total) = window(&link, ThreadFilter::All, 0, 200);
+        let after_first_window = rss_mb();
+        let mut offset = 0;
+        while offset < total {
+            let (page, _) = window(&link, ThreadFilter::All, offset, 200);
+            if page.is_empty() {
+                break;
+            }
+            offset += page.len();
+        }
+        let after_scroll = rss_mb();
+
+        // One conversation open in the reader.
+        let thrid = first[0].thrid;
+        link.commands.send(Command::Thread { thrid }).unwrap();
+        let thread_msgs = loop {
+            if let Event::Thread { messages, .. } = next(&link) {
+                break messages;
+            }
+        };
+        let after_thread = rss_mb();
+
+        // Bytes held per row of the list, from the strings it keeps.
+        let row_heap: usize = first
+            .iter()
+            .map(|t| {
+                let m = &t.head;
+                m.from.capacity()
+                    + m.subject.capacity()
+                    + m.date.capacity()
+                    + m.labels.iter().map(String::len).sum::<usize>()
+            })
+            .sum::<usize>()
+            / first.len().max(1);
+        let uids: UidSet = (1..=N).collect();
+
+        println!("\n== memory breakdown, {N} cached messages in {file_mb:.0} MB on disk ==");
+        println!("process before the test        {start:>8.1} MB");
+        println!(
+            "after writing the cache        {after_fill:>8.1} MB  (includes the writer's transient batches)"
+        );
+        println!("worker started on the cache    {after_open:>8.1} MB");
+        println!("first window of 200 threads    {after_first_window:>8.1} MB  ({total} threads)");
+        println!("scrolled the whole list        {after_scroll:>8.1} MB");
+        println!(
+            "one conversation open          {after_thread:>8.1} MB  ({} messages)",
+            thread_msgs.len()
+        );
+        println!("\nper-object sizes:");
+        println!(
+            "  Message struct (inline)      {:>8} B",
+            std::mem::size_of::<Message>()
+        );
+        println!(
+            "  ThreadEntry struct (inline)  {:>8} B",
+            std::mem::size_of::<ThreadEntry>()
+        );
+        println!("  heap per listed row (avg)    {row_heap:>8} B  (sender, subject, date, labels)");
+        println!(
+            "  UidSet for {N} UIDs           {:>8} KB",
+            uids.len() / 8 / 1024
+        );
+        println!(
+            "  HashSet<u32> for {N} UIDs     ~{:>7} KB  (estimate: buckets x 5 bytes)",
+            (N as usize).next_power_of_two() * 5 / 1024
+        );
+
+        drop(link);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn loads_then_prefetches_every_body() {
         let link = mock_link();
