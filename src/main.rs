@@ -5,7 +5,7 @@
 //! Mail access runs on a worker thread (see `worker.rs`).
 //!
 //! The list is sized for large mailboxes. Messages live in a map keyed by UID,
-//! label counts are kept up to date as messages change, the visible order is
+//! label totals come from the cache, the visible order is
 //! rebuilt only when something changes, and only the rows on screen are drawn.
 
 mod backend;
@@ -186,20 +186,6 @@ fn row_title(m: &Message, count: usize, unread: bool) -> egui::RichText {
     };
     let title = egui::RichText::new(text);
     if unread { title.strong() } else { title }
-}
-
-/// Adds (`add = true`) or removes one count per label in `labels`.
-fn adjust_counts(counts: &mut BTreeMap<String, usize>, labels: &BTreeSet<String>, add: bool) {
-    for label in labels {
-        if add {
-            *counts.entry(label.clone()).or_insert(0) += 1;
-        } else if let Some(n) = counts.get_mut(label) {
-            *n -= 1;
-            if *n == 0 {
-                counts.remove(label);
-            }
-        }
-    }
 }
 
 /// Draws one line of a message. Long lines wrap, and links are clickable.
@@ -453,6 +439,8 @@ impl App {
                 self.cached_count = cached;
                 self.mailbox_total = total;
             }
+            // The cache's totals cover the whole mailbox, not just the loaded rows.
+            Event::LabelCounts(counts) => self.counts = counts.into_iter().collect(),
             Event::Reconnecting => self.reconnecting = true,
             Event::Reconnected => {
                 self.reconnecting = false;
@@ -483,9 +471,7 @@ impl App {
             Event::Labels { updates, command } => {
                 for u in updates {
                     if let Some(m) = self.messages.get_mut(&u.uid) {
-                        let old = std::mem::replace(&mut m.labels, u.labels);
-                        adjust_counts(&mut self.counts, &old, false);
-                        adjust_counts(&mut self.counts, &m.labels, true);
+                        m.labels = u.labels;
                         m.seen = u.seen;
                         self.view_dirty = true;
                     }
@@ -494,13 +480,12 @@ impl App {
             }
             Event::Removed(uids) => {
                 for uid in uids {
-                    if let Some(m) = self.messages.remove(&uid) {
-                        adjust_counts(&mut self.counts, &m.labels, false);
-                        if let Some(set) = self.threads.get_mut(&m.thrid) {
-                            set.remove(&uid);
-                            if set.is_empty() {
-                                self.threads.remove(&m.thrid);
-                            }
+                    if let Some(m) = self.messages.remove(&uid)
+                        && let Some(set) = self.threads.get_mut(&m.thrid)
+                    {
+                        set.remove(&uid);
+                        if set.is_empty() {
+                            self.threads.remove(&m.thrid);
                         }
                     }
                     self.requested_bodies.remove(&uid);
@@ -546,13 +531,10 @@ impl App {
             m.headers = Vec::new();
             match self.messages.get_mut(&m.uid) {
                 Some(existing) => {
-                    adjust_counts(&mut self.counts, &existing.labels, false);
                     m.body = existing.body.take();
                     *existing = m;
-                    adjust_counts(&mut self.counts, &existing.labels, true);
                 }
                 None => {
-                    adjust_counts(&mut self.counts, &m.labels, true);
                     self.threads.entry(m.thrid).or_default().insert(m.uid);
                     self.messages.insert(m.uid, m);
                 }
@@ -1511,20 +1493,5 @@ mod tests {
     fn system_labels_come_first() {
         let m = message_with(&["Zeta", "\\Important", "Alpha"]);
         assert_eq!(row_chips(&m, None), vec!["\\Important", "Alpha", "Zeta"]);
-    }
-
-    #[test]
-    fn label_counts_track_adds_and_removes() {
-        let mut counts = BTreeMap::new();
-        let a: BTreeSet<String> = ["Work".to_string(), "\\Inbox".to_string()].into();
-        let b: BTreeSet<String> = ["Work".to_string()].into();
-        adjust_counts(&mut counts, &a, true);
-        adjust_counts(&mut counts, &b, true);
-        assert_eq!(counts.get("Work"), Some(&2));
-        assert_eq!(counts.get("\\Inbox"), Some(&1));
-
-        adjust_counts(&mut counts, &a, false);
-        assert_eq!(counts.get("Work"), Some(&1));
-        assert_eq!(counts.get("\\Inbox"), None, "zero counts are dropped");
     }
 }

@@ -79,6 +79,8 @@ pub enum Event {
         updates: Vec<MessageUpdate>,
         command: String,
     },
+    /// The cache's label totals (label, number of cached messages with it).
+    LabelCounts(Vec<(String, usize)>),
     /// Messages were removed on the server. Drop them from the view.
     Removed(Vec<u32>),
     /// Whether live updates (IDLE) are running, so the GUI can stop polling.
@@ -219,6 +221,7 @@ struct Worker {
 
 impl Worker {
     fn run(mut self, commands: Receiver<Command>) {
+        self.emit_label_counts();
         loop {
             self.report_idle_state();
             if self.idle_work_pending() {
@@ -429,6 +432,20 @@ impl Worker {
             cached: self.state.cached,
             total: self.state.total,
         });
+        self.emit_label_counts();
+    }
+
+    /// Sends the cache's label totals, so the GUI doesn't have to count messages.
+    fn emit_label_counts(&self) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        match store.label_counts() {
+            Ok(counts) => self.emit.send(Event::LabelCounts(counts)),
+            Err(e) => self
+                .emit
+                .send(Event::Error(format!("cache read failed: {e}"))),
+        }
     }
 
     /// Records the mailbox's size and UIDVALIDITY. Returns `true` if UIDVALIDITY
@@ -597,6 +614,7 @@ impl Worker {
             self.emit
                 .send(Event::Error(format!("cache write failed: {e}")));
         }
+        self.emit_label_counts();
     }
 
     /// Shows the cache, applies changes made since the last sync, then fetches
@@ -904,6 +922,7 @@ impl Worker {
         for u in &updates {
             self.cache_update(u);
         }
+        self.emit_label_counts();
         self.emit.send(Event::Labels { updates, command });
         Ok(())
     }
@@ -977,7 +996,7 @@ mod tests {
     fn next_significant(link: &Link) -> Event {
         loop {
             match next(link) {
-                Event::Progress { .. } | Event::LabelList(_) => continue,
+                Event::Progress { .. } | Event::LabelList(_) | Event::LabelCounts(_) => continue,
                 ev => return ev,
             }
         }
@@ -1057,7 +1076,10 @@ mod tests {
                     cached: 6,
                     total: 6,
                 } => break,
-                Event::Body { .. } | Event::Progress { .. } | Event::LabelList(_) => {}
+                Event::Body { .. }
+                | Event::Progress { .. }
+                | Event::LabelList(_)
+                | Event::LabelCounts(_) => {}
                 _ => panic!("unexpected event during background fill"),
             }
         }
@@ -1382,6 +1404,7 @@ mod sync_tests {
             Event::Body { .. } => "Body",
             Event::Labels { .. } => "Labels",
             Event::LabelList(_) => "LabelList",
+            Event::LabelCounts(_) => "LabelCounts",
             Event::Removed(_) => "Removed",
             Event::IdleState(_) => "IdleState",
             Event::Error(_) => "Error",
@@ -1439,6 +1462,7 @@ mod sync_tests {
                 Event::Body { .. }
                 | Event::Progress { .. }
                 | Event::LabelList(_)
+                | Event::LabelCounts(_)
                 | Event::IdleState(_) => {}
                 other => panic!("unexpected event: {}", name(&other)),
             }
@@ -1477,6 +1501,7 @@ mod sync_tests {
                 Event::Body { .. }
                 | Event::Progress { .. }
                 | Event::LabelList(_)
+                | Event::LabelCounts(_)
                 | Event::CheckFinished(_) => {}
                 other => panic!("unexpected event: {}", name(&other)),
             }
@@ -1571,6 +1596,7 @@ mod sync_tests {
                 Event::Body { .. }
                 | Event::Progress { .. }
                 | Event::LabelList(_)
+                | Event::LabelCounts(_)
                 | Event::CheckFinished(_)
                 | Event::IdleState(_)
                 | Event::Labels { .. } => {}

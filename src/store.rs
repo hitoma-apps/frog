@@ -23,7 +23,7 @@ pub const DEFAULT_BODY_CAP: u64 = 1 << 30;
 /// zstd level. Mail is text, so a low level compresses well and stays fast.
 const ZSTD_LEVEL: i32 = 3;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -188,6 +188,26 @@ impl Store {
                  ALTER TABLE sync ADD COLUMN highest_modseq INTEGER;",
             )?;
         }
+        if version < 3 {
+            // Per-label totals, kept exact by triggers on message_labels (which
+            // also fire for rows removed by the messages cascade).
+            tx.execute_batch(
+                "CREATE TABLE label_stats (
+                 label TEXT PRIMARY KEY,
+                 count INTEGER NOT NULL
+             );
+             INSERT INTO label_stats (label, count)
+                 SELECT label, COUNT(*) FROM message_labels GROUP BY label;
+             CREATE TRIGGER message_labels_added AFTER INSERT ON message_labels BEGIN
+                 INSERT INTO label_stats (label, count) VALUES (NEW.label, 1)
+                 ON CONFLICT(label) DO UPDATE SET count = count + 1;
+             END;
+             CREATE TRIGGER message_labels_removed AFTER DELETE ON message_labels BEGIN
+                 UPDATE label_stats SET count = count - 1 WHERE label = OLD.label;
+                 DELETE FROM label_stats WHERE label = OLD.label AND count <= 0;
+             END;",
+            )?;
+        }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
@@ -291,6 +311,20 @@ impl Store {
             params![to_i64(msgid)?, seen],
         )?;
         Ok(())
+    }
+
+    /// How many cached messages carry each label, by label name. Read from the
+    /// stored totals, so it doesn't scan the messages.
+    pub fn label_counts(&self) -> Result<Vec<(String, usize)>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT label, count FROM label_stats ORDER BY label")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// One page of cached headers with UID below `before` (or the newest, if
@@ -643,6 +677,29 @@ mod tests {
             vec![Some(1)]
         );
         assert!(s.list_page(last.last().unwrap().uid, 2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn label_counts_follow_every_write() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        s.upsert_messages(&[msg(1, 1, &["Work", "\\Inbox"]), msg(2, 2, &["Work"])])
+            .unwrap();
+        assert_eq!(
+            s.label_counts().unwrap(),
+            vec![("Work".to_string(), 2), ("\\Inbox".to_string(), 1)]
+        );
+
+        // Replacing labels adjusts both the old and the new label.
+        let home: BTreeSet<String> = ["Home".to_string()].into();
+        s.set_labels(1, &home).unwrap();
+        assert_eq!(
+            s.label_counts().unwrap(),
+            vec![("Home".to_string(), 1), ("Work".to_string(), 1)]
+        );
+
+        // Removing a message (the labels cascade) drops its labels from the totals.
+        s.remove_uids(&[2]).unwrap();
+        assert_eq!(s.label_counts().unwrap(), vec![("Home".to_string(), 1)]);
     }
 
     #[test]
