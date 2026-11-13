@@ -657,12 +657,18 @@ impl Store {
 
     /// Every cached message of one thread, newest first, with labels.
     pub fn thread_messages(&self, thrid: u64) -> Result<Vec<CachedMessage>> {
+        // The header blocks are read too: a conversation is read in full, and they carry
+        // the authentication results.
         let mut stmt = self.conn.prepare_cached(
-            "SELECT msgid, thrid, uid, from_addr, subject, date, seen, sent FROM messages
+            "SELECT msgid, thrid, uid, from_addr, subject, date, seen, sent, headers FROM messages
              WHERE thrid = ?1 AND uid IS NOT NULL ORDER BY uid DESC",
         )?;
         let mut out = stmt
-            .query_map(params![to_i64(thrid)?], cached_from_row)?
+            .query_map(params![to_i64(thrid)?], |r| {
+                let mut m = cached_from_row(r)?;
+                m.headers = r.get(8)?;
+                Ok(m)
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         self.attach_labels(&mut out)?;
         Ok(out)

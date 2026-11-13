@@ -3,6 +3,7 @@
 //! A `MailSource` owns one connection. The worker calls it from a background
 //! thread, so the GUI never blocks on the network.
 
+use gmail_imap_proto::auth::AuthCheck;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
@@ -86,8 +87,10 @@ pub struct Message {
     pub date: String,
     /// When the message was sent, as a Unix timestamp. 0 if the Date header is missing.
     pub sent: i64,
-    /// The header block, as sent by the server.
+    /// The header block, as sent by the server. Empty for list rows, which don't need it.
     pub headers: Vec<u8>,
+    /// The SPF, DKIM and DMARC checks the server recorded in the headers.
+    pub auth: Vec<AuthCheck>,
     /// The full RFC 5322 message, once fetched.
     pub body: Option<Vec<u8>>,
 }
@@ -103,6 +106,7 @@ impl Message {
         headers: Vec<u8>,
     ) -> Self {
         let parsed = MessageParser::default().parse(&headers);
+        let auth = gmail_imap_proto::auth::checks(&headers);
         let sent = parsed
             .as_ref()
             .and_then(|m| m.date())
@@ -134,6 +138,7 @@ impl Message {
             date,
             sent,
             headers,
+            auth,
             body: None,
         }
     }
@@ -169,7 +174,8 @@ impl Message {
             subject: c.subject,
             date: c.date,
             sent: c.sent,
-            headers: Vec::new(),
+            auth: gmail_imap_proto::auth::checks(&c.headers),
+            headers: c.headers,
             body: None,
         })
     }
@@ -666,6 +672,10 @@ mod cached_tests {
         assert_eq!(back.sent, 1_794_303_000);
         assert_eq!(back.from, m.from);
         assert_eq!(back.subject, "Hi");
-        assert!(back.headers.is_empty());
+        assert_eq!(
+            back.headers, m.headers,
+            "the header block survives the cache"
+        );
+        assert_eq!(back.auth, m.auth);
     }
 }

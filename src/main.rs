@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use gmail_imap_proto::auth::AuthCheck;
 use gmail_imap_proto::labels::{LabelAction, SystemLabel};
 use gmail_imap_proto::linkcheck::{self, LinkInfo};
 use gmail_imap_proto::links::{gmail_original_url, gmail_thread_url};
@@ -167,6 +168,34 @@ fn row_title(m: &Message, count: usize, unread: bool) -> egui::RichText {
 /// Draws one line of a message. Long lines wrap, and links are clickable.
 /// A link that looks disguised isn't opened here. Its check result goes to
 /// `pending` so the confirmation window can show it.
+/// The SPF, DKIM and DMARC verdicts for a message, each with its details on hover. A
+/// method with a pass counts as a pass. Otherwise the first verdict is shown.
+fn auth_line(ui: &mut egui::Ui, checks: &[AuthCheck]) {
+    ui.horizontal(|ui| {
+        for method in ["spf", "dkim", "dmarc"] {
+            let of_method = || checks.iter().filter(move |c| c.method == method);
+            let chosen = of_method()
+                .find(|c| c.result == "pass")
+                .or_else(|| of_method().next());
+            let label = method.to_uppercase();
+            match chosen {
+                Some(check) => {
+                    let text = egui::RichText::new(format!("{label}: {}", check.result));
+                    let text = match check.result.as_str() {
+                        "pass" => text.color(egui::Color32::from_rgb(80, 170, 90)),
+                        "none" | "neutral" => text.weak(),
+                        _ => text.color(egui::Color32::LIGHT_RED),
+                    };
+                    ui.label(text).on_hover_text(check.detail.clone());
+                }
+                None => {
+                    ui.weak(format!("{label}: not reported"));
+                }
+            }
+        }
+    });
+}
+
 fn render_line(ui: &mut egui::Ui, line: &str, pending: &mut Option<LinkInfo>) {
     if line.is_empty() {
         ui.add_space(ui.text_style_height(&egui::TextStyle::Monospace) * 0.6);
@@ -1280,6 +1309,7 @@ impl App {
                                         ui.ctx().open_url(egui::OpenUrl::new_tab(url));
                                     }
                                 });
+                                auth_line(ui, &m.auth);
                                 match self.rendered.get(&uid) {
                                     Some(blocks) => {
                                         for (i, block) in blocks.iter().enumerate() {
