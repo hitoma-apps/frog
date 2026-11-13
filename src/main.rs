@@ -976,7 +976,8 @@ impl App {
                     ui.horizontal(|ui| {
                         // The gap between items is set here, and the widths below assume it.
                         ui.spacing_mut().item_spacing.x = ROW_GAP;
-                        let pane_w = ui.available_width();
+                        // Leave room for the scrollbar, which can sit over the right edge.
+                        let pane_w = ui.available_width() - ui.spacing().scroll.allocated_width();
                         let mut checked = self.checked.contains(&row.thrid);
                         let box_changed = ui
                             .add_sized(
