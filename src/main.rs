@@ -68,6 +68,43 @@ const MAILBOXES: [(&str, Option<&str>); 8] = [
     ("Trash", Some("\\Trash")),
 ];
 
+/// Most label chips shown on a row. Any more become a "+N" chip.
+const MAX_CHIPS: usize = 3;
+/// Widest a label chip may be. Longer names are cut off, with the full name on hover.
+const CHIP_MAX_WIDTH: f32 = 80.0;
+/// The most space the chips of a row may take.
+const CHIPS_MAX_WIDTH: f32 = 360.0;
+
+/// The chips for a message row, in display order. Leaves out the label the view is
+/// filtered by. In a mailbox view (All Mail or a system folder) it also leaves out
+/// Inbox. System labels come first.
+fn row_chips(m: &Message, filter: Option<&str>) -> Vec<String> {
+    let mailbox_view = filter.is_none_or(|f| f.starts_with('\\'));
+    let inbox = SystemLabel::Inbox.as_wire();
+    let mut labels: Vec<&String> = m
+        .labels
+        .iter()
+        .filter(|l| Some(l.as_str()) != filter)
+        .filter(|l| !(mailbox_view && l.as_str() == inbox))
+        .collect();
+    labels.sort_by_key(|l| (!l.starts_with('\\'), l.to_lowercase()));
+    labels.into_iter().map(|l| display_label(l)).collect()
+}
+
+/// One label chip: a small rounded tag. `tooltip` is shown on hover.
+fn label_chip(ui: &mut egui::Ui, text: &str, tooltip: &str) {
+    egui::Frame::new()
+        .fill(ui.visuals().widgets.inactive.weak_bg_fill)
+        .corner_radius(8)
+        .inner_margin(egui::Margin::symmetric(6, 1))
+        .show(ui, |ui| {
+            ui.set_max_width(CHIP_MAX_WIDTH);
+            ui.add(egui::Label::new(egui::RichText::new(text).small()).truncate());
+        })
+        .response
+        .on_hover_text(tooltip);
+}
+
 /// The list title for a message. Unread messages are emphasized.
 fn unread_title(m: &Message) -> egui::RichText {
     let title = egui::RichText::new(format!("{} — {}", m.from, m.subject));
@@ -852,7 +889,12 @@ impl App {
                             }
                         }
                         let open = self.open == Some(uid);
-                        let title_w = (ui.available_width() * 0.6).max(120.0);
+                        // Subject cell (title on the left, chips on the right), then the date.
+                        let total = ui.available_width();
+                        let date_w = (total * 0.2).clamp(60.0, 160.0);
+                        let chips_w = (total * 0.35).clamp(0.0, CHIPS_MAX_WIDTH);
+                        let title_w = (total - date_w - chips_w).max(80.0);
+
                         let title = egui::Button::selectable(open, unread_title(m)).truncate();
                         if ui
                             .add_sized([title_w, row_height], title)
@@ -861,14 +903,29 @@ impl App {
                         {
                             self.open = Some(uid);
                         }
-                        let date_w = (ui.available_width() * 0.4).max(60.0);
+
+                        let chips = row_chips(m, self.filter.as_deref());
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(chips_w, row_height),
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                let (shown, hidden) = chips.split_at(chips.len().min(MAX_CHIPS));
+                                // Right-to-left: the first thing added sits at the far right.
+                                if !hidden.is_empty() {
+                                    label_chip(
+                                        ui,
+                                        &format!("+{}", hidden.len()),
+                                        &hidden.join("\n"),
+                                    );
+                                }
+                                for name in shown.iter().rev() {
+                                    label_chip(ui, name, name);
+                                }
+                            },
+                        );
+
                         let date = egui::RichText::new(&m.date).weak();
                         ui.add_sized([date_w, row_height], egui::Label::new(date).truncate());
-                        let labels: Vec<String> =
-                            m.labels.iter().map(|l| display_label(l)).collect();
-                        let labels_w = ui.available_width().max(0.0);
-                        let labels = egui::RichText::new(labels.join(", ")).weak();
-                        ui.add_sized([labels_w, row_height], egui::Label::new(labels).truncate());
                     });
                 }
             });
@@ -1097,6 +1154,39 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn message_with(labels: &[&str]) -> Message {
+        Message::from_headers(
+            1,
+            2,
+            3,
+            labels.iter().map(|s| s.to_string()).collect(),
+            true,
+            b"From: a@example.com\r\nSubject: hi\r\n\r\n".to_vec(),
+        )
+    }
+
+    #[test]
+    fn chips_leave_out_the_current_label() {
+        let m = message_with(&["Work", "\\Starred", "Home"]);
+        assert_eq!(row_chips(&m, Some("Work")), vec!["Starred", "Home"]);
+    }
+
+    #[test]
+    fn chips_leave_out_inbox_only_in_mailbox_views() {
+        let m = message_with(&["\\Inbox", "Work"]);
+        // All Mail and system folders are mailbox views: no Inbox chip.
+        assert_eq!(row_chips(&m, None), vec!["Work"]);
+        assert_eq!(row_chips(&m, Some("\\Starred")), vec!["Work"]);
+        // A label view keeps Inbox.
+        assert_eq!(row_chips(&m, Some("Work")), vec!["Inbox"]);
+    }
+
+    #[test]
+    fn system_labels_come_first() {
+        let m = message_with(&["Zeta", "\\Important", "Alpha"]);
+        assert_eq!(row_chips(&m, None), vec!["Important", "Alpha", "Zeta"]);
+    }
 
     #[test]
     fn label_counts_track_adds_and_removes() {
