@@ -105,10 +105,48 @@ fn label_chip(ui: &mut egui::Ui, text: &str, tooltip: &str) {
         .on_hover_text(tooltip);
 }
 
-/// The list title for a message. Unread messages are emphasized.
-fn unread_title(m: &Message) -> egui::RichText {
-    let title = egui::RichText::new(format!("{} — {}", m.from, m.subject));
-    if m.seen { title } else { title.strong() }
+/// Groups messages into one row per conversation, in the order given (newest
+/// first). Each row is shown by its first message, with the count and unread
+/// state of the conversation's messages in the view.
+fn conversation_rows<'a>(
+    messages: impl Iterator<Item = &'a Message>,
+    filter: Option<&str>,
+) -> Vec<ThreadRow> {
+    let mut rows: Vec<ThreadRow> = Vec::new();
+    let mut index: HashMap<u64, usize> = HashMap::new();
+    for m in messages {
+        if !filter.is_none_or(|l| m.labels.contains(l)) {
+            continue;
+        }
+        match index.get(&m.thrid) {
+            Some(&i) => {
+                rows[i].count += 1;
+                rows[i].unread |= !m.seen;
+            }
+            None => {
+                index.insert(m.thrid, rows.len());
+                rows.push(ThreadRow {
+                    thrid: m.thrid,
+                    rep: m.uid,
+                    count: 1,
+                    unread: !m.seen,
+                });
+            }
+        }
+    }
+    rows
+}
+
+/// The title of a conversation row: the newest message's sender and subject, with
+/// the message count when there's more than one. Unread conversations are emphasized.
+fn row_title(m: &Message, count: usize, unread: bool) -> egui::RichText {
+    let text = if count > 1 {
+        format!("({count}) {} — {}", m.from, m.subject)
+    } else {
+        format!("{} — {}", m.from, m.subject)
+    };
+    let title = egui::RichText::new(text);
+    if unread { title.strong() } else { title }
 }
 
 /// Adds (`add = true`) or removes one count per label in `labels`.
@@ -176,6 +214,18 @@ struct LoginForm {
     error: Option<String>,
 }
 
+/// One row of the message list: a conversation, shown by its newest message in the view.
+#[derive(Clone, Copy)]
+struct ThreadRow {
+    thrid: u64,
+    /// UID of the newest message in the view with this thread ID.
+    rep: u32,
+    /// How many messages of the conversation are in the view.
+    count: usize,
+    /// Whether any of them is unread.
+    unread: bool,
+}
+
 struct App {
     ctx: egui::Context,
     settings: Settings,
@@ -201,8 +251,8 @@ struct App {
     counts: BTreeMap<String, usize>,
     /// Every label on the account, from the server. Includes labels with no cached messages.
     known_labels: BTreeSet<String>,
-    /// UIDs in display order, after the filter. Rebuilt when `view_dirty` is set.
-    view: Vec<u32>,
+    /// Conversations in display order, after the filter. Rebuilt when `view_dirty` is set.
+    view: Vec<ThreadRow>,
     view_dirty: bool,
     /// When the visible order was last rebuilt. Large lists are rebuilt at most a few times a second.
     view_built: Instant,
@@ -225,8 +275,8 @@ struct App {
 
     /// `None` shows All Mail, `Some(label)` filters by one raw label.
     filter: Option<String>,
-    /// Checked messages, by UID.
-    checked: BTreeSet<u32>,
+    /// Checked conversations, by thread ID. An action on one applies to all its messages.
+    checked: BTreeSet<u64>,
     /// The open message, by UID.
     open: Option<u32>,
     label_input: String,
@@ -403,7 +453,6 @@ impl App {
                             }
                         }
                     }
-                    self.checked.remove(&uid);
                     self.requested_bodies.remove(&uid);
                     if self.open == Some(uid) {
                         self.open = None;
@@ -476,13 +525,10 @@ impl App {
         self.view_built = Instant::now();
         self.view_dirty = false;
         let filter = self.filter.as_deref();
-        self.view = self
-            .messages
-            .values()
-            .rev()
-            .filter(|m| filter.is_none_or(|l| m.labels.contains(l)))
-            .map(|m| m.uid)
-            .collect();
+        self.view = conversation_rows(self.messages.values().rev(), filter);
+        // Drop checks on conversations that no longer exist.
+        let threads = &self.threads;
+        self.checked.retain(|t| threads.contains_key(t));
     }
 
     fn check_now(&mut self) {
@@ -504,13 +550,22 @@ impl App {
         self.send(Command::FetchBody { uid });
     }
 
-    /// Checked messages if any, otherwise the open message. Returns UIDs.
+    /// The messages an action applies to: every message of the checked
+    /// conversations, or else of the open one. Returns UIDs.
     fn target_uids(&self) -> Vec<u32> {
-        if !self.checked.is_empty() {
+        let thrids: Vec<u64> = if !self.checked.is_empty() {
             self.checked.iter().copied().collect()
         } else {
-            self.open.into_iter().collect()
-        }
+            self.open
+                .and_then(|uid| self.messages.get(&uid))
+                .map(|m| vec![m.thrid])
+                .unwrap_or_default()
+        };
+        thrids
+            .iter()
+            .filter_map(|t| self.threads.get(t))
+            .flat_map(|set| set.iter().copied())
+            .collect()
     }
 
     fn apply(&mut self, action: LabelAction, labels: Vec<String>) {
@@ -875,33 +930,35 @@ impl App {
         egui::ScrollArea::vertical()
             .id_salt("message_list")
             .show_rows(ui, row_height, view.len(), |ui, range| {
-                for &uid in &view[range] {
-                    let Some(m) = self.messages.get(&uid) else {
+                for &row in &view[range] {
+                    let Some(m) = self.messages.get(&row.rep) else {
                         continue;
                     };
                     ui.horizontal(|ui| {
-                        let mut checked = self.checked.contains(&uid);
+                        let mut checked = self.checked.contains(&row.thrid);
                         if ui.checkbox(&mut checked, "").changed() {
                             if checked {
-                                self.checked.insert(uid);
+                                self.checked.insert(row.thrid);
                             } else {
-                                self.checked.remove(&uid);
+                                self.checked.remove(&row.thrid);
                             }
                         }
-                        let open = self.open == Some(uid);
+                        let open = self.open == Some(row.rep);
                         // Subject cell (title on the left, chips on the right), then the date.
                         let total = ui.available_width();
                         let date_w = (total * 0.2).clamp(60.0, 160.0);
                         let chips_w = (total * 0.35).clamp(0.0, CHIPS_MAX_WIDTH);
                         let title_w = (total - date_w - chips_w).max(80.0);
 
-                        let title = egui::Button::selectable(open, unread_title(m)).truncate();
+                        let title =
+                            egui::Button::selectable(open, row_title(m, row.count, row.unread))
+                                .truncate();
                         if ui
                             .add_sized([title_w, row_height], title)
                             .on_hover_text(format!("thread {}", m.thrid))
                             .clicked()
                         {
-                            self.open = Some(uid);
+                            self.open = Some(row.rep);
                         }
 
                         let chips = row_chips(m, self.filter.as_deref());
@@ -1164,6 +1221,43 @@ mod tests {
             true,
             b"From: a@example.com\r\nSubject: hi\r\n\r\n".to_vec(),
         )
+    }
+
+    #[test]
+    fn conversations_are_one_row_with_a_count() {
+        let mut a = message_with(&["Work"]);
+        a.thrid = 10;
+        a.uid = 3;
+        let mut b = message_with(&["Work"]);
+        b.thrid = 10;
+        b.uid = 2;
+        b.seen = false;
+        let mut c = message_with(&["Other"]);
+        c.thrid = 20;
+        c.uid = 1;
+        // Newest first, as the view supplies them.
+        let rows = conversation_rows([&a, &b, &c].into_iter(), None);
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0].thrid, rows[0].rep, rows[0].count), (10, 3, 2));
+        assert!(
+            rows[0].unread,
+            "one unread message makes the conversation unread"
+        );
+        assert_eq!((rows[1].thrid, rows[1].count), (20, 1));
+    }
+
+    #[test]
+    fn filtered_count_only_counts_messages_in_the_view() {
+        let mut a = message_with(&["Work"]);
+        a.thrid = 10;
+        a.uid = 3;
+        let mut b = message_with(&["Other"]);
+        b.thrid = 10;
+        b.uid = 2;
+        let rows = conversation_rows([&a, &b].into_iter(), Some("Work"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].count, 1);
+        assert_eq!(rows[0].rep, 3);
     }
 
     #[test]
