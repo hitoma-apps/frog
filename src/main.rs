@@ -72,8 +72,8 @@ const MAILBOXES: [(&str, Option<&str>); 8] = [
 const MAX_CHIPS: usize = 3;
 /// Widest a label chip may be. Longer names are cut off, with the full name on hover.
 const CHIP_MAX_WIDTH: f32 = 80.0;
-/// The most space the chips of a row may take.
-const CHIPS_MAX_WIDTH: f32 = 360.0;
+/// Width of the date column, on the right of every row.
+const DATE_WIDTH: f32 = 190.0;
 
 /// The chips for a message row, in display order. Leaves out the label the view is
 /// filtered by. In a mailbox view (All Mail or a system folder) it also leaves out
@@ -944,45 +944,19 @@ impl App {
                             }
                         }
                         let open = self.open == Some(row.rep);
-                        // Subject cell (title on the left, chips on the right), then the date.
-                        let total = ui.available_width();
-                        let date_w = (total * 0.2).clamp(60.0, 200.0);
-                        let chips_w = (total * 0.35).clamp(0.0, CHIPS_MAX_WIDTH);
-                        let title_w = (total - date_w - chips_w).max(80.0);
-
-                        // A left-aligned label, not a button: buttons centre their text.
-                        // The open row gets a background band behind it.
-                        let title = ui
-                            .allocate_ui_with_layout(
-                                egui::vec2(title_w, row_height),
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    if open {
-                                        ui.painter().rect_filled(
-                                            ui.max_rect(),
-                                            4.0,
-                                            ui.visuals().selection.bg_fill,
-                                        );
-                                    }
-                                    ui.add(
-                                        egui::Label::new(row_title(m, row.count, row.unread))
-                                            .truncate()
-                                            .sense(egui::Sense::click()),
-                                    )
-                                },
-                            )
-                            .inner;
-                        if title.on_hover_text(format!("thread {}", m.thrid)).clicked() {
-                            self.open = Some(row.rep);
-                        }
-
+                        // The date is a fixed column on the far right. The subject cell takes
+                        // the rest: chips against its right edge, the subject filling what's left.
+                        let date_w = DATE_WIDTH;
+                        let cell_w = (ui.available_width() - date_w).max(120.0);
                         let chips = row_chips(m, self.filter.as_deref());
+                        let title_text = row_title(m, row.count, row.unread);
+                        let open_band = open;
                         ui.allocate_ui_with_layout(
-                            egui::vec2(chips_w, row_height),
+                            egui::vec2(cell_w, row_height),
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
+                                // Right to left: what's added first sits at the far right.
                                 let (shown, hidden) = chips.split_at(chips.len().min(MAX_CHIPS));
-                                // Right-to-left: the first thing added sits at the far right.
                                 if !hidden.is_empty() {
                                     label_chip(
                                         ui,
@@ -992,6 +966,31 @@ impl App {
                                 }
                                 for name in shown.iter().rev() {
                                     label_chip(ui, name, name);
+                                }
+                                // The subject takes whatever width the chips left.
+                                let title_w = ui.available_width().max(40.0);
+                                let title = ui
+                                    .allocate_ui_with_layout(
+                                        egui::vec2(title_w, row_height),
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            if open_band {
+                                                ui.painter().rect_filled(
+                                                    ui.max_rect(),
+                                                    4.0,
+                                                    ui.visuals().selection.bg_fill,
+                                                );
+                                            }
+                                            ui.add(
+                                                egui::Label::new(title_text)
+                                                    .truncate()
+                                                    .sense(egui::Sense::click()),
+                                            )
+                                        },
+                                    )
+                                    .inner;
+                                if title.on_hover_text(format!("thread {}", m.thrid)).clicked() {
+                                    self.open = Some(row.rep);
                                 }
                             },
                         );
