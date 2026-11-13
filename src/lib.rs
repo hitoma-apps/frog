@@ -1,6 +1,7 @@
-//! Prototype Gmail IMAP client pieces: `X-GM-*` response parsing, label
-//! operations, and plaintext message rendering. No network I/O yet.
+//! Prototype Gmail IMAP client pieces: a small IMAP client, `X-GM-*` response
+//! parsing, label operations, and plaintext message rendering.
 
+pub mod imap;
 pub mod labels;
 pub mod render;
 pub mod response;

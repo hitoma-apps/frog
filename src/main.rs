@@ -1,6 +1,7 @@
 //! Prototype Gmail label manager. Runs on the mock backend for now.
 
 mod backend;
+mod live;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -10,12 +11,39 @@ use gmail_imap_proto::render_plaintext;
 
 use backend::{MailBackend, Message, MockBackend};
 
+/// Live Gmail when `GMAIL_USER` and `GMAIL_APP_PASSWORD` are set, otherwise the mock.
+fn choose_backend() -> Result<Box<dyn MailBackend>, String> {
+    match (
+        std::env::var("GMAIL_USER"),
+        std::env::var("GMAIL_APP_PASSWORD"),
+    ) {
+        (Ok(user), Ok(password)) => {
+            let conn = gmail_imap_proto::imap::connect_tls("imap.gmail.com", 993)
+                .map_err(|e| format!("connect failed: {e}"))?;
+            let backend = live::LiveBackend::open(conn, &user, &password, LIVE_LIMIT)
+                .map_err(|e| format!("login/load failed: {e}"))?;
+            Ok(Box::new(backend))
+        }
+        _ => Ok(Box::new(MockBackend::demo())),
+    }
+}
+
+/// Newest messages to load from All Mail in live mode.
+const LIVE_LIMIT: usize = 200;
+
 fn main() -> eframe::Result {
+    let backend = match choose_backend() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
     let options = eframe::NativeOptions::default();
     eframe::run_native(
         "Gmail Labels Prototype",
         options,
-        Box::new(|_cc| Ok(Box::new(App::new(Box::new(MockBackend::demo()))))),
+        Box::new(move |_cc| Ok(Box::new(App::new(backend)))),
     )
 }
 
