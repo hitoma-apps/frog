@@ -13,6 +13,18 @@ use crate::backend::{MailBackend, Message};
 /// Gmail's All Mail folder holds every message, whatever its labels.
 pub const ALL_MAIL: &str = "[Gmail]/All Mail";
 const FETCH_CHUNK: usize = 50;
+/// Newest messages to load from All Mail.
+pub const LIVE_LIMIT: usize = 200;
+
+/// Connects to Gmail over TLS, logs in, and loads the newest `LIVE_LIMIT` messages.
+/// The error is a message for the user, not a typed error.
+pub fn connect_gmail(user: &str, password: &str) -> Result<Box<dyn MailBackend + Send>, String> {
+    let conn = gmail_imap_proto::imap::connect_tls("imap.gmail.com", 993)
+        .map_err(|e| format!("Could not connect to imap.gmail.com: {e}"))?;
+    let backend = LiveBackend::open(conn, user, password, LIVE_LIMIT)
+        .map_err(|e| format!("Gmail sign-in or load failed: {e}"))?;
+    Ok(Box::new(backend))
+}
 
 pub struct LiveBackend<S: Read + Write> {
     conn: ImapConn<S>,

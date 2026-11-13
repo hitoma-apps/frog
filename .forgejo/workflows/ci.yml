@@ -43,3 +43,33 @@ jobs:
             target/release/libgmail_imap_proto.rlib
           if-no-files-found: error
           retention-days: 14
+
+  windows:
+    name: Windows build (cross-compiled)
+    runs-on: docker
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain and MinGW
+        run: |
+          SUDO=""
+          if [ "$(id -u)" -ne 0 ]; then SUDO="sudo"; fi
+          $SUDO apt-get update -q
+          DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -q gcc-mingw-w64-x86-64
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup target add x86_64-pc-windows-gnu
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Release build for Windows
+        run: cargo build --release --locked --target x86_64-pc-windows-gnu
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v3
+        with:
+          name: gmail-imap-proto-windows-x86_64
+          path: target/x86_64-pc-windows-gnu/release/gmail-imap-proto.exe
+          if-no-files-found: error
+          retention-days: 14
