@@ -1053,20 +1053,39 @@ impl App {
         self.view = view;
     }
 
-    /// The reader: the whole conversation the open message belongs to, oldest first.
+    /// The reader: the whole conversation the open message belongs to, newest first.
     fn reader(&mut self, ui: &mut egui::Ui) {
         let Some(open) = self.open else {
             ui.label("Open a message to read it.");
             return;
         };
-        let Some((thrid, msgid)) = self.messages.get(&open).map(|m| (m.thrid, m.msgid)) else {
+        let Some(thrid) = self.messages.get(&open).map(|m| m.thrid) else {
             return;
         };
-        let thread: Vec<u32> = self
+        let mut thread: Vec<u32> = self
             .threads
             .get(&thrid)
             .map(|set| set.iter().copied().collect())
             .unwrap_or_else(|| vec![open]);
+        // Newest first, by when each message was sent.
+        thread.sort_by_key(|uid| {
+            std::cmp::Reverse(
+                self.messages
+                    .get(uid)
+                    .map_or((0i64, 0u32), |m| (m.sent, m.uid)),
+            )
+        });
+
+        // Every label on the conversation, system labels first.
+        let mut labels: BTreeSet<String> = BTreeSet::new();
+        for uid in &thread {
+            if let Some(m) = self.messages.get(uid) {
+                labels.extend(m.labels.iter().cloned());
+            }
+        }
+        let mut sorted_labels: Vec<&String> = labels.iter().collect();
+        sorted_labels.sort_by_key(|l| (!l.starts_with('\\'), l.to_lowercase()));
+        let chip_names: Vec<String> = sorted_labels.iter().map(|l| display_label(l)).collect();
 
         // Bodies for the whole conversation, fetched in the background, and
         // each one rendered once.
@@ -1097,17 +1116,32 @@ impl App {
             {
                 ui.ctx().open_url(egui::OpenUrl::new_tab(url));
             }
+            ui.weak(format!(
+                "thread {thrid} (0x{thrid:x}) · {} messages in this conversation",
+                thread.len()
+            ));
         });
-        ui.monospace(format!(
-            "msgid  {msgid} (0x{msgid:x})\nthrid  {thrid} (0x{thrid:x})"
-        ));
-        ui.weak(format!("{} messages in this conversation", thread.len()));
+
+        // The conversation's labels, as chips. A chip that's cut short has the full name on hover.
+        let font = egui::TextStyle::Small.resolve(ui.style());
+        let chip_h = ui.text_style_height(&egui::TextStyle::Small) + 6.0;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+            for name in &chip_names {
+                let w = chip_width(ui, name, &font);
+                let (rect, resp) =
+                    ui.allocate_exact_size(egui::vec2(w, chip_h), egui::Sense::hover());
+                paint_chip(ui, rect, name, &font);
+                resp.on_hover_text(name);
+            }
+        });
         ui.separator();
 
-        let newest = thread.last().copied();
+        let newest = thread.first().copied();
         let mut pending: Option<LinkInfo> = None;
         egui::ScrollArea::vertical()
             .id_salt("reader")
+            .auto_shrink([false, false])
             .show(ui, |ui| {
                 for &uid in &thread {
                     let Some(m) = self.messages.get(&uid) else {
@@ -1123,37 +1157,40 @@ impl App {
                     ui.push_id(uid, |ui| {
                         egui::CollapsingHeader::new(title)
                             .default_open(expanded)
-                            .show(ui, |ui| match self.rendered.get(&uid) {
-                                Some(blocks) => {
-                                    for (i, block) in blocks.iter().enumerate() {
-                                        match block {
-                                            Block::Line(line) => {
-                                                render_line(ui, line, &mut pending)
-                                            }
-                                            Block::Quote(lines) => {
-                                                ui.push_id(i, |ui| {
-                                                    egui::CollapsingHeader::new(format!(
-                                                        "▸ Quoted text ({} lines)",
-                                                        lines.len()
-                                                    ))
-                                                    .default_open(false)
-                                                    .show(ui, |ui| {
-                                                        for line in lines {
-                                                            render_line(ui, line, &mut pending);
-                                                        }
+                            .show(ui, |ui| {
+                                ui.monospace(format!("msgid {} (0x{:x})", m.msgid, m.msgid));
+                                match self.rendered.get(&uid) {
+                                    Some(blocks) => {
+                                        for (i, block) in blocks.iter().enumerate() {
+                                            match block {
+                                                Block::Line(line) => {
+                                                    render_line(ui, line, &mut pending)
+                                                }
+                                                Block::Quote(lines) => {
+                                                    ui.push_id(i, |ui| {
+                                                        egui::CollapsingHeader::new(format!(
+                                                            "▸ Quoted text ({} lines)",
+                                                            lines.len()
+                                                        ))
+                                                        .default_open(false)
+                                                        .show(ui, |ui| {
+                                                            for line in lines {
+                                                                render_line(ui, line, &mut pending);
+                                                            }
+                                                        });
                                                     });
-                                                });
+                                                }
                                             }
                                         }
                                     }
-                                }
-                                None => {
-                                    ui.spinner();
-                                    ui.label("Loading message…");
-                                    ui.monospace(format!(
-                                        "From:    {}\nSubject: {}\nDate:    {}",
-                                        m.from, m.subject, m.date
-                                    ));
+                                    None => {
+                                        ui.spinner();
+                                        ui.label("Loading message…");
+                                        ui.monospace(format!(
+                                            "From:    {}\nSubject: {}\nDate:    {}",
+                                            m.from, m.subject, m.date
+                                        ));
+                                    }
                                 }
                             });
                     });

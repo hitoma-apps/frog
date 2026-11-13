@@ -84,6 +84,8 @@ pub struct Message {
     pub from: String,
     pub subject: String,
     pub date: String,
+    /// When the message was sent, as a Unix timestamp. 0 if the Date header is missing.
+    pub sent: i64,
     /// The header block, as sent by the server.
     pub headers: Vec<u8>,
     /// The full RFC 5322 message, once fetched.
@@ -101,6 +103,10 @@ impl Message {
         headers: Vec<u8>,
     ) -> Self {
         let parsed = MessageParser::default().parse(&headers);
+        let sent = parsed
+            .as_ref()
+            .and_then(|m| m.date())
+            .map_or(0, |d| d.to_timestamp());
         let (from, subject, date) = match &parsed {
             Some(m) => (
                 m.from()
@@ -126,6 +132,7 @@ impl Message {
             from,
             subject,
             date,
+            sent,
             headers,
             body: None,
         }
@@ -601,6 +608,16 @@ mod tests {
             src.modify_labels(&[9999], LabelAction::Add, &["x".to_string()])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn sent_time_comes_from_the_date_header() {
+        let headers =
+            b"From: a@example.com\r\nDate: Tue, 10 Nov 2026 09:30:00 +0000\r\n\r\n".to_vec();
+        let m = Message::from_headers(1, 2, 3, vec![], false, headers);
+        assert_eq!(m.sent, 1_794_303_000);
+        let no_date = Message::from_headers(1, 2, 3, vec![], false, b"From: a\r\n\r\n".to_vec());
+        assert_eq!(no_date.sent, 0);
     }
 
     #[test]
