@@ -93,6 +93,8 @@ fn row_chips(m: &Message, filter: Option<&str>) -> Vec<String> {
 
 /// Gap between the items of a row.
 const ROW_GAP: f32 = 4.0;
+/// Width of the checkbox column, on the far left of every row.
+const CHECK_WIDTH: f32 = 24.0;
 
 /// The width a chip needs: its text, cut to `CHIP_TEXT_MAX`, plus padding.
 fn chip_width(ui: &egui::Ui, text: &str, font: &egui::FontId) -> f32 {
@@ -972,8 +974,17 @@ impl App {
                         continue;
                     };
                     ui.horizontal(|ui| {
+                        // The gap between items is set here, and the widths below assume it.
+                        ui.spacing_mut().item_spacing.x = ROW_GAP;
+                        let pane_w = ui.available_width();
                         let mut checked = self.checked.contains(&row.thrid);
-                        if ui.checkbox(&mut checked, "").changed() {
+                        let box_changed = ui
+                            .add_sized(
+                                [CHECK_WIDTH, row_height],
+                                egui::Checkbox::without_text(&mut checked),
+                            )
+                            .changed();
+                        if box_changed {
                             if checked {
                                 self.checked.insert(row.thrid);
                             } else {
@@ -995,10 +1006,12 @@ impl App {
                         let widths: Vec<f32> =
                             tags.iter().map(|(t, _)| chip_width(ui, t, &font)).collect();
                         // Gaps: subject to first chip, between chips, last chip to date.
-                        let gaps = (tags.len() as f32 + 1.0) * ROW_GAP;
+                        // Items in order: checkbox, subject, chips, date. That's one gap
+                        // between each pair.
+                        let gaps = (tags.len() as f32 + 2.0) * ROW_GAP;
                         let title_w =
-                            (ui.available_width() - DATE_WIDTH - widths.iter().sum::<f32>() - gaps)
-                                .max(80.0);
+                            (pane_w - CHECK_WIDTH - DATE_WIDTH - widths.iter().sum::<f32>() - gaps)
+                                .max(40.0);
 
                         let band = if open {
                             ui.visuals().selection.bg_fill
