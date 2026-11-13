@@ -12,7 +12,7 @@ use std::thread;
 
 use eframe::egui;
 use gmail_imap_proto::labels::{LabelAction, SystemLabel};
-use gmail_imap_proto::links::gmail_open_url;
+use gmail_imap_proto::links::gmail_thread_url;
 use gmail_imap_proto::render_plaintext;
 
 use backend::{MailBackend, Message, MockBackend};
@@ -358,17 +358,21 @@ impl App {
         let Some(msg) = self.messages.iter().find(|m| m.msgid == msgid) else {
             return;
         };
-        let open_url = msg.message_id.as_deref().map(gmail_open_url);
+        let open_url = (msg.thrid != 0).then(|| gmail_thread_url(msg.thrid));
         ui.horizontal(|ui| {
             let button = ui.add_enabled(open_url.is_some(), egui::Button::new("Open in Gmail"));
             if button
-                .on_disabled_hover_text("This message has no Message-ID header.")
+                .on_disabled_hover_text("This message has no thread ID.")
                 .clicked()
                 && let Some(url) = open_url
             {
                 ui.ctx().open_url(egui::OpenUrl::new_tab(url));
             }
         });
+        ui.monospace(format!(
+            "msgid  {} (0x{:x})\nthrid  {} (0x{:x})",
+            msg.msgid, msg.msgid, msg.thrid, msg.thrid
+        ));
         ui.separator();
         let text = render_plaintext(&msg.raw).unwrap_or_else(|| "(could not parse message)".into());
         egui::ScrollArea::vertical()

@@ -78,12 +78,7 @@ impl<S: Read + Write> Drop for LiveBackend<S> {
 }
 
 fn to_message(msgid: u64, thrid: u64, uid: u32, labels: Vec<String>, raw: &[u8]) -> Message {
-    let parsed = MessageParser::default().parse(raw);
-    let message_id = parsed
-        .as_ref()
-        .and_then(|m| m.message_id())
-        .map(str::to_owned);
-    let (from, subject) = match parsed {
+    let (from, subject) = match MessageParser::default().parse(raw) {
         Some(m) => (
             m.from()
                 .and_then(|a| a.first())
@@ -101,7 +96,6 @@ fn to_message(msgid: u64, thrid: u64, uid: u32, labels: Vec<String>, raw: &[u8])
         labels: labels.into_iter().collect(),
         from,
         subject,
-        message_id,
         raw: raw.to_vec(),
     }
 }
