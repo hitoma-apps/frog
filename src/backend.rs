@@ -148,28 +148,30 @@ impl Message {
             from: self.from.clone(),
             subject: self.subject.clone(),
             date: self.date.clone(),
+            sent: self.sent,
             headers: self.headers.clone(),
             seen: self.seen,
         }
     }
 
     /// A listing entry from a cached header. Returns `None` if the UID was
-    /// invalidated, since such a message can't be acted on.
+    /// invalidated, since such a message can't be acted on. Nothing is parsed: the
+    /// cache holds the sent time, sender, subject and date. The header block is
+    /// left empty, since listings don't use it.
     pub fn from_cached(c: CachedMessage) -> Option<Self> {
-        let uid = c.uid?;
-        let mut m = Self::from_headers(
-            c.msgid,
-            c.thrid,
-            uid,
-            c.labels.into_iter().collect(),
-            c.seen,
-            c.headers,
-        );
-        // The cached subject, sender and date are what the header parse gave us.
-        m.from = c.from;
-        m.subject = c.subject;
-        m.date = c.date;
-        Some(m)
+        Some(Self {
+            msgid: c.msgid,
+            thrid: c.thrid,
+            uid: c.uid?,
+            labels: c.labels,
+            seen: c.seen,
+            from: c.from,
+            subject: c.subject,
+            date: c.date,
+            sent: c.sent,
+            headers: Vec::new(),
+            body: None,
+        })
     }
 }
 
@@ -648,5 +650,22 @@ mod tests {
         let mut src = MockSource::demo();
         let now = src.select().unwrap().highest_modseq.unwrap();
         assert!(src.changed_since(now).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod cached_tests {
+    use super::*;
+
+    #[test]
+    fn cached_listing_keeps_the_sent_time_without_the_headers() {
+        let headers = b"From: A <a@example.com>\r\nDate: Tue, 10 Nov 2026 09:30:00 +0000\r\nSubject: Hi\r\n\r\n".to_vec();
+        let m = Message::from_headers(7, 8, 9, vec!["\\Inbox".into()], true, headers);
+        let back = Message::from_cached(m.to_cached()).unwrap();
+        assert_eq!(back.sent, m.sent);
+        assert_eq!(back.sent, 1_794_303_000);
+        assert_eq!(back.from, m.from);
+        assert_eq!(back.subject, "Hi");
+        assert!(back.headers.is_empty());
     }
 }

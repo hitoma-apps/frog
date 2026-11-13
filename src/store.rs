@@ -23,7 +23,7 @@ pub const DEFAULT_BODY_CAP: u64 = 1 << 30;
 /// zstd level. Mail is text, so a low level compresses well and stays fast.
 const ZSTD_LEVEL: i32 = 3;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -73,7 +73,10 @@ pub struct CachedMessage {
     pub from: String,
     pub subject: String,
     pub date: String,
-    /// The header block as the server sent it.
+    /// The sent time (Unix seconds) from the Date header, or 0 if there isn't one.
+    pub sent: i64,
+    /// The header block as the server sent it. Empty when read from a listing,
+    /// which doesn't need it.
     pub headers: Vec<u8>,
     /// Whether the message has been read (`\Seen`).
     pub seen: bool,
@@ -113,6 +116,14 @@ pub fn account_cache_path(email: &str) -> Option<PathBuf> {
             .join("accounts")
             .join(format!("{safe}.sqlite")),
     )
+}
+
+/// The sent time (Unix seconds) from a header block's Date line, or 0 if there isn't one.
+pub fn sent_timestamp(headers: &[u8]) -> i64 {
+    mail_parser::MessageParser::default()
+        .parse(headers)
+        .and_then(|m| m.date().map(|d| d.to_timestamp()))
+        .unwrap_or(0)
 }
 
 fn to_i64(v: u64) -> Result<i64> {
@@ -208,6 +219,22 @@ impl Store {
              END;",
             )?;
         }
+        if version < 4 {
+            // The sent time is stored, so listings don't parse header blocks. Existing
+            // rows are filled in once here.
+            tx.execute_batch("ALTER TABLE messages ADD COLUMN sent INTEGER NOT NULL DEFAULT 0;")?;
+            let rows: Vec<(i64, Vec<u8>)> = {
+                let mut stmt = tx.prepare("SELECT msgid, headers FROM messages")?;
+                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<std::result::Result<_, _>>()?
+            };
+            for (msgid, headers) in rows {
+                tx.execute(
+                    "UPDATE messages SET sent = ?2 WHERE msgid = ?1",
+                    params![msgid, sent_timestamp(&headers)],
+                )?;
+            }
+        }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
@@ -253,13 +280,13 @@ impl Store {
         for m in msgs {
             let msgid = to_i64(m.msgid)?;
             tx.execute(
-                "INSERT INTO messages (msgid, thrid, uid, from_addr, subject, date, headers, seen)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "INSERT INTO messages (msgid, thrid, uid, from_addr, subject, date, headers, seen, sent)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(msgid) DO UPDATE SET
                      thrid = excluded.thrid, uid = excluded.uid,
                      from_addr = excluded.from_addr, subject = excluded.subject,
                      date = excluded.date, headers = excluded.headers,
-                     seen = excluded.seen",
+                     seen = excluded.seen, sent = excluded.sent",
                 params![
                     msgid,
                     to_i64(m.thrid)?,
@@ -268,7 +295,8 @@ impl Store {
                     m.subject,
                     m.date,
                     m.headers,
-                    m.seen
+                    m.seen,
+                    m.sent
                 ],
             )?;
             tx.execute(
@@ -331,7 +359,7 @@ impl Store {
     /// `None`), newest first. Walking pages down the cache lists all of it.
     pub fn list_page(&self, before: Option<u32>, limit: usize) -> Result<Vec<CachedMessage>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT msgid, thrid, uid, from_addr, subject, date, headers, seen FROM messages
+            "SELECT msgid, thrid, uid, from_addr, subject, date, seen, sent FROM messages
              WHERE uid IS NOT NULL AND (?1 IS NULL OR uid < ?1)
              ORDER BY uid DESC LIMIT ?2",
         )?;
@@ -344,8 +372,9 @@ impl Store {
                 from: r.get(3)?,
                 subject: r.get(4)?,
                 date: r.get(5)?,
-                headers: r.get(6)?,
-                seen: r.get(7)?,
+                headers: Vec::new(),
+                seen: r.get(6)?,
+                sent: r.get(7)?,
             })
         })?;
         let mut out = rows.collect::<std::result::Result<Vec<_>, _>>()?;
@@ -400,11 +429,11 @@ impl Store {
     pub fn list_messages(&self, label: Option<&str>, limit: usize) -> Result<Vec<CachedMessage>> {
         let sql = match label {
             None => {
-                "SELECT msgid, thrid, uid, from_addr, subject, date, headers, seen FROM messages
+                "SELECT msgid, thrid, uid, from_addr, subject, date, seen, sent FROM messages
                  WHERE uid IS NOT NULL ORDER BY uid DESC LIMIT ?2"
             }
             Some(_) => {
-                "SELECT msgid, thrid, uid, from_addr, subject, date, headers, seen FROM messages
+                "SELECT msgid, thrid, uid, from_addr, subject, date, seen, sent FROM messages
                  WHERE uid IS NOT NULL
                    AND EXISTS (SELECT 1 FROM message_labels l
                                WHERE l.msgid = messages.msgid AND l.label = ?1)
@@ -421,8 +450,9 @@ impl Store {
                 from: r.get(3)?,
                 subject: r.get(4)?,
                 date: r.get(5)?,
-                headers: r.get(6)?,
-                seen: r.get(7)?,
+                headers: Vec::new(),
+                seen: r.get(6)?,
+                sent: r.get(7)?,
             })
         })?;
         let mut out = rows.collect::<std::result::Result<Vec<_>, _>>()?;
@@ -545,6 +575,7 @@ mod tests {
             from: format!("sender{uid}@example.com"),
             subject: format!("Hello {uid}"),
             date: "Tue, 10 Nov 2026 09:30:00 +0000".into(),
+            sent: 1_794_303_000 + i64::from(uid),
             headers: format!("Subject: Hello {uid}\r\n\r\n").into_bytes(),
             seen: false,
         }
@@ -580,7 +611,10 @@ mod tests {
         );
         assert_eq!(listed[1].labels.len(), 2);
         assert!(listed[1].labels.contains("Work"));
-        assert_eq!(listed[0].headers, b"Subject: Hello 2\r\n\r\n".to_vec());
+        assert!(
+            listed[0].headers.is_empty(),
+            "listings leave out the header block"
+        );
     }
 
     #[test]
@@ -712,6 +746,21 @@ mod tests {
     }
 
     #[test]
+    fn migrating_from_v3_fills_in_sent_times() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        let mut m = msg(1, 1, &["Work"]);
+        m.headers = b"Date: Tue, 10 Nov 2026 09:30:00 +0000\r\nSubject: Hello 1\r\n\r\n".to_vec();
+        m.sent = 0;
+        s.upsert_messages(&[m]).unwrap();
+        // Put the database back in its v3 shape: no sent column, version 3.
+        s.conn
+            .execute_batch("ALTER TABLE messages DROP COLUMN sent; PRAGMA user_version = 3;")
+            .unwrap();
+        s.migrate().unwrap();
+        assert_eq!(s.list_page(None, 10).unwrap()[0].sent, 1_794_303_000);
+    }
+
+    #[test]
     fn mailbox_state_round_trips() {
         let s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
         assert_eq!(s.mailbox_state().unwrap(), None);
@@ -832,6 +881,7 @@ mod bulk_timing {
                     subject: "Something".into(),
                     date: "Tue, 10 Nov 2026 09:30:00 +0000".into(),
                     headers: headers.clone(),
+                    sent: sent_timestamp(&headers),
                     seen: false,
                 })
                 .collect();
@@ -856,27 +906,6 @@ mod bulk_timing {
         }
         println!(
             "list_page walk ({seen} rows, pages of 5000): {:?}",
-            t.elapsed()
-        );
-
-        // What from_cached costs on top of the query: parsing each header block.
-        let t = Instant::now();
-        let (mut before, mut built) = (None, 0usize);
-        loop {
-            let page = s.list_page(before, 5000).unwrap();
-            if page.is_empty() {
-                break;
-            }
-            before = page.last().and_then(|m| m.uid);
-            for m in &page {
-                let parsed = mail_parser::MessageParser::default().parse(&m.headers);
-                if parsed.as_ref().and_then(|p| p.date()).is_some() {
-                    built += 1;
-                }
-            }
-        }
-        println!(
-            "header parse walk ({built} dates parsed): {:?}",
             t.elapsed()
         );
 
