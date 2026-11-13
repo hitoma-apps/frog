@@ -7,7 +7,7 @@
 //! It also keeps the connection alive. It sends NOOP after a quiet period, and
 //! reconnects when the connection drops, retrying the failed command once.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::thread;
@@ -18,6 +18,7 @@ use gmail_imap_proto::labels::LabelAction;
 use gmail_imap_proto::store::{
     DEFAULT_BODY_CAP, MailboxState, Store, ThreadFilter, account_cache_path,
 };
+use gmail_imap_proto::uidset::UidSet;
 
 use crate::backend::{IdleNotice, MailSource, MailboxInfo, Message, MessageUpdate, SourceError};
 use crate::live;
@@ -594,16 +595,16 @@ impl Worker {
     }
 
     /// UIDs with cached headers.
-    fn cached_uid_list(&mut self) -> Vec<u32> {
+    fn cached_uid_set(&mut self) -> UidSet {
         let Some(store) = self.store.as_ref() else {
-            return Vec::new();
+            return UidSet::new();
         };
-        match store.cached_uids() {
+        match store.cached_uid_set() {
             Ok(uids) => uids,
             Err(e) => {
                 self.emit
                     .send(Event::Error(format!("cache read failed: {e}")));
-                Vec::new()
+                UidSet::new()
             }
         }
     }
@@ -680,13 +681,13 @@ impl Worker {
 
         let all = src.search_from(1)?;
         self.state.highest = all.last().copied();
-        let server: HashSet<u32> = all.iter().copied().collect();
+        let server: UidSet = all.iter().copied().collect();
 
         // Messages deleted on the server drop out of the cache.
         let stale: Vec<u32> = self
-            .cached_uid_list()
-            .into_iter()
-            .filter(|u| !server.contains(u))
+            .cached_uid_set()
+            .iter()
+            .filter(|&u| !server.contains(u))
             .collect();
         self.remove_cached(&stale);
 
@@ -697,19 +698,15 @@ impl Worker {
             self.sync_changes(src, modseq)?;
         }
 
-        let cached: HashSet<u32> = self
-            .cached_uid_list()
-            .into_iter()
-            .filter(|u| server.contains(u))
-            .collect();
-        self.state.cached = cached.len();
+        let cached = self.cached_uid_set();
+        self.state.cached = all.iter().filter(|&&u| cached.contains(u)).count();
         self.emit_progress();
 
         // Headers we don't have, newest first.
         let mut missing: VecDeque<u32> = all
             .iter()
             .rev()
-            .filter(|u| !cached.contains(u))
+            .filter(|&&u| !cached.contains(u))
             .copied()
             .collect();
         let urgent: Vec<u32> = (0..limit.min(missing.len()))
@@ -809,9 +806,13 @@ impl Worker {
                 return Ok(());
             }
         };
-        let cached: HashSet<u32> = self.cached_uid_list().into_iter().collect();
+        // Nothing changed (the usual case for a periodic check): nothing to look up.
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let cached = self.cached_uid_set();
         let (known, unknown): (Vec<MessageUpdate>, Vec<MessageUpdate>) =
-            changes.into_iter().partition(|c| cached.contains(&c.uid));
+            changes.into_iter().partition(|c| cached.contains(c.uid));
 
         if !unknown.is_empty() {
             let uids: Vec<u32> = unknown.iter().map(|c| c.uid).collect();
@@ -835,17 +836,17 @@ impl Worker {
 
     /// After an expunge: drops cached messages the server no longer has.
     fn reconcile(&mut self, src: &mut dyn MailSource) -> Result<(), SourceError> {
-        let server: HashSet<u32> = src.search_from(1)?.into_iter().collect();
+        let server: UidSet = src.search_from(1)?.into_iter().collect();
         let stale: Vec<u32> = self
-            .cached_uid_list()
-            .into_iter()
-            .filter(|u| !server.contains(u))
+            .cached_uid_set()
+            .iter()
+            .filter(|&u| !server.contains(u))
             .collect();
         self.remove_cached(&stale);
         self.state.cached = self.state.cached.saturating_sub(stale.len());
-        self.state.pending_headers.retain(|u| server.contains(u));
-        self.state.prefetch.retain(|u| server.contains(u));
-        self.state.highest = server.iter().max().copied();
+        self.state.pending_headers.retain(|&u| server.contains(u));
+        self.state.prefetch.retain(|&u| server.contains(u));
+        self.state.highest = server.iter().max();
         if !stale.is_empty() {
             self.emit.send(Event::Removed(stale));
         }

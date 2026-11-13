@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 use directories::ProjectDirs;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
+use crate::uidset::UidSet;
+
 /// Default body cache size, in compressed bytes.
 pub const DEFAULT_BODY_CAP: u64 = 1 << 30;
 
@@ -726,6 +728,18 @@ impl Store {
             .query_map([], |r| r.get::<_, u32>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(uids)
+    }
+
+    /// The UIDs that have a cached header, as a set.
+    pub fn cached_uid_set(&self) -> Result<UidSet> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT uid FROM messages WHERE uid IS NOT NULL")?;
+        let mut set = UidSet::new();
+        for uid in stmt.query_map([], |r| r.get::<_, u32>(0))? {
+            set.insert(uid?);
+        }
+        Ok(set)
     }
 
     /// The message ID for a UID in the current UIDVALIDITY, if cached.
