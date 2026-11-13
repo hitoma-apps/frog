@@ -264,6 +264,19 @@ pub struct GmailFetch<'a> {
     pub body: Option<&'a [u8]>,
     /// `BODY[HEADER]` payload (message headers only), if requested.
     pub header: Option<&'a [u8]>,
+    /// `FLAGS`, if requested. `\Seen` means read.
+    pub flags: Option<Vec<String>>,
+    /// `MODSEQ` (CONDSTORE change counter), if the server sent one.
+    pub modseq: Option<u64>,
+}
+
+impl GmailFetch<'_> {
+    /// Whether the message has been read (`\Seen`), if the flags were requested.
+    pub fn seen(&self) -> Option<bool> {
+        self.flags
+            .as_ref()
+            .map(|f| f.iter().any(|flag| flag.eq_ignore_ascii_case("\\Seen")))
+    }
 }
 
 /// Parses a FETCH response and extracts the Gmail attributes.
@@ -279,6 +292,8 @@ pub fn parse_gmail_fetch(buf: &[u8]) -> Result<GmailFetch<'_>, ParseError> {
             "X-GM-MSGID" => out.msgid = number_as(&value),
             "X-GM-THRID" => out.thrid = number_as(&value),
             "X-GM-LABELS" => out.labels = labels_from(&value),
+            "FLAGS" => out.flags = Some(labels_from(&value)),
+            "MODSEQ" => out.modseq = modseq_from(&value),
             "BODY[]" => {
                 if let Value::Bytes(b) = value {
                     out.body = Some(b);
@@ -293,6 +308,14 @@ pub fn parse_gmail_fetch(buf: &[u8]) -> Result<GmailFetch<'_>, ParseError> {
         }
     }
     Ok(out)
+}
+
+/// `MODSEQ (n)`: the number is inside a one-item list.
+fn modseq_from(v: &Value<'_>) -> Option<u64> {
+    match v {
+        Value::List(items) => items.first().and_then(number_as),
+        other => number_as(other),
+    }
 }
 
 fn number_as(v: &Value<'_>) -> Option<u64> {
@@ -335,5 +358,28 @@ mod label_tests {
         let raw = b"* 1 FETCH (UID 5 X-GM-LABELS ({4}\r\nWork) X-GM-MSGID 9)\r\n";
         let f = parse_gmail_fetch(raw).unwrap();
         assert_eq!(f.labels, vec!["Work"]);
+    }
+}
+
+#[cfg(test)]
+mod flags_tests {
+    use super::*;
+
+    #[test]
+    fn flags_and_modseq_are_read() {
+        let raw = b"* 1 FETCH (UID 5 FLAGS (\\Seen \\Flagged) MODSEQ (12345) X-GM-MSGID 9)\r\n";
+        let f = parse_gmail_fetch(raw).unwrap();
+        assert_eq!(f.seen(), Some(true));
+        assert_eq!(f.modseq, Some(12345));
+    }
+
+    #[test]
+    fn unread_and_absent_flags() {
+        let unread = b"* 1 FETCH (UID 5 FLAGS ())\r\n";
+        assert_eq!(parse_gmail_fetch(unread).unwrap().seen(), Some(false));
+        let absent = b"* 1 FETCH (UID 5)\r\n";
+        let f = parse_gmail_fetch(absent).unwrap();
+        assert_eq!(f.seen(), None);
+        assert_eq!(f.modseq, None);
     }
 }

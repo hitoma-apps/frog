@@ -1,12 +1,15 @@
 //! Gmail session: implements `MailSource` over IMAP.
 
 use std::io::{Read, Write};
+use std::time::Duration;
 
-use gmail_imap_proto::imap::{ImapConn, ImapError, connect_tls};
+use gmail_imap_proto::imap::{ImapConn, ImapError, SetReadTimeout, connect_tls};
 use gmail_imap_proto::labels::LabelAction;
 use gmail_imap_proto::parse_gmail_fetch;
 
-use crate::backend::{LabelUpdates, MailSource, MailboxInfo, Message, SourceError, label_refs};
+use crate::backend::{
+    IdleNotice, MailSource, MailboxInfo, Message, MessageUpdate, SourceError, label_refs,
+};
 
 /// Gmail's All Mail folder holds every message, whatever its labels.
 pub const ALL_MAIL: &str = "[Gmail]/All Mail";
@@ -16,6 +19,12 @@ const FETCH_CHUNK: usize = 200;
 pub struct LiveSession<S: Read + Write> {
     conn: ImapConn<S>,
     selected: bool,
+    /// The server advertised CONDSTORE, so changes can be fetched by modseq.
+    condstore: bool,
+    /// The server advertised IDLE, so changes can be pushed.
+    idle: bool,
+    /// Notices from IDLE that arrived during a command, not yet handed out.
+    notices: Vec<IdleNotice>,
 }
 
 impl<S: Read + Write> LiveSession<S> {
@@ -27,9 +36,14 @@ impl<S: Read + Write> LiveSession<S> {
         if !caps.iter().any(|c| c.eq_ignore_ascii_case("X-GM-EXT-1")) {
             return Err("server does not advertise X-GM-EXT-1; not a Gmail account?".into());
         }
+        let condstore = caps.iter().any(|c| c.eq_ignore_ascii_case("CONDSTORE"));
+        let idle = caps.iter().any(|c| c.eq_ignore_ascii_case("IDLE"));
         Ok(Self {
             conn,
             selected: false,
+            condstore,
+            idle,
+            notices: Vec::new(),
         })
     }
 
@@ -50,13 +64,29 @@ fn to_source_error(e: ImapError) -> SourceError {
     }
 }
 
-impl<S: Read + Write + Send> MailSource for LiveSession<S> {
+/// Reads an IDLE line from the server. Returns `None` for anything that isn't a change.
+fn idle_notice(line: &str) -> Option<IdleNotice> {
+    let mut parts = line.split_whitespace();
+    if parts.next() != Some("*") {
+        return None;
+    }
+    parts.next()?.parse::<u32>().ok()?;
+    match parts.next()? {
+        "EXISTS" => Some(IdleNotice::NewMail),
+        "EXPUNGE" => Some(IdleNotice::Expunged),
+        "FETCH" => Some(IdleNotice::Changed),
+        _ => None,
+    }
+}
+
+impl<S: Read + Write + Send + SetReadTimeout> MailSource for LiveSession<S> {
     fn select(&mut self) -> Result<MailboxInfo, SourceError> {
         let sel = self.conn.select(ALL_MAIL).map_err(to_source_error)?;
         self.selected = true;
         Ok(MailboxInfo {
             uidvalidity: sel.uidvalidity,
             exists: sel.exists,
+            highest_modseq: sel.highestmodseq,
         })
     }
 
@@ -73,7 +103,7 @@ impl<S: Read + Write + Send> MailSource for LiveSession<S> {
         self.ensure_selected()?;
         let mut out = Vec::with_capacity(uids.len());
         for chunk in uids.chunks(FETCH_CHUNK) {
-            let items = "UID X-GM-MSGID X-GM-THRID X-GM-LABELS BODY.PEEK[HEADER]";
+            let items = "UID X-GM-MSGID X-GM-THRID X-GM-LABELS FLAGS BODY.PEEK[HEADER]";
             for raw in self.conn.uid_fetch(chunk, items).map_err(to_source_error)? {
                 let f = parse_gmail_fetch(&raw).map_err(|e| SourceError::Failed(e.to_string()))?;
                 let (Some(uid), Some(msgid)) = (f.uid, f.msgid) else {
@@ -84,7 +114,8 @@ impl<S: Read + Write + Send> MailSource for LiveSession<S> {
                     msgid,
                     f.thrid.unwrap_or(0),
                     uid,
-                    f.labels,
+                    f.labels.clone(),
+                    f.seen().unwrap_or(false),
                     headers,
                 ));
             }
@@ -114,26 +145,79 @@ impl<S: Read + Write + Send> MailSource for LiveSession<S> {
         uids: &[u32],
         action: LabelAction,
         labels: &[String],
-    ) -> Result<(String, LabelUpdates), SourceError> {
+    ) -> Result<(String, Vec<MessageUpdate>), SourceError> {
         self.ensure_selected()?;
         let command = self
             .conn
             .uid_store(uids, action, &label_refs(labels))
             .map_err(to_source_error)?;
 
-        // Re-read labels so the view matches the server, not our guess.
-        let mut updates = Vec::new();
+        // Re-read labels and read state so the view matches the server, not our guess.
+        let updates = self.fetch_states(uids)?;
+        Ok((command, updates))
+    }
+
+    fn supports_condstore(&self) -> bool {
+        self.condstore
+    }
+
+    fn changed_since(&mut self, modseq: u64) -> Result<Vec<MessageUpdate>, SourceError> {
+        self.ensure_selected()?;
+        let mut out = Vec::new();
         for raw in self
             .conn
-            .uid_fetch(uids, "UID X-GM-LABELS")
+            .uid_fetch_changed_since("UID X-GM-LABELS FLAGS", modseq)
             .map_err(to_source_error)?
         {
             let f = parse_gmail_fetch(&raw).map_err(|e| SourceError::Failed(e.to_string()))?;
             if let Some(uid) = f.uid {
-                updates.push((uid, f.labels.into_iter().collect()));
+                out.push(MessageUpdate {
+                    uid,
+                    labels: f.labels.iter().cloned().collect(),
+                    seen: f.seen().unwrap_or(false),
+                });
             }
         }
-        Ok((command, updates))
+        Ok(out)
+    }
+
+    fn supports_idle(&self) -> bool {
+        self.idle
+    }
+
+    fn idle_poll(&mut self, wait: Duration) -> Result<Vec<IdleNotice>, SourceError> {
+        self.ensure_selected()?;
+        let lines = self.conn.idle_poll(wait).map_err(to_source_error)?;
+        Ok(lines.iter().filter_map(|l| idle_notice(l)).collect())
+    }
+
+    fn take_notices(&mut self) -> Vec<IdleNotice> {
+        let stashed = self.conn.take_stashed();
+        self.notices
+            .extend(stashed.iter().filter_map(|l| idle_notice(l)));
+        std::mem::take(&mut self.notices)
+    }
+}
+
+impl<S: Read + Write> LiveSession<S> {
+    /// Labels and read state for the given UIDs, as the server reports them now.
+    fn fetch_states(&mut self, uids: &[u32]) -> Result<Vec<MessageUpdate>, SourceError> {
+        let mut out = Vec::new();
+        for raw in self
+            .conn
+            .uid_fetch(uids, "UID X-GM-LABELS FLAGS")
+            .map_err(to_source_error)?
+        {
+            let f = parse_gmail_fetch(&raw).map_err(|e| SourceError::Failed(e.to_string()))?;
+            if let Some(uid) = f.uid {
+                out.push(MessageUpdate {
+                    uid,
+                    labels: f.labels.iter().cloned().collect(),
+                    seen: f.seen().unwrap_or(false),
+                });
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -317,7 +401,7 @@ mod tests {
         assert_eq!(cmd, r#"UID STORE 1 -X-GM-LABELS ("\\Inbox")"#);
         assert!(seen.lock().unwrap().iter().any(|c| c == &cmd));
         assert_eq!(updates.len(), 1);
-        assert_eq!(updates[0].0, 1);
+        assert_eq!(updates[0].uid, 1);
     }
 
     #[test]

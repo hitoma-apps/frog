@@ -7,7 +7,7 @@
 //! It also keeps the connection alive. It sends NOOP after a quiet period, and
 //! reconnects when the connection drops, retrying the failed command once.
 
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::thread;
@@ -17,9 +17,11 @@ use eframe::egui;
 use gmail_imap_proto::labels::LabelAction;
 use gmail_imap_proto::store::{MailboxState, Store, account_cache_path};
 
-use crate::backend::{MailSource, MailboxInfo, Message, SourceError};
+use crate::backend::{IdleNotice, MailSource, MailboxInfo, Message, MessageUpdate, SourceError};
 use crate::live;
 
+/// How long one IDLE wait lasts before checking for commands.
+const IDLE_POLL: Duration = Duration::from_secs(1);
 /// Messages per header FETCH, so the list fills in steadily.
 const BATCH: usize = 200;
 /// Quiet time before a NOOP keeps the connection open.
@@ -70,11 +72,15 @@ pub enum Event {
         raw: Vec<u8>,
     },
     Labels {
-        updates: Vec<(u32, BTreeSet<String>)>,
+        updates: Vec<MessageUpdate>,
         command: String,
     },
     /// A notice for the user, not an error (for example, where the cache lives).
     Info(String),
+    /// Messages were removed on the server. Drop them from the view.
+    Removed(Vec<u32>),
+    /// Whether live updates (IDLE) are running, so the GUI can stop polling.
+    IdleState(bool),
     Error(String),
 }
 
@@ -179,6 +185,14 @@ struct State {
     uidvalidity: Option<u32>,
     /// Highest UID known to exist.
     highest: Option<u32>,
+    /// Last synced HIGHESTMODSEQ, for CONDSTORE. `None` until the server reports one.
+    modseq: Option<u64>,
+    /// An expunge was seen, so the next check must reconcile UIDs.
+    reconcile: bool,
+    /// IDLE failed on this server. Periodic checks are used instead.
+    idle_off: bool,
+    /// Whether the GUI has been told live updates are on.
+    idle_reported: bool,
     /// Messages in the mailbox, as reported by SELECT.
     total: usize,
     /// Headers held locally, from the cache or fetched.
@@ -204,10 +218,17 @@ struct Worker {
 impl Worker {
     fn run(mut self, commands: Receiver<Command>) {
         loop {
+            self.report_idle_state();
             if self.idle_work_pending() {
                 match commands.try_recv() {
                     Ok(cmd) => self.dispatch(cmd),
                     Err(TryRecvError::Empty) => self.idle_step(),
+                    Err(TryRecvError::Disconnected) => return,
+                }
+            } else if self.can_idle() {
+                match commands.try_recv() {
+                    Ok(cmd) => self.dispatch(cmd),
+                    Err(TryRecvError::Empty) => self.idle_tick(),
                     Err(TryRecvError::Disconnected) => return,
                 }
             } else {
@@ -217,7 +238,61 @@ impl Worker {
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
             }
+            self.drain_notices();
         }
+    }
+
+    /// Whether to wait for server pushes. That needs a loaded mailbox, a server
+    /// that supports IDLE, and no IDLE failure so far.
+    fn can_idle(&self) -> bool {
+        !self.state.idle_off
+            && self.state.limit > 0
+            && self.source.as_ref().is_some_and(|s| s.supports_idle())
+    }
+
+    fn report_idle_state(&mut self) {
+        let idle = self.can_idle();
+        if idle != self.state.idle_reported {
+            self.state.idle_reported = idle;
+            self.emit.send(Event::IdleState(idle));
+        }
+    }
+
+    /// Waits for the server to push a change. Changes trigger a sync.
+    fn idle_tick(&mut self) {
+        match self.with_source(|_, src| src.idle_poll(IDLE_POLL)) {
+            Ok(notices) => self.sync_from(&notices),
+            Err(SourceError::Disconnected(_)) => {
+                self.reconnect();
+            }
+            Err(e) => {
+                // IDLE didn't work here. Fall back to periodic checks.
+                self.state.idle_off = true;
+                self.emit.send(Event::Error(format!(
+                    "Live updates stopped ({e}); checking periodically instead."
+                )));
+            }
+        }
+    }
+
+    /// Notices that arrived while a command ended IDLE.
+    fn drain_notices(&mut self) {
+        let notices = match self.source.as_deref_mut() {
+            Some(src) => src.take_notices(),
+            None => Vec::new(),
+        };
+        self.sync_from(&notices);
+    }
+
+    /// Runs a sync after the server reported a change.
+    fn sync_from(&mut self, notices: &[IdleNotice]) {
+        if notices.is_empty() || self.state.limit == 0 {
+            return;
+        }
+        if notices.contains(&IdleNotice::Expunged) {
+            self.state.reconcile = true;
+        }
+        self.dispatch(Command::CheckNew);
     }
 
     fn idle_work_pending(&self) -> bool {
@@ -360,13 +435,21 @@ impl Worker {
             self.clear_background();
             self.state.cached = 0;
             self.state.highest = None;
+            self.state.modseq = None;
             self.emit.send(Event::Reset);
         }
 
         if let Some(store) = self.store.as_mut() {
-            let same =
-                matches!(store.mailbox_state(), Ok(Some(st)) if st.uidvalidity == info.uidvalidity);
-            if !same {
+            let stored = store.mailbox_state();
+            let same = matches!(&stored, Ok(Some(st)) if st.uidvalidity == info.uidvalidity);
+            if same {
+                // A restart with a valid cache: resume from the last synced modseq,
+                // so changes made while the app was closed get picked up.
+                if self.state.modseq.is_none() {
+                    self.state.modseq = stored.ok().flatten().and_then(|st| st.highest_modseq);
+                }
+            } else {
+                self.state.modseq = None;
                 // The cache's UIDs belong to a different UIDVALIDITY. Keep the
                 // messages, drop the UIDs, and let the sync assign new ones.
                 if let Err(e) = store.invalidate_uids() {
@@ -378,6 +461,7 @@ impl Worker {
                 let state = MailboxState {
                     uidvalidity: info.uidvalidity,
                     highest_uid: None,
+                    highest_modseq: None,
                 };
                 if let Err(e) = store.set_mailbox_state(state) {
                     self.emit
@@ -396,6 +480,7 @@ impl Worker {
         let state = MailboxState {
             uidvalidity,
             highest_uid: self.state.highest,
+            highest_modseq: self.state.modseq,
         };
         if let Err(e) = store.set_mailbox_state(state) {
             self.emit
@@ -475,12 +560,15 @@ impl Worker {
         }
     }
 
-    fn cache_labels(&mut self, uid: u32, labels: &BTreeSet<String>) {
+    /// Writes a message's labels and read state to the cache.
+    fn cache_update(&mut self, u: &MessageUpdate) {
         let Some(store) = self.store.as_mut() else {
             return;
         };
-        let result = store.msgid_for_uid(uid).and_then(|msgid| match msgid {
-            Some(msgid) => store.set_labels(msgid, labels),
+        let result = store.msgid_for_uid(u.uid).and_then(|msgid| match msgid {
+            Some(msgid) => store
+                .set_labels(msgid, &u.labels)
+                .and_then(|()| store.set_seen(msgid, u.seen)),
             None => Ok(()),
         });
         if let Err(e) = result {
@@ -502,8 +590,9 @@ impl Worker {
         }
     }
 
-    /// Shows the cache, then fetches whatever headers it lacks. The newest
-    /// `limit` are fetched now. The rest are queued for the background.
+    /// Shows the cache, applies changes made since the last sync, then fetches
+    /// whatever headers the cache lacks. The newest `limit` are fetched now. The
+    /// rest are queued for the background.
     fn op_load(&mut self, src: &mut dyn MailSource, limit: usize) -> Result<(), SourceError> {
         self.state.limit = limit;
         let info = src.select()?;
@@ -514,18 +603,12 @@ impl Worker {
         let server: HashSet<u32> = all.iter().copied().collect();
 
         // Messages deleted on the server drop out of the cache.
-        let cached_all = self.cached_uid_list();
-        let stale: Vec<u32> = cached_all
-            .iter()
-            .copied()
+        let stale: Vec<u32> = self
+            .cached_uid_list()
+            .into_iter()
             .filter(|u| !server.contains(u))
             .collect();
         self.remove_cached(&stale);
-        let cached: HashSet<u32> = cached_all
-            .into_iter()
-            .filter(|u| server.contains(u))
-            .collect();
-        self.state.cached = cached.len();
 
         self.emit.send(Event::LoadStarted {
             total: limit.min(all.len()),
@@ -534,6 +617,22 @@ impl Worker {
         if !shown.is_empty() {
             self.emit.send(Event::Batch(shown));
         }
+
+        // Changes made since the last sync: labels and read state, from elsewhere.
+        if let (Some(modseq), true) = (self.state.modseq, src.supports_condstore()) {
+            let mut fetched = Vec::new();
+            self.sync_changes(src, modseq, &mut fetched)?;
+            if !fetched.is_empty() {
+                self.emit.send(Event::Batch(fetched));
+            }
+        }
+
+        let cached: HashSet<u32> = self
+            .cached_uid_list()
+            .into_iter()
+            .filter(|u| server.contains(u))
+            .collect();
+        self.state.cached = cached.len();
 
         // Headers we don't have, newest first.
         let mut missing: VecDeque<u32> = all
@@ -553,6 +652,7 @@ impl Worker {
         }
         self.state.pending_headers = missing;
         self.state.prefetch = all.iter().rev().take(limit).copied().collect();
+        self.state.modseq = info.highest_modseq;
 
         self.emit.send(Event::LoadFinished);
         self.emit_progress();
@@ -560,7 +660,9 @@ impl Worker {
         Ok(())
     }
 
-    /// Looks for messages newer than the highest UID we know about.
+    /// Looks for messages newer than the highest UID we know about, then for
+    /// changes to messages we have (labels and read state, via CONDSTORE), and
+    /// removals after an expunge.
     fn op_check(&mut self, src: &mut dyn MailSource) -> Result<(), SourceError> {
         let info = src.select()?;
         if self.begin_mailbox(info) {
@@ -575,7 +677,7 @@ impl Worker {
             .into_iter()
             .filter(|&u| u > highest)
             .collect();
-        let msgs = if new.is_empty() {
+        let mut msgs = if new.is_empty() {
             Vec::new()
         } else {
             src.fetch_headers(&new)?
@@ -590,9 +692,82 @@ impl Worker {
             self.state.prefetch.push_front(uid);
         }
 
+        if let (Some(modseq), true) = (self.state.modseq, src.supports_condstore()) {
+            self.sync_changes(src, modseq, &mut msgs)?;
+        }
+
+        if std::mem::take(&mut self.state.reconcile) {
+            self.reconcile(src)?;
+        }
+        if let Some(modseq) = info.highest_modseq {
+            self.state.modseq = Some(modseq);
+        }
+
         self.emit.send(Event::CheckFinished(msgs));
         self.emit_progress();
         self.save_sync();
+        Ok(())
+    }
+
+    /// Applies changes made since `modseq`: labels and read state for messages
+    /// we have, and full headers for messages we don't.
+    fn sync_changes(
+        &mut self,
+        src: &mut dyn MailSource,
+        modseq: u64,
+        msgs: &mut Vec<Message>,
+    ) -> Result<(), SourceError> {
+        let changes = match src.changed_since(modseq) {
+            Ok(changes) => changes,
+            Err(e @ SourceError::Disconnected(_)) => return Err(e),
+            Err(e) => {
+                self.emit
+                    .send(Event::Error(format!("Could not sync changes: {e}")));
+                return Ok(());
+            }
+        };
+        let cached: HashSet<u32> = self.cached_uid_list().into_iter().collect();
+        let (known, unknown): (Vec<MessageUpdate>, Vec<MessageUpdate>) =
+            changes.into_iter().partition(|c| cached.contains(&c.uid));
+
+        if !unknown.is_empty() {
+            let uids: Vec<u32> = unknown.iter().map(|c| c.uid).collect();
+            let fetched = src.fetch_headers(&uids)?;
+            self.cache_upsert(&fetched);
+            self.state.cached += fetched.len();
+            // Those messages are no longer waiting for a background header fetch.
+            self.state.pending_headers.retain(|u| !uids.contains(u));
+            msgs.extend(fetched);
+        }
+        for c in &known {
+            self.cache_update(c);
+        }
+        if !known.is_empty() {
+            self.emit.send(Event::Labels {
+                updates: known,
+                command: format!("UID FETCH 1:* (CHANGEDSINCE {modseq})"),
+            });
+        }
+        Ok(())
+    }
+
+    /// After an expunge: drops cached messages the server no longer has.
+    fn reconcile(&mut self, src: &mut dyn MailSource) -> Result<(), SourceError> {
+        let server: HashSet<u32> = src.search_from(1)?.into_iter().collect();
+        let stale: Vec<u32> = self
+            .cached_uid_list()
+            .into_iter()
+            .filter(|u| !server.contains(u))
+            .collect();
+        self.remove_cached(&stale);
+        self.state.cached = self.state.cached.saturating_sub(stale.len());
+        self.state.pending_headers.retain(|u| server.contains(u));
+        self.state.prefetch.retain(|u| server.contains(u));
+        self.state.highest = server.iter().max().copied();
+        if !stale.is_empty() {
+            self.emit.send(Event::Removed(stale));
+        }
+        self.emit_progress();
         Ok(())
     }
 
@@ -633,10 +808,14 @@ impl Worker {
                 self.emit.send(Event::Body { uid, raw });
                 Ok(())
             }
-            Err(e) => {
+            // The connection dropped: try this one again after reconnecting.
+            Err(e @ SourceError::Disconnected(_)) => {
                 self.state.prefetch.push_front(uid);
                 Err(e)
             }
+            // The server couldn't give this body, typically because it was
+            // expunged after it was listed. Skip it. Opening it reports the error.
+            Err(_) => Ok(()),
         }
     }
 
@@ -660,8 +839,8 @@ impl Worker {
         labels: &[String],
     ) -> Result<(), SourceError> {
         let (command, updates) = src.modify_labels(uids, action, labels)?;
-        for (uid, labels) in &updates {
-            self.cache_labels(*uid, labels);
+        for u in &updates {
+            self.cache_update(u);
         }
         self.emit.send(Event::Labels { updates, command });
         Ok(())
@@ -717,7 +896,7 @@ mod tests {
             uids: &[u32],
             action: LabelAction,
             labels: &[String],
-        ) -> Result<(String, crate::backend::LabelUpdates), SourceError> {
+        ) -> Result<(String, Vec<MessageUpdate>), SourceError> {
             self.check()?;
             self.inner.modify_labels(uids, action, labels)
         }
@@ -841,7 +1020,7 @@ mod tests {
                 Event::Labels { updates, command } => {
                     assert_eq!(command, r#"UID STORE 3 -X-GM-LABELS ("\\Inbox")"#);
                     assert_eq!(updates.len(), 1);
-                    assert!(!updates[0].1.contains("\\Inbox"));
+                    assert!(!updates[0].labels.contains("\\Inbox"));
                     break;
                 }
                 Event::Body { .. } => continue,
@@ -1003,6 +1182,203 @@ mod tests {
         match next_significant(&link) {
             Event::Error(e) => assert!(e.contains("sign-in refused"), "{e}"),
             _ => panic!("expected a reconnect error"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::*;
+    use crate::backend::MockSource;
+    use gmail_imap_proto::store::DEFAULT_BODY_CAP;
+    use std::collections::{BTreeSet, VecDeque};
+    use std::sync::{Arc, Mutex};
+
+    /// The demo mailbox, plus a scripted IDLE: each `idle_poll` returns the next
+    /// scripted notices, or waits a moment and returns none.
+    struct Pushing {
+        inner: MockSource,
+        script: Arc<Mutex<VecDeque<Vec<IdleNotice>>>>,
+    }
+
+    impl MailSource for Pushing {
+        fn select(&mut self) -> Result<MailboxInfo, SourceError> {
+            self.inner.select()
+        }
+        fn noop(&mut self) -> Result<(), SourceError> {
+            self.inner.noop()
+        }
+        fn search_from(&mut self, start: u32) -> Result<Vec<u32>, SourceError> {
+            self.inner.search_from(start)
+        }
+        fn fetch_headers(&mut self, uids: &[u32]) -> Result<Vec<Message>, SourceError> {
+            self.inner.fetch_headers(uids)
+        }
+        fn fetch_body(&mut self, uid: u32) -> Result<Vec<u8>, SourceError> {
+            self.inner.fetch_body(uid)
+        }
+        fn modify_labels(
+            &mut self,
+            uids: &[u32],
+            action: LabelAction,
+            labels: &[String],
+        ) -> Result<(String, Vec<MessageUpdate>), SourceError> {
+            self.inner.modify_labels(uids, action, labels)
+        }
+        fn supports_condstore(&self) -> bool {
+            self.inner.supports_condstore()
+        }
+        fn changed_since(&mut self, modseq: u64) -> Result<Vec<MessageUpdate>, SourceError> {
+            self.inner.changed_since(modseq)
+        }
+        fn supports_idle(&self) -> bool {
+            true
+        }
+        fn idle_poll(&mut self, wait: Duration) -> Result<Vec<IdleNotice>, SourceError> {
+            let next = self.script.lock().unwrap().pop_front();
+            match next {
+                Some(notices) => Ok(notices),
+                None => {
+                    thread::sleep(wait.min(Duration::from_millis(20)));
+                    Ok(Vec::new())
+                }
+            }
+        }
+    }
+
+    /// The variant name of an event, for readable test failures.
+    fn name(ev: &Event) -> &'static str {
+        match ev {
+            Event::Connected => "Connected",
+            Event::ConnectFailed(_) => "ConnectFailed",
+            Event::Reconnecting => "Reconnecting",
+            Event::Reconnected => "Reconnected",
+            Event::Reset => "Reset",
+            Event::LoadStarted { .. } => "LoadStarted",
+            Event::Batch(_) => "Batch",
+            Event::LoadFinished => "LoadFinished",
+            Event::CheckFinished(_) => "CheckFinished",
+            Event::Progress { .. } => "Progress",
+            Event::Body { .. } => "Body",
+            Event::Labels { .. } => "Labels",
+            Event::Removed(_) => "Removed",
+            Event::IdleState(_) => "IdleState",
+            Event::Error(_) => "Error",
+            Event::Info(_) => "Info",
+        }
+    }
+
+    fn next(link: &Link) -> Event {
+        link.events
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker went quiet")
+    }
+
+    /// Starts a worker on `source`, loads it, and waits until the load is done.
+    fn loaded(source: &MockSource, script: Arc<Mutex<VecDeque<Vec<IdleNotice>>>>) -> Link {
+        let pushing = Pushing {
+            inner: source.clone(),
+            script,
+        };
+        let mut slot = Some(pushing);
+        let link = spawn(
+            egui::Context::default(),
+            Box::new(move || {
+                let s = slot.take().ok_or("already connected once")?;
+                Ok(Box::new(s) as Box<dyn MailSource>)
+            }),
+            KEEPALIVE,
+            Duration::from_millis(1),
+            Some(Store::open_in_memory(DEFAULT_BODY_CAP).unwrap()),
+            Vec::new(),
+        );
+        link.commands.send(Command::Load { limit: 500 }).unwrap();
+        loop {
+            if matches!(next(&link), Event::LoadFinished) {
+                break;
+            }
+        }
+        link
+    }
+
+    #[test]
+    fn a_change_made_elsewhere_reaches_the_gui_on_check() {
+        let source = MockSource::demo();
+        let handle = source.handle();
+        let link = loaded(&source, Arc::new(Mutex::new(VecDeque::new())));
+
+        handle.set_labels(4, &["Archive"]);
+        handle.set_seen(1, true);
+        link.commands.send(Command::CheckNew).unwrap();
+
+        let mut updates = Vec::new();
+        loop {
+            match next(&link) {
+                Event::Labels { updates: u, .. } => updates.extend(u),
+                Event::CheckFinished(_) => break,
+                Event::Body { .. } | Event::Progress { .. } | Event::IdleState(_) => {}
+                other => panic!("unexpected event: {}", name(&other)),
+            }
+        }
+        let four = updates.iter().find(|u| u.uid == 4).expect("uid 4 updated");
+        assert_eq!(four.labels, BTreeSet::from(["Archive".to_string()]));
+        assert!(updates.iter().find(|u| u.uid == 1).unwrap().seen);
+        assert!(updates.iter().all(|u| u.uid == 1 || u.uid == 4));
+    }
+
+    #[test]
+    fn idle_notice_triggers_a_sync_and_idle_is_reported() {
+        let source = MockSource::demo();
+        let handle = source.handle();
+        let script = Arc::new(Mutex::new(VecDeque::new()));
+        let link = loaded(&source, script.clone());
+
+        // Once the mailbox is loaded, the worker reports that it's idle.
+        loop {
+            if let Event::IdleState(on) = next(&link) {
+                assert!(on);
+                break;
+            }
+        }
+
+        // The server pushes a change. The worker syncs without being asked.
+        handle.set_labels(2, &["Done"]);
+        script.lock().unwrap().push_back(vec![IdleNotice::Changed]);
+        loop {
+            match next(&link) {
+                Event::Labels { updates, .. } => {
+                    assert_eq!(updates[0].uid, 2);
+                    assert!(updates[0].labels.contains("Done"));
+                    break;
+                }
+                Event::Body { .. } | Event::Progress { .. } | Event::CheckFinished(_) => {}
+                other => panic!("unexpected event: {}", name(&other)),
+            }
+        }
+    }
+
+    #[test]
+    fn expunge_removes_the_message_from_the_view() {
+        let source = MockSource::demo();
+        let handle = source.handle();
+        let script = Arc::new(Mutex::new(VecDeque::new()));
+        let link = loaded(&source, script.clone());
+        handle.expunge(3);
+        script.lock().unwrap().push_back(vec![IdleNotice::Expunged]);
+        loop {
+            match next(&link) {
+                Event::Removed(uids) => {
+                    assert_eq!(uids, vec![3]);
+                    break;
+                }
+                Event::Body { .. }
+                | Event::Progress { .. }
+                | Event::CheckFinished(_)
+                | Event::IdleState(_)
+                | Event::Labels { .. } => {}
+                Event::Error(e) => panic!("error event: {e}"),
+                other => panic!("unexpected event: {}", name(&other)),
+            }
         }
     }
 }

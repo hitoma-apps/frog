@@ -23,7 +23,7 @@ pub const DEFAULT_BODY_CAP: u64 = 1 << 30;
 /// zstd level. Mail is text, so a low level compresses well and stays fast.
 const ZSTD_LEVEL: i32 = 3;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -75,6 +75,8 @@ pub struct CachedMessage {
     pub date: String,
     /// The header block as the server sent it.
     pub headers: Vec<u8>,
+    /// Whether the message has been read (`\Seen`).
+    pub seen: bool,
 }
 
 /// What the cache knows about the mailbox's sync position.
@@ -82,6 +84,8 @@ pub struct CachedMessage {
 pub struct MailboxState {
     pub uidvalidity: u32,
     pub highest_uid: Option<u32>,
+    /// HIGHESTMODSEQ at the last sync. `None` if the server doesn't do CONDSTORE.
+    pub highest_modseq: Option<u64>,
 }
 
 pub struct Store {
@@ -145,8 +149,9 @@ impl Store {
             return Ok(());
         }
         let tx = self.conn.transaction()?;
-        tx.execute_batch(
-            "CREATE TABLE sync (
+        if version < 1 {
+            tx.execute_batch(
+                "CREATE TABLE sync (
                  id INTEGER PRIMARY KEY CHECK (id = 1),
                  uidvalidity INTEGER NOT NULL,
                  highest_uid INTEGER
@@ -175,7 +180,14 @@ impl Store {
                  last_access INTEGER NOT NULL
              );
              CREATE INDEX bodies_lru ON bodies(last_access);",
-        )?;
+            )?;
+        }
+        if version < 2 {
+            tx.execute_batch(
+                "ALTER TABLE messages ADD COLUMN seen INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE sync ADD COLUMN highest_modseq INTEGER;",
+            )?;
+        }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
@@ -186,12 +198,13 @@ impl Store {
         let state = self
             .conn
             .query_row(
-                "SELECT uidvalidity, highest_uid FROM sync WHERE id = 1",
+                "SELECT uidvalidity, highest_uid, highest_modseq FROM sync WHERE id = 1",
                 [],
                 |r| {
                     Ok(MailboxState {
                         uidvalidity: r.get(0)?,
                         highest_uid: r.get(1)?,
+                        highest_modseq: r.get::<_, Option<i64>>(2)?.map(|m| m as u64),
                     })
                 },
             )
@@ -201,10 +214,15 @@ impl Store {
 
     pub fn set_mailbox_state(&self, state: MailboxState) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO sync (id, uidvalidity, highest_uid) VALUES (1, ?1, ?2)
+            "INSERT INTO sync (id, uidvalidity, highest_uid, highest_modseq) VALUES (1, ?1, ?2, ?3)
              ON CONFLICT(id) DO UPDATE SET uidvalidity = excluded.uidvalidity,
-                                           highest_uid = excluded.highest_uid",
-            params![state.uidvalidity, state.highest_uid],
+                                           highest_uid = excluded.highest_uid,
+                                           highest_modseq = excluded.highest_modseq",
+            params![
+                state.uidvalidity,
+                state.highest_uid,
+                state.highest_modseq.map(|m| m as i64)
+            ],
         )?;
         Ok(())
     }
@@ -215,12 +233,13 @@ impl Store {
         for m in msgs {
             let msgid = to_i64(m.msgid)?;
             tx.execute(
-                "INSERT INTO messages (msgid, thrid, uid, from_addr, subject, date, headers)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "INSERT INTO messages (msgid, thrid, uid, from_addr, subject, date, headers, seen)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(msgid) DO UPDATE SET
                      thrid = excluded.thrid, uid = excluded.uid,
                      from_addr = excluded.from_addr, subject = excluded.subject,
-                     date = excluded.date, headers = excluded.headers",
+                     date = excluded.date, headers = excluded.headers,
+                     seen = excluded.seen",
                 params![
                     msgid,
                     to_i64(m.thrid)?,
@@ -228,7 +247,8 @@ impl Store {
                     m.from,
                     m.subject,
                     m.date,
-                    m.headers
+                    m.headers,
+                    m.seen
                 ],
             )?;
             tx.execute(
@@ -261,6 +281,15 @@ impl Store {
             )?;
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Records whether a message has been read.
+    pub fn set_seen(&mut self, msgid: u64, seen: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE messages SET seen = ?2 WHERE msgid = ?1",
+            params![to_i64(msgid)?, seen],
+        )?;
         Ok(())
     }
 
@@ -311,11 +340,11 @@ impl Store {
     pub fn list_messages(&self, label: Option<&str>, limit: usize) -> Result<Vec<CachedMessage>> {
         let sql = match label {
             None => {
-                "SELECT msgid, thrid, uid, from_addr, subject, date, headers FROM messages
+                "SELECT msgid, thrid, uid, from_addr, subject, date, headers, seen FROM messages
                  WHERE uid IS NOT NULL ORDER BY uid DESC LIMIT ?2"
             }
             Some(_) => {
-                "SELECT msgid, thrid, uid, from_addr, subject, date, headers FROM messages
+                "SELECT msgid, thrid, uid, from_addr, subject, date, headers, seen FROM messages
                  WHERE uid IS NOT NULL
                    AND EXISTS (SELECT 1 FROM message_labels l
                                WHERE l.msgid = messages.msgid AND l.label = ?1)
@@ -333,6 +362,7 @@ impl Store {
                 subject: r.get(4)?,
                 date: r.get(5)?,
                 headers: r.get(6)?,
+                seen: r.get(7)?,
             })
         })?;
         let mut out = Vec::new();
@@ -443,6 +473,7 @@ mod tests {
             subject: format!("Hello {uid}"),
             date: "Tue, 10 Nov 2026 09:30:00 +0000".into(),
             headers: format!("Subject: Hello {uid}\r\n\r\n").into_bytes(),
+            seen: false,
         }
     }
 
@@ -524,6 +555,7 @@ mod tests {
         s.set_mailbox_state(MailboxState {
             uidvalidity: 5,
             highest_uid: Some(9),
+            highest_modseq: None,
         })
         .unwrap();
         s.upsert_messages(&[msg(1, 1, &["\\Inbox"])]).unwrap();
@@ -567,6 +599,7 @@ mod tests {
         let st = MailboxState {
             uidvalidity: 42,
             highest_uid: Some(7),
+            highest_modseq: Some(99),
         };
         s.set_mailbox_state(st).unwrap();
         assert_eq!(s.mailbox_state().unwrap(), Some(st));
@@ -665,6 +698,7 @@ mod bulk_timing {
                     subject: "Something".into(),
                     date: "Tue, 10 Nov 2026 09:30:00 +0000".into(),
                     headers: headers.clone(),
+                    seen: false,
                 })
                 .collect();
             s.upsert_messages(&batch).unwrap();

@@ -54,7 +54,12 @@ pub type Result<T> = std::result::Result<T, ImapError>;
 
 /// Reads the number after `UIDVALIDITY ` in a response line, if present.
 fn parse_uidvalidity(text: &str) -> Option<u32> {
-    let rest = text.split("UIDVALIDITY ").nth(1)?;
+    parse_bracketed_number(text, "UIDVALIDITY ")
+}
+
+/// Reads the number right after `key` (for example `HIGHESTMODSEQ 42`).
+fn parse_bracketed_number<T: std::str::FromStr>(text: &str, key: &str) -> Option<T> {
+    let rest = text.split(key).nth(1)?;
     let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse().ok()
 }
@@ -64,6 +69,8 @@ fn parse_uidvalidity(text: &str) -> Option<u32> {
 pub struct Selected {
     pub exists: u32,
     pub uidvalidity: u32,
+    /// `HIGHESTMODSEQ`, if the server supports CONDSTORE.
+    pub highestmodseq: Option<u64>,
 }
 
 /// Opens a TLS connection to `host:port` and reads the server greeting.
@@ -105,6 +112,39 @@ pub struct Response {
 pub struct ImapConn<S: Read + Write> {
     reader: BufReader<S>,
     next_tag: u32,
+    /// Bytes of a line read so far. Kept across read timeouts, so a line split by one isn't lost.
+    partial: Vec<u8>,
+    /// The tag of the IDLE command, while idling.
+    idling: Option<String>,
+    /// When the current IDLE started. The server may drop IDLE after about 30 minutes.
+    idle_started: Option<std::time::Instant>,
+    /// Untagged lines that arrived while a command ended IDLE. See [`ImapConn::take_stashed`].
+    stash: Vec<String>,
+}
+
+/// How long one IDLE may run before it's restarted (RFC 2177 suggests under 29 minutes).
+pub const IDLE_RESTART: Duration = Duration::from_secs(25 * 60);
+
+/// Sets the read timeout on the underlying socket. IDLE polling needs short
+/// timeouts, and it has to restore the normal one afterwards.
+pub trait SetReadTimeout {
+    fn set_read_timeout_to(&self, t: Option<Duration>) -> io::Result<()>;
+}
+
+impl SetReadTimeout for TcpStream {
+    fn set_read_timeout_to(&self, t: Option<Duration>) -> io::Result<()> {
+        self.set_read_timeout(t)
+    }
+}
+
+impl SetReadTimeout for StreamOwned<ClientConnection, TcpStream> {
+    fn set_read_timeout_to(&self, t: Option<Duration>) -> io::Result<()> {
+        self.sock.set_read_timeout(t)
+    }
+}
+
+fn is_timeout(e: &ImapError) -> bool {
+    matches!(e, ImapError::Io(io) if matches!(io.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut))
 }
 
 impl<S: Read + Write> ImapConn<S> {
@@ -113,6 +153,10 @@ impl<S: Read + Write> ImapConn<S> {
         let mut conn = ImapConn {
             reader: BufReader::new(stream),
             next_tag: 1,
+            partial: Vec::new(),
+            idling: None,
+            idle_started: None,
+            stash: Vec::new(),
         };
         let greeting = conn.read_line()?;
         if !(greeting.starts_with(b"* OK") || greeting.starts_with(b"* PREAUTH")) {
@@ -124,16 +168,27 @@ impl<S: Read + Write> ImapConn<S> {
         Ok(conn)
     }
 
+    /// Reads one complete line. If a read times out partway through, the bytes
+    /// read so far are kept, and the next call continues the same line.
     fn read_line(&mut self) -> Result<Vec<u8>> {
-        let mut line = Vec::new();
-        if self.reader.read_until(b'\n', &mut line)? == 0 {
-            return Err(ImapError::Closed);
+        loop {
+            let n = self.reader.read_until(b'\n', &mut self.partial)?;
+            if n == 0 {
+                return Err(ImapError::Closed);
+            }
+            if self.partial.ends_with(b"\n") {
+                return Ok(std::mem::take(&mut self.partial));
+            }
         }
-        Ok(line)
     }
 
     /// Sends `cmd` with a fresh tag and collects responses up to the tagged status.
     pub fn command(&mut self, cmd: &str) -> Result<Response> {
+        if self.idling.is_some() {
+            // Commands can't run inside IDLE. End it, and keep what the server sent.
+            let lines = self.idle_done()?;
+            self.stash.extend(lines);
+        }
         let tag = format!("a{:04}", self.next_tag);
         self.next_tag += 1;
         {
@@ -212,10 +267,17 @@ impl<S: Read + Write> ImapConn<S> {
             .map(|line| String::from_utf8_lossy(line).into_owned())
             .chain(std::iter::once(resp.text.clone()))
             .find_map(|text| parse_uidvalidity(&text));
+        let highestmodseq = resp
+            .untagged
+            .iter()
+            .map(|line| String::from_utf8_lossy(line).into_owned())
+            .chain(std::iter::once(resp.text.clone()))
+            .find_map(|text| parse_bracketed_number(&text, "HIGHESTMODSEQ "));
         match (exists, uidvalidity) {
             (Some(exists), Some(uidvalidity)) => Ok(Selected {
                 exists,
                 uidvalidity,
+                highestmodseq,
             }),
             _ => Err(ImapError::Protocol(
                 "SELECT did not report EXISTS and UIDVALIDITY".into(),
@@ -255,6 +317,122 @@ impl<S: Read + Write> ImapConn<S> {
             .into_iter()
             .filter(|line| line.windows(7).any(|w| w == b" FETCH "))
             .collect())
+    }
+
+    /// Messages whose flags, labels or other data changed after `modseq`
+    /// (CONDSTORE). Returns one raw FETCH response per message.
+    pub fn uid_fetch_changed_since(&mut self, items: &str, modseq: u64) -> Result<Vec<Vec<u8>>> {
+        let resp = self.command(&format!("UID FETCH 1:* ({items}) (CHANGEDSINCE {modseq})"))?;
+        Ok(resp
+            .untagged
+            .into_iter()
+            .filter(|line| line.windows(7).any(|w| w == b" FETCH "))
+            .collect())
+    }
+
+    /// Starts IDLE if it isn't running.
+    pub fn idle_start(&mut self) -> Result<()> {
+        if self.idling.is_some() {
+            return Ok(());
+        }
+        let tag = format!("a{:04}", self.next_tag);
+        self.next_tag += 1;
+        {
+            let stream = self.reader.get_mut();
+            stream.write_all(format!("{tag} IDLE\r\n").as_bytes())?;
+            stream.flush()?;
+        }
+        loop {
+            let line = self.read_line()?;
+            if line.starts_with(b"+") {
+                break;
+            }
+            if let Some(status) = line.strip_prefix(tag.as_bytes()) {
+                return Err(ImapError::No(
+                    String::from_utf8_lossy(status).trim().to_string(),
+                ));
+            }
+            // Untagged data before the continuation request is kept for the caller.
+            if line.starts_with(b"* ") {
+                self.stash
+                    .push(String::from_utf8_lossy(&line).trim_end().to_string());
+            }
+        }
+        self.idling = Some(tag);
+        self.idle_started = Some(std::time::Instant::now());
+        Ok(())
+    }
+
+    /// Ends IDLE with DONE, and returns the untagged lines the server sent before it finished.
+    fn idle_done(&mut self) -> Result<Vec<String>> {
+        let Some(tag) = self.idling.take() else {
+            return Ok(Vec::new());
+        };
+        self.idle_started = None;
+        self.reader.get_mut().write_all(b"DONE\r\n")?;
+        self.reader.get_mut().flush()?;
+        let mut lines = Vec::new();
+        loop {
+            let line = self.read_line()?;
+            if let Some(status) = line
+                .strip_prefix(tag.as_bytes())
+                .and_then(|r| r.strip_prefix(b" "))
+            {
+                let text = String::from_utf8_lossy(status).trim_end().to_string();
+                return if text.starts_with("OK") {
+                    Ok(lines)
+                } else {
+                    Err(ImapError::Bad(text))
+                };
+            }
+            if line.starts_with(b"* ") {
+                lines.push(String::from_utf8_lossy(&line).trim_end().to_string());
+            }
+        }
+    }
+
+    /// Waits up to `wait` for untagged updates while idling. Starts IDLE if
+    /// needed, and restarts it after [`IDLE_RESTART`]. Returns the untagged
+    /// lines received, which include any stashed earlier.
+    pub fn idle_poll(&mut self, wait: Duration) -> Result<Vec<String>>
+    where
+        S: SetReadTimeout,
+    {
+        if self
+            .idle_started
+            .is_some_and(|t| t.elapsed() >= IDLE_RESTART)
+        {
+            let lines = self.idle_done()?;
+            self.stash.extend(lines);
+        }
+        self.idle_start()?;
+        let mut lines = std::mem::take(&mut self.stash);
+        self.reader.get_mut().set_read_timeout_to(Some(wait))?;
+        let result = loop {
+            match self.read_line() {
+                Ok(line) => {
+                    if line.starts_with(b"* ") {
+                        lines.push(String::from_utf8_lossy(&line).trim_end().to_string());
+                    } else {
+                        // A tagged line here means the server ended IDLE on its own.
+                        self.idling = None;
+                        self.idle_started = None;
+                        break Err(ImapError::Protocol("server ended IDLE".into()));
+                    }
+                }
+                Err(e) if is_timeout(&e) => break Ok(lines),
+                Err(e) => break Err(e),
+            }
+        };
+        self.reader
+            .get_mut()
+            .set_read_timeout_to(Some(IO_TIMEOUT))?;
+        result
+    }
+
+    /// Untagged lines that arrived while a command ended IDLE. Clears them.
+    pub fn take_stashed(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.stash)
     }
 
     /// Applies a label change with `UID STORE`. Returns the command sent.
@@ -395,5 +573,74 @@ mod timeout_tests {
             conn.noop(),
             Err(ImapError::Closed) | Err(ImapError::Io(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+    use std::io::BufRead;
+    use std::net::TcpListener;
+
+    /// Plays a server that announces a new message during IDLE, ends IDLE on
+    /// DONE, and answers one NOOP afterwards.
+    fn spawn_idle_server() -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut w = stream;
+            w.write_all(b"* OK ready\r\n").unwrap();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                let line = line.trim_end();
+                if line == "a0001 IDLE" {
+                    w.write_all(b"+ idling\r\n* 4 EXISTS\r\n").unwrap();
+                } else if line == "DONE" {
+                    w.write_all(b"a0001 OK IDLE terminated\r\n").unwrap();
+                } else if line == "a0002 NOOP" {
+                    w.write_all(b"a0002 OK NOOP done\r\n").unwrap();
+                    break;
+                }
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn idle_reports_updates_then_a_command_ends_it() {
+        let addr = spawn_idle_server();
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut conn = ImapConn::new(stream).unwrap();
+
+        // The update arrives while idling. The poll then times out and returns it.
+        let lines = conn.idle_poll(Duration::from_millis(300)).unwrap();
+        assert_eq!(lines, vec!["* 4 EXISTS".to_string()]);
+
+        // A command ends IDLE with DONE and then runs. The server answers normally.
+        conn.command("NOOP").unwrap();
+        assert!(conn.take_stashed().is_empty());
+    }
+
+    #[test]
+    fn server_ending_idle_is_reported() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut w = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            w.write_all(b"* OK ready\r\n").unwrap();
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            w.write_all(b"+ idling\r\na0001 BAD going away\r\n")
+                .unwrap();
+        });
+        let mut conn = ImapConn::new(TcpStream::connect(addr).unwrap()).unwrap();
+        assert!(conn.idle_poll(Duration::from_millis(200)).is_err());
     }
 }

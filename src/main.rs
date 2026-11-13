@@ -56,6 +56,12 @@ fn display_label(raw: &str) -> String {
     }
 }
 
+/// The list title for a message. Unread messages are emphasized.
+fn unread_title(m: &Message) -> egui::RichText {
+    let title = egui::RichText::new(format!("{} — {}", m.from, m.subject));
+    if m.seen { title } else { title.strong() }
+}
+
 /// Adds (`add = true`) or removes one count per label in `labels`.
 fn adjust_counts(counts: &mut BTreeMap<String, usize>, labels: &BTreeSet<String>, add: bool) {
     for label in labels {
@@ -145,6 +151,8 @@ struct App {
 
     /// `(loaded, total)` while the initial list is loading.
     loading: Option<(usize, usize)>,
+    /// The server pushes changes (IDLE), so periodic checks are off.
+    idle_on: bool,
     checking: bool,
     auto_check: bool,
     last_check: Instant,
@@ -184,6 +192,7 @@ impl App {
             view: Vec::new(),
             view_dirty: true,
             loading: None,
+            idle_on: false,
             checking: false,
             auto_check: false,
             last_check: Instant::now(),
@@ -282,16 +291,32 @@ impl App {
                 }
             }
             Event::Labels { updates, command } => {
-                for (uid, labels) in updates {
-                    if let Some(m) = self.messages.get_mut(&uid) {
-                        let old = std::mem::replace(&mut m.labels, labels);
+                for u in updates {
+                    if let Some(m) = self.messages.get_mut(&u.uid) {
+                        let old = std::mem::replace(&mut m.labels, u.labels);
                         adjust_counts(&mut self.counts, &old, false);
                         adjust_counts(&mut self.counts, &m.labels, true);
+                        m.seen = u.seen;
                         self.view_dirty = true;
                     }
                 }
                 self.log.push(command);
             }
+            Event::Removed(uids) => {
+                for uid in uids {
+                    if let Some(m) = self.messages.remove(&uid) {
+                        adjust_counts(&mut self.counts, &m.labels, false);
+                    }
+                    self.checked.remove(&uid);
+                    self.requested_bodies.remove(&uid);
+                    if self.open == Some(uid) {
+                        self.open = None;
+                        self.rendered = None;
+                    }
+                }
+                self.view_dirty = true;
+            }
+            Event::IdleState(on) => self.idle_on = on,
             Event::Error(e) => {
                 self.checking = false;
                 self.loading = None;
@@ -457,7 +482,11 @@ impl App {
                     ui.spinner();
                     ui.label("Checking…");
                 }
-                ui.checkbox(&mut self.auto_check, "Check every 60s");
+                if self.idle_on {
+                    ui.weak("Live updates on");
+                } else {
+                    ui.checkbox(&mut self.auto_check, "Check every 60s");
+                }
             }
             if let Some(info) = &self.info {
                 ui.weak(info);
@@ -573,7 +602,7 @@ impl App {
                         }
                         let open = self.open == Some(uid);
                         if ui
-                            .selectable_label(open, format!("{} — {}", m.from, m.subject))
+                            .selectable_label(open, unread_title(m))
                             .on_hover_text(format!("thread {}", m.thrid))
                             .clicked()
                         {
@@ -739,7 +768,7 @@ impl eframe::App for App {
         self.refresh_view();
 
         // Auto-check: a timer that only runs while the toggle is on and nothing else is busy.
-        if self.auto_check {
+        if self.auto_check && !self.idle_on {
             if !self.checking
                 && self.loading.is_none()
                 && self.last_check.elapsed() >= AUTO_CHECK_INTERVAL

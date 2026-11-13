@@ -4,9 +4,8 @@
 //! thread, so the GUI never blocks on the network.
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
-#[cfg(test)]
-use gmail_imap_proto::labels::uid_store_labels;
 use gmail_imap_proto::labels::{LabelAction, LabelRef, SystemLabel};
 use gmail_imap_proto::store::CachedMessage;
 use mail_parser::MessageParser;
@@ -40,11 +39,32 @@ impl From<&str> for SourceError {
     }
 }
 
-/// What SELECT reports: how many messages the mailbox holds, and its UIDVALIDITY.
+/// What SELECT reports: the mailbox size, its UIDVALIDITY, and its modseq if the server has one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MailboxInfo {
     pub uidvalidity: u32,
     pub exists: u32,
+    /// `HIGHESTMODSEQ`, if the server supports CONDSTORE.
+    pub highest_modseq: Option<u64>,
+}
+
+/// The current labels and read state of one message, as the server reports them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageUpdate {
+    pub uid: u32,
+    pub labels: BTreeSet<String>,
+    pub seen: bool,
+}
+
+/// Something the server told us while idle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleNotice {
+    /// New messages arrived.
+    NewMail,
+    /// Messages were removed.
+    Expunged,
+    /// A message's flags or labels changed.
+    Changed,
 }
 
 /// One message as the GUI sees it. Headers are loaded with the list; the full
@@ -59,6 +79,8 @@ pub struct Message {
     pub uid: u32,
     /// Raw `X-GM-LABELS` names, e.g. `\Inbox` or `Work/Projects`.
     pub labels: BTreeSet<String>,
+    /// Whether the message has been read.
+    pub seen: bool,
     pub from: String,
     pub subject: String,
     pub date: String,
@@ -75,6 +97,7 @@ impl Message {
         thrid: u64,
         uid: u32,
         labels: Vec<String>,
+        seen: bool,
         headers: Vec<u8>,
     ) -> Self {
         let parsed = MessageParser::default().parse(&headers);
@@ -99,6 +122,7 @@ impl Message {
             thrid,
             uid,
             labels: labels.into_iter().collect(),
+            seen,
             from,
             subject,
             date,
@@ -106,12 +130,7 @@ impl Message {
             body: None,
         }
     }
-}
 
-/// New label sets for UIDs, as returned after a label change.
-pub type LabelUpdates = Vec<(u32, BTreeSet<String>)>;
-
-impl Message {
     /// The cache form of this message. Only messages with a UID can be cached.
     pub fn to_cached(&self) -> CachedMessage {
         CachedMessage {
@@ -123,6 +142,7 @@ impl Message {
             subject: self.subject.clone(),
             date: self.date.clone(),
             headers: self.headers.clone(),
+            seen: self.seen,
         }
     }
 
@@ -130,19 +150,25 @@ impl Message {
     /// invalidated, since such a message can't be acted on.
     pub fn from_cached(c: CachedMessage) -> Option<Self> {
         let uid = c.uid?;
-        Some(Self::from_headers(
+        let mut m = Self::from_headers(
             c.msgid,
             c.thrid,
             uid,
             c.labels.into_iter().collect(),
+            c.seen,
             c.headers,
-        ))
+        );
+        // The cached subject, sender and date are what the header parse gave us.
+        m.from = c.from;
+        m.subject = c.subject;
+        m.date = c.date;
+        Some(m)
     }
 }
 
 /// Everything the worker needs from a mailbox.
 pub trait MailSource: Send {
-    /// Selects All Mail and reports its size and UIDVALIDITY.
+    /// Selects All Mail and reports its size, UIDVALIDITY and modseq.
     fn select(&mut self) -> Result<MailboxInfo, SourceError>;
     /// Keeps the connection alive. Does nothing else.
     fn noop(&mut self) -> Result<(), SourceError>;
@@ -152,14 +178,39 @@ pub trait MailSource: Send {
     fn fetch_headers(&mut self, uids: &[u32]) -> Result<Vec<Message>, SourceError>;
     /// The full RFC 5322 message.
     fn fetch_body(&mut self, uid: u32) -> Result<Vec<u8>, SourceError>;
-    /// Applies a label change. Returns the command for the log and the
-    /// labels of each affected UID afterwards.
+    /// Applies a label change. Returns the command for the log and the new
+    /// state of each affected message.
     fn modify_labels(
         &mut self,
         uids: &[u32],
         action: LabelAction,
         labels: &[String],
-    ) -> Result<(String, LabelUpdates), SourceError>;
+    ) -> Result<(String, Vec<MessageUpdate>), SourceError>;
+
+    /// Whether the server reports changes since a modseq (CONDSTORE).
+    fn supports_condstore(&self) -> bool {
+        false
+    }
+    /// The state of every message changed after `modseq`. Changes made
+    /// elsewhere, such as in the web UI, appear here.
+    fn changed_since(&mut self, modseq: u64) -> Result<Vec<MessageUpdate>, SourceError> {
+        let _ = modseq;
+        Err("CONDSTORE is not supported by this server".into())
+    }
+
+    /// Whether the server supports IDLE (push notifications).
+    fn supports_idle(&self) -> bool {
+        false
+    }
+    /// Waits up to `wait` for the server to report a change while idle.
+    fn idle_poll(&mut self, wait: Duration) -> Result<Vec<IdleNotice>, SourceError> {
+        let _ = wait;
+        Err("IDLE is not supported by this server".into())
+    }
+    /// Notices that arrived while the connection was busy with a command.
+    fn take_notices(&mut self) -> Vec<IdleNotice> {
+        Vec::new()
+    }
 }
 
 /// Maps label names to IMAP label references, recognizing system labels.
@@ -182,25 +233,82 @@ pub fn header_block(raw: &[u8]) -> Vec<u8> {
     }
 }
 
+/// In-memory mailbox for tests. Clones share the same state, so a test can
+/// change messages through a [`MockHandle`] while the worker is running.
+#[cfg(test)]
+#[derive(Clone)]
+pub struct MockSource {
+    state: std::sync::Arc<std::sync::Mutex<MockState>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct MockState {
+    entries: Vec<MockEntry>,
+    highest_modseq: u64,
+}
+
 #[cfg(test)]
 struct MockEntry {
     msgid: u64,
     thrid: u64,
     uid: u32,
     labels: BTreeSet<String>,
+    seen: bool,
     raw: Vec<u8>,
+    modseq: u64,
 }
 
-/// In-memory mailbox for the demo and for tests.
+/// Changes the mock mailbox the way another client would.
 #[cfg(test)]
-pub struct MockSource {
-    entries: Vec<MockEntry>,
+#[derive(Clone)]
+pub struct MockHandle {
+    state: std::sync::Arc<std::sync::Mutex<MockState>>,
+}
+
+#[cfg(test)]
+impl MockHandle {
+    /// Replaces a message's labels, as another client would.
+    pub fn set_labels(&self, uid: u32, labels: &[&str]) {
+        let mut st = self.state.lock().unwrap();
+        st.highest_modseq += 1;
+        let modseq = st.highest_modseq;
+        if let Some(e) = st.entries.iter_mut().find(|e| e.uid == uid) {
+            e.labels = labels.iter().map(|s| s.to_string()).collect();
+            e.modseq = modseq;
+        }
+    }
+
+    /// Removes a message, as an expunge from another client would.
+    pub fn expunge(&self, uid: u32) {
+        let mut st = self.state.lock().unwrap();
+        st.entries.retain(|e| e.uid != uid);
+    }
+
+    /// Marks a message read or unread, as another client would.
+    pub fn set_seen(&self, uid: u32, seen: bool) {
+        let mut st = self.state.lock().unwrap();
+        st.highest_modseq += 1;
+        let modseq = st.highest_modseq;
+        if let Some(e) = st.entries.iter_mut().find(|e| e.uid == uid) {
+            e.seen = seen;
+            e.modseq = modseq;
+        }
+    }
 }
 
 #[cfg(test)]
 impl MockSource {
+    /// Six messages, UIDs 1 to 6.
     pub fn demo() -> Self {
-        let entry = |msgid, thrid, uid, labels: &[&str], from: &str, subject: &str, body: &str| {
+        let entry = |uid: u32,
+                     msgid: u64,
+                     thrid: u64,
+                     labels: &[&str],
+                     seen: bool,
+                     from: &str,
+                     subject: &str,
+                     body: &str| {
             let raw = format!(
                 "From: {from}\r\nTo: me@example.com\r\nSubject: {subject}\r\n\
                  Date: Tue, 10 Nov 2026 09:30:00 +0000\r\n\
@@ -212,80 +320,105 @@ impl MockSource {
                 thrid,
                 uid,
                 labels: labels.iter().map(|s| s.to_string()).collect(),
+                seen,
                 raw,
+                modseq: uid as u64,
             }
         };
+        let entries = vec![
+            entry(
+                1,
+                1001,
+                9001,
+                &["\\Inbox", "\\Important", "Work/Projects"],
+                false,
+                "Ada <ada@example.com>",
+                "Q3 plan",
+                "Here is the draft of the Q3 plan.\nPlease review by Friday.",
+            ),
+            entry(
+                2,
+                1002,
+                9001,
+                &["\\Inbox", "Work/Projects"],
+                true,
+                "Charles <charles@example.com>",
+                "Re: Q3 plan",
+                "Looks good. Two comments on the budget section.",
+            ),
+            entry(
+                3,
+                1003,
+                9002,
+                &["\\Inbox", "\\Starred"],
+                false,
+                "Shop <orders@example.com>",
+                "Your receipt",
+                "Thanks for your order #4411.",
+            ),
+            entry(
+                4,
+                1004,
+                9003,
+                &["Personal"],
+                true,
+                "Mary <mary@example.com>",
+                "Holiday photos",
+                "Uploaded the photos from the lake trip.",
+            ),
+            entry(
+                5,
+                1005,
+                9004,
+                &["\\Trash"],
+                true,
+                "News <news@example.com>",
+                "Old newsletter",
+                "This one is in the trash.",
+            ),
+            entry(
+                6,
+                1006,
+                9005,
+                &["\\Sent"],
+                true,
+                "me@example.com",
+                "Re: lunch",
+                "Thursday works for me.",
+            ),
+        ];
         Self {
-            entries: vec![
-                entry(
-                    1001,
-                    9001,
-                    1,
-                    &["\\Inbox", "\\Important", "Work/Projects"],
-                    "Ada <ada@example.com>",
-                    "Q3 plan",
-                    "Here is the draft of the Q3 plan.\nPlease review by Friday.",
-                ),
-                entry(
-                    1002,
-                    9001,
-                    2,
-                    &["\\Inbox", "Work/Projects"],
-                    "Charles <charles@example.com>",
-                    "Re: Q3 plan",
-                    "Looks good. Two comments on the budget section.",
-                ),
-                entry(
-                    1003,
-                    9002,
-                    3,
-                    &["\\Inbox", "\\Starred"],
-                    "Shop <orders@example.com>",
-                    "Your receipt",
-                    "Thanks for your order #4411.",
-                ),
-                entry(
-                    1004,
-                    9003,
-                    4,
-                    &["Personal"],
-                    "Mary <mary@example.com>",
-                    "Holiday photos",
-                    "Uploaded the photos from the lake trip.",
-                ),
-                entry(
-                    1005,
-                    9004,
-                    5,
-                    &["\\Trash"],
-                    "News <news@example.com>",
-                    "Old newsletter",
-                    "This one is in the trash.",
-                ),
-                entry(
-                    1006,
-                    9005,
-                    6,
-                    &["\\Sent"],
-                    "me@example.com",
-                    "Re: lunch",
-                    "Thursday works for me.",
-                ),
-            ],
+            state: std::sync::Arc::new(std::sync::Mutex::new(MockState {
+                entries,
+                highest_modseq: 6,
+            })),
         }
     }
 
-    fn entry_mut(&mut self, uid: u32) -> Option<&mut MockEntry> {
-        self.entries.iter_mut().find(|e| e.uid == uid)
+    /// A handle for changing this mailbox from a test.
+    pub fn handle(&self) -> MockHandle {
+        MockHandle {
+            state: self.state.clone(),
+        }
+    }
+
+    fn update_of(e: &MockEntry) -> MessageUpdate {
+        MessageUpdate {
+            uid: e.uid,
+            labels: e.labels.clone(),
+            seen: e.seen,
+        }
     }
 }
 
 #[cfg(test)]
 impl MailSource for MockSource {
     fn select(&mut self) -> Result<MailboxInfo, SourceError> {
+        let st = self.state.lock().unwrap();
         Ok(MailboxInfo {
             uidvalidity: 1,
-            exists: self.entries.len() as u32,
+            exists: st.entries.len() as u32,
+            highest_modseq: Some(st.highest_modseq),
         })
     }
 
@@ -294,7 +427,8 @@ impl MailSource for MockSource {
     }
 
     fn search_from(&mut self, start: u32) -> Result<Vec<u32>, SourceError> {
-        let mut uids: Vec<u32> = self
+        let st = self.state.lock().unwrap();
+        let mut uids: Vec<u32> = st
             .entries
             .iter()
             .map(|e| e.uid)
@@ -305,15 +439,17 @@ impl MailSource for MockSource {
     }
 
     fn fetch_headers(&mut self, uids: &[u32]) -> Result<Vec<Message>, SourceError> {
+        let st = self.state.lock().unwrap();
         Ok(uids
             .iter()
-            .filter_map(|&uid| self.entries.iter().find(|e| e.uid == uid))
+            .filter_map(|&uid| st.entries.iter().find(|e| e.uid == uid))
             .map(|e| {
                 Message::from_headers(
                     e.msgid,
                     e.thrid,
                     e.uid,
                     e.labels.iter().cloned().collect(),
+                    e.seen,
                     header_block(&e.raw),
                 )
             })
@@ -321,7 +457,8 @@ impl MailSource for MockSource {
     }
 
     fn fetch_body(&mut self, uid: u32) -> Result<Vec<u8>, SourceError> {
-        self.entries
+        let st = self.state.lock().unwrap();
+        st.entries
             .iter()
             .find(|e| e.uid == uid)
             .map(|e| e.raw.clone())
@@ -333,21 +470,25 @@ impl MailSource for MockSource {
         uids: &[u32],
         action: LabelAction,
         labels: &[String],
-    ) -> Result<(String, LabelUpdates), SourceError> {
+    ) -> Result<(String, Vec<MessageUpdate>), SourceError> {
+        let mut st = self.state.lock().unwrap();
         let found: Vec<u32> = uids
             .iter()
             .copied()
-            .filter(|u| self.entries.iter().any(|e| e.uid == *u))
+            .filter(|u| st.entries.iter().any(|e| e.uid == *u))
             .collect();
         if found.is_empty() {
             return Err("no messages selected".into());
         }
-        let command = uid_store_labels(&found, action, &label_refs(labels))
-            .ok_or_else(|| "nothing to change".to_string())?;
+        let command =
+            gmail_imap_proto::labels::uid_store_labels(&found, action, &label_refs(labels))
+                .ok_or_else(|| "nothing to change".to_string())?;
 
+        st.highest_modseq += 1;
+        let modseq = st.highest_modseq;
         let mut updates = Vec::new();
         for &uid in &found {
-            if let Some(e) = self.entry_mut(uid) {
+            if let Some(e) = st.entries.iter_mut().find(|e| e.uid == uid) {
                 match action {
                     LabelAction::Add => e.labels.extend(labels.iter().cloned()),
                     LabelAction::Remove => {
@@ -357,10 +498,25 @@ impl MailSource for MockSource {
                     }
                     LabelAction::Replace => e.labels = labels.iter().cloned().collect(),
                 }
-                updates.push((uid, e.labels.clone()));
+                e.modseq = modseq;
+                updates.push(Self::update_of(e));
             }
         }
         Ok((command, updates))
+    }
+
+    fn supports_condstore(&self) -> bool {
+        true
+    }
+
+    fn changed_since(&mut self, modseq: u64) -> Result<Vec<MessageUpdate>, SourceError> {
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .entries
+            .iter()
+            .filter(|e| e.modseq > modseq)
+            .map(Self::update_of)
+            .collect())
     }
 }
 
@@ -408,5 +564,29 @@ mod tests {
     fn header_block_stops_at_blank_line() {
         let raw = b"From: a\r\nSubject: b\r\n\r\nbody\r\n";
         assert_eq!(header_block(raw), b"From: a\r\nSubject: b\r\n\r\n".to_vec());
+    }
+
+    #[test]
+    fn changes_made_elsewhere_are_reported_since_a_modseq() {
+        let mut src = MockSource::demo();
+        let handle = src.handle();
+        let before = src.select().unwrap().highest_modseq.unwrap();
+
+        handle.set_labels(4, &["Archive"]);
+        handle.set_seen(1, true);
+
+        let changed = src.changed_since(before).unwrap();
+        let uids: Vec<u32> = changed.iter().map(|c| c.uid).collect();
+        assert_eq!(uids, vec![1, 4], "only the two changed messages");
+        let four = changed.iter().find(|c| c.uid == 4).unwrap();
+        assert_eq!(four.labels, BTreeSet::from(["Archive".to_string()]));
+        assert!(changed.iter().find(|c| c.uid == 1).unwrap().seen);
+    }
+
+    #[test]
+    fn nothing_changed_since_now() {
+        let mut src = MockSource::demo();
+        let now = src.select().unwrap().highest_modseq.unwrap();
+        assert!(src.changed_since(now).unwrap().is_empty());
     }
 }
