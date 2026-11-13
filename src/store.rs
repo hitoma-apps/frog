@@ -264,6 +264,40 @@ impl Store {
         Ok(())
     }
 
+    /// UIDs that have a cached header, newest first.
+    pub fn cached_uids(&self) -> Result<Vec<u32>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT uid FROM messages WHERE uid IS NOT NULL ORDER BY uid DESC")?;
+        let uids = stmt
+            .query_map([], |r| r.get::<_, u32>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(uids)
+    }
+
+    /// The message ID for a UID in the current UIDVALIDITY, if cached.
+    pub fn msgid_for_uid(&self, uid: u32) -> Result<Option<u64>> {
+        let msgid: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT msgid FROM messages WHERE uid = ?1",
+                params![uid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(msgid.map(|m| m as u64))
+    }
+
+    /// Removes cached messages by UID, for messages deleted on the server.
+    pub fn remove_uids(&mut self, uids: &[u32]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for uid in uids {
+            tx.execute("DELETE FROM messages WHERE uid = ?1", params![uid])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Clears every UID. Call this when UIDVALIDITY changes. The messages
     /// themselves are kept, and the next sync assigns new UIDs.
     pub fn invalidate_uids(&mut self) -> Result<()> {
@@ -490,6 +524,29 @@ mod tests {
         let listed = s.list_messages(None, 10).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].uid, None);
+    }
+
+    #[test]
+    fn cached_uids_and_msgid_lookup() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        s.upsert_messages(&[msg(1001, 1, &[]), msg(1003, 3, &[]), msg(1002, 2, &[])])
+            .unwrap();
+        assert_eq!(s.cached_uids().unwrap(), vec![3, 2, 1]);
+        assert_eq!(s.msgid_for_uid(2).unwrap(), Some(1002));
+        assert_eq!(s.msgid_for_uid(99).unwrap(), None);
+        s.invalidate_uids().unwrap();
+        assert!(s.cached_uids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn remove_uids_drops_messages_and_their_labels() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        s.upsert_messages(&[msg(1, 1, &["Work"]), msg(2, 2, &["Work"])])
+            .unwrap();
+        s.remove_uids(&[1]).unwrap();
+        assert_eq!(s.cached_uids().unwrap(), vec![2]);
+        let work = s.list_messages(Some("Work"), 10).unwrap();
+        assert_eq!(work.iter().map(|m| m.msgid).collect::<Vec<_>>(), vec![2]);
     }
 
     #[test]

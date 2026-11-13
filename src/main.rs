@@ -64,6 +64,10 @@ struct App {
     connected: bool,
     /// The connection dropped and the worker is reconnecting.
     reconnecting: bool,
+    /// Messages in the mailbox, from the last SELECT.
+    mailbox_total: usize,
+    /// Headers held locally, out of `mailbox_total`.
+    cached_count: usize,
     login: LoginForm,
 
     messages: Vec<Message>,
@@ -97,6 +101,8 @@ impl App {
             connecting: false,
             connected: false,
             reconnecting: false,
+            mailbox_total: 0,
+            cached_count: 0,
             login: LoginForm::default(),
             messages: Vec::new(),
             loading: None,
@@ -162,10 +168,15 @@ impl App {
             }
             Event::Reset => {
                 self.messages.clear();
+                self.cached_count = 0;
                 self.requested_bodies.clear();
                 self.rendered = None;
                 self.open = None;
                 self.checked.clear();
+            }
+            Event::Progress { cached, total } => {
+                self.cached_count = cached;
+                self.mailbox_total = total;
             }
             Event::Reconnecting => self.reconnecting = true,
             Event::Reconnected => {
@@ -378,7 +389,14 @@ impl App {
                     ui.label("Checking…");
                 }
                 ui.checkbox(&mut self.auto_check, "Check every 60s");
-                ui.weak(format!("{} messages", self.messages.len()));
+            }
+            ui.weak(format!(
+                "{} in mailbox · {} cached",
+                self.mailbox_total, self.cached_count
+            ));
+            if self.cached_count < self.mailbox_total {
+                ui.spinner();
+                ui.label("Caching headers…");
             }
         });
     }

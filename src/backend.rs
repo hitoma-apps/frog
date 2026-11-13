@@ -6,6 +6,7 @@
 use std::collections::BTreeSet;
 
 use gmail_imap_proto::labels::{LabelAction, LabelRef, SystemLabel, uid_store_labels};
+use gmail_imap_proto::store::CachedMessage;
 use mail_parser::MessageParser;
 
 /// Why a mail operation failed.
@@ -35,6 +36,13 @@ impl From<&str> for SourceError {
     fn from(s: &str) -> Self {
         SourceError::Failed(s.to_string())
     }
+}
+
+/// What SELECT reports: how many messages the mailbox holds, and its UIDVALIDITY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MailboxInfo {
+    pub uidvalidity: u32,
+    pub exists: u32,
 }
 
 /// One message as the GUI sees it. Headers are loaded with the list; the full
@@ -101,10 +109,39 @@ impl Message {
 /// New label sets for UIDs, as returned after a label change.
 pub type LabelUpdates = Vec<(u32, BTreeSet<String>)>;
 
+impl Message {
+    /// The cache form of this message. Only messages with a UID can be cached.
+    pub fn to_cached(&self) -> CachedMessage {
+        CachedMessage {
+            msgid: self.msgid,
+            thrid: self.thrid,
+            uid: Some(self.uid),
+            labels: self.labels.clone(),
+            from: self.from.clone(),
+            subject: self.subject.clone(),
+            date: self.date.clone(),
+            headers: self.headers.clone(),
+        }
+    }
+
+    /// A listing entry from a cached header. Returns `None` if the UID was
+    /// invalidated, since such a message can't be acted on.
+    pub fn from_cached(c: CachedMessage) -> Option<Self> {
+        let uid = c.uid?;
+        Some(Self::from_headers(
+            c.msgid,
+            c.thrid,
+            uid,
+            c.labels.into_iter().collect(),
+            c.headers,
+        ))
+    }
+}
+
 /// Everything the worker needs from a mailbox.
 pub trait MailSource: Send {
-    /// Selects All Mail and returns its UIDVALIDITY.
-    fn select(&mut self) -> Result<u32, SourceError>;
+    /// Selects All Mail and reports its size and UIDVALIDITY.
+    fn select(&mut self) -> Result<MailboxInfo, SourceError>;
     /// Keeps the connection alive. Does nothing else.
     fn noop(&mut self) -> Result<(), SourceError>;
     /// UIDs at least `start`, ascending.
@@ -238,8 +275,11 @@ impl MockSource {
 }
 
 impl MailSource for MockSource {
-    fn select(&mut self) -> Result<u32, SourceError> {
-        Ok(1)
+    fn select(&mut self) -> Result<MailboxInfo, SourceError> {
+        Ok(MailboxInfo {
+            uidvalidity: 1,
+            exists: self.entries.len() as u32,
+        })
     }
 
     fn noop(&mut self) -> Result<(), SourceError> {

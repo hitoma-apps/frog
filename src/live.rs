@@ -6,7 +6,7 @@ use gmail_imap_proto::imap::{ImapConn, ImapError, connect_tls};
 use gmail_imap_proto::labels::LabelAction;
 use gmail_imap_proto::parse_gmail_fetch;
 
-use crate::backend::{LabelUpdates, MailSource, Message, SourceError, label_refs};
+use crate::backend::{LabelUpdates, MailSource, MailboxInfo, Message, SourceError, label_refs};
 
 /// Gmail's All Mail folder holds every message, whatever its labels.
 pub const ALL_MAIL: &str = "[Gmail]/All Mail";
@@ -51,10 +51,13 @@ fn to_source_error(e: ImapError) -> SourceError {
 }
 
 impl<S: Read + Write + Send> MailSource for LiveSession<S> {
-    fn select(&mut self) -> Result<u32, SourceError> {
+    fn select(&mut self) -> Result<MailboxInfo, SourceError> {
         let sel = self.conn.select(ALL_MAIL).map_err(to_source_error)?;
         self.selected = true;
-        Ok(sel.uidvalidity)
+        Ok(MailboxInfo {
+            uidvalidity: sel.uidvalidity,
+            exists: sel.exists,
+        })
     }
 
     fn noop(&mut self) -> Result<(), SourceError> {
@@ -277,7 +280,9 @@ mod tests {
     fn lists_headers_newest_first_and_reports_uidvalidity() {
         let addr = spawn_fake(Arc::new(Mutex::new(Vec::new())));
         let mut s = session(addr, "app-pass").unwrap();
-        assert_eq!(s.select().unwrap(), 42);
+        let info = s.select().unwrap();
+        assert_eq!(info.uidvalidity, 42);
+        assert_eq!(info.exists, 3);
         let mut uids = s.search_from(1).unwrap();
         uids.reverse();
         assert_eq!(uids, vec![3, 2, 1]);
