@@ -10,7 +10,7 @@
 //! There's one file per account, and each file holds one mailbox (All Mail).
 //! Plaintext for now. Encryption at rest is planned.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -348,12 +348,8 @@ impl Store {
                 seen: r.get(7)?,
             })
         })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let mut m = row?;
-            m.labels = self.labels_of(m.msgid)?;
-            out.push(m);
-        }
+        let mut out = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        self.attach_labels(&mut out)?;
         Ok(out)
     }
 
@@ -429,23 +425,36 @@ impl Store {
                 seen: r.get(7)?,
             })
         })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let mut m = row?;
-            m.labels = self.labels_of(m.msgid)?;
-            out.push(m);
-        }
+        let mut out = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        self.attach_labels(&mut out)?;
         Ok(out)
     }
 
-    fn labels_of(&self, msgid: u64) -> Result<BTreeSet<String>> {
-        let mut stmt = self
-            .conn
-            .prepare_cached("SELECT label FROM message_labels WHERE msgid = ?1")?;
-        let labels = stmt
-            .query_map(params![to_i64(msgid)?], |r| r.get::<_, String>(0))?
-            .collect::<std::result::Result<BTreeSet<_>, _>>()?;
-        Ok(labels)
+    /// Fills in the labels of a page of messages with one query, rather than one
+    /// query per message.
+    fn attach_labels(&self, msgs: &mut [CachedMessage]) -> Result<()> {
+        if msgs.is_empty() {
+            return Ok(());
+        }
+        // Message IDs are stored as i64 (checked on write), so these are plain integers.
+        let ids: Vec<String> = msgs.iter().map(|m| (m.msgid as i64).to_string()).collect();
+        let json = format!("[{}]", ids.join(","));
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT msgid, label FROM message_labels
+             WHERE msgid IN (SELECT value FROM json_each(?1))",
+        )?;
+        let mut by_msg: HashMap<i64, BTreeSet<String>> = HashMap::new();
+        let rows = stmt.query_map(params![json], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (msgid, label) = row?;
+            by_msg.entry(msgid).or_default().insert(label);
+        }
+        for m in msgs.iter_mut() {
+            m.labels = by_msg.remove(&(m.msgid as i64)).unwrap_or_default();
+        }
+        Ok(())
     }
 
     /// Returns the full message if it's cached, and marks it recently used.
@@ -794,7 +803,22 @@ mod bulk_timing {
         let n: u64 = 250_000;
         let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
         let labels: BTreeSet<String> = ["\\Inbox".to_string(), "Work".to_string()].into();
-        let headers = b"From: a@example.com\r\nSubject: Something\r\n\r\n".to_vec();
+        // A realistic header block (about 1.5 KB), so header parsing costs what it does in practice.
+        let headers = [
+            "Received: from mail.example.net (mail.example.net [203.0.113.5])\r\n\tby mx.example.com with ESMTPS id abc123\r\n\tfor <me@example.com>; Tue, 10 Nov 2026 09:29:58 +0000 (UTC)\r\n",
+            "Received-SPF: pass (google.com: domain of a@example.com designates 203.0.113.5 as permitted sender)\r\n",
+            "Authentication-Results: mx.example.com; spf=pass; dkim=pass header.i=@example.com; dmarc=pass\r\n",
+            "DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.com; s=sel; h=from:to:subject:date:message-id; bh=0123456789abcdefghijklmnopqrstuvwxyzABCDEF=; b=abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOP\r\n",
+            "Date: Tue, 10 Nov 2026 09:30:00 +0000\r\n",
+            "From: A Person <a@example.com>\r\n",
+            "To: Me <me@example.com>\r\n",
+            "Message-ID: <abc123@example.com>\r\n",
+            "Subject: Something\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: multipart/alternative; boundary=\"b1\"\r\n\r\n",
+        ]
+        .concat()
+        .into_bytes();
 
         let t = Instant::now();
         for start in (1..=n).step_by(200) {
@@ -818,6 +842,43 @@ mod bulk_timing {
         let t = Instant::now();
         let uids = s.cached_uids().unwrap();
         println!("cached_uids ({} rows): {:?}", uids.len(), t.elapsed());
+
+        // The startup show: walk the whole cache in pages of 5000, as the worker does.
+        let t = Instant::now();
+        let (mut before, mut seen) = (None, 0usize);
+        loop {
+            let page = s.list_page(before, 5000).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            seen += page.len();
+            before = page.last().and_then(|m| m.uid);
+        }
+        println!(
+            "list_page walk ({seen} rows, pages of 5000): {:?}",
+            t.elapsed()
+        );
+
+        // What from_cached costs on top of the query: parsing each header block.
+        let t = Instant::now();
+        let (mut before, mut built) = (None, 0usize);
+        loop {
+            let page = s.list_page(before, 5000).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            before = page.last().and_then(|m| m.uid);
+            for m in &page {
+                let parsed = mail_parser::MessageParser::default().parse(&m.headers);
+                if parsed.as_ref().and_then(|p| p.date()).is_some() {
+                    built += 1;
+                }
+            }
+        }
+        println!(
+            "header parse walk ({built} dates parsed): {:?}",
+            t.elapsed()
+        );
 
         let t = Instant::now();
         let newest = s.list_messages(None, 500).unwrap();

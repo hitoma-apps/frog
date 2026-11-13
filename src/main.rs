@@ -17,6 +17,7 @@ mod worker;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -279,10 +280,11 @@ struct App {
 
     /// Messages keyed by UID. Iterating in reverse gives newest first.
     messages: BTreeMap<u32, Message>,
-    /// Label name to number of messages with it. Kept in step with `messages`.
-    counts: BTreeMap<String, usize>,
+    /// Label name to number of cached messages with it, from the cache. Shared, so
+    /// the sidebar can hold it each frame without copying.
+    counts: Arc<BTreeMap<String, usize>>,
     /// Every label on the account, from the server. Includes labels with no cached messages.
-    known_labels: BTreeSet<String>,
+    known_labels: Arc<BTreeSet<String>>,
     /// Conversations in display order, after the filter. Rebuilt when `view_dirty` is set.
     view: Vec<ThreadRow>,
     view_dirty: bool,
@@ -354,8 +356,8 @@ impl App {
             cached_count: 0,
             login,
             messages: BTreeMap::new(),
-            counts: BTreeMap::new(),
-            known_labels: BTreeSet::new(),
+            counts: Arc::default(),
+            known_labels: Arc::default(),
             view: Vec::new(),
             view_dirty: true,
             view_built: Instant::now(),
@@ -426,7 +428,7 @@ impl App {
             }
             Event::Reset => {
                 self.messages.clear();
-                self.counts.clear();
+                self.counts = Arc::default();
                 self.view_dirty = true;
                 self.cached_count = 0;
                 self.requested_bodies.clear();
@@ -440,7 +442,7 @@ impl App {
                 self.mailbox_total = total;
             }
             // The cache's totals cover the whole mailbox, not just the loaded rows.
-            Event::LabelCounts(counts) => self.counts = counts.into_iter().collect(),
+            Event::LabelCounts(counts) => self.counts = Arc::new(counts.into_iter().collect()),
             Event::Reconnecting => self.reconnecting = true,
             Event::Reconnected => {
                 self.reconnecting = false;
@@ -497,7 +499,7 @@ impl App {
                 self.view_dirty = true;
             }
             Event::IdleState(on) => self.idle_on = on,
-            Event::LabelList(labels) => self.known_labels = labels.into_iter().collect(),
+            Event::LabelList(labels) => self.known_labels = Arc::new(labels.into_iter().collect()),
             Event::NewArrivals(msgs) => {
                 if self.settings.notifications {
                     let items: Vec<notify::NewMail> = msgs
@@ -883,9 +885,9 @@ impl App {
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         ui.heading("Labels");
         ui.separator();
-        // Clone the counts so the rows can call `&mut self` methods.
-        let counts = self.counts.clone();
-        let known = self.known_labels.clone();
+        // Shared handles, so the rows can call `&mut self` methods without copying the labels.
+        let counts = Arc::clone(&self.counts);
+        let known = Arc::clone(&self.known_labels);
         egui::ScrollArea::vertical()
             .id_salt("sidebar")
             .auto_shrink([false, false])
@@ -915,7 +917,7 @@ impl App {
                     .filter(|(k, _)| !k.starts_with('\\'))
                     .map(|(k, c)| (k.clone(), *c))
                     .collect();
-                for label in &known {
+                for label in known.iter() {
                     user.entry(label.clone()).or_insert(0);
                 }
                 if !user.is_empty() {
