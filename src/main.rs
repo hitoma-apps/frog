@@ -2,40 +2,42 @@
 //!
 //! With `GMAIL_USER` and `GMAIL_APP_PASSWORD` set, it signs in at startup.
 //! Otherwise it shows a sign-in dialog, which also offers demo data.
+//! Mail access runs on a worker thread (see `worker.rs`).
 
 mod backend;
 mod live;
+mod worker;
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::thread;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use gmail_imap_proto::labels::{LabelAction, SystemLabel};
 use gmail_imap_proto::links::gmail_thread_url;
 use gmail_imap_proto::render_plaintext;
 
-use backend::{MailBackend, Message, MockBackend};
+use backend::Message;
+use worker::{Command, Event, Link};
 
-type ConnectResult = Result<Box<dyn MailBackend + Send>, String>;
+/// Newest messages to list from All Mail on load.
+const LIVE_LIMIT: usize = 500;
+/// How often the auto-check toggle looks for new mail.
+const AUTO_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 fn main() -> eframe::Result {
-    let (initial, initial_error) = match (
+    let creds = match (
         std::env::var("GMAIL_USER"),
         std::env::var("GMAIL_APP_PASSWORD"),
     ) {
-        (Ok(user), Ok(password)) => match live::connect_gmail(&user, &password) {
-            Ok(b) => (Some(b as Box<dyn MailBackend>), None),
-            Err(e) => (None, Some(e)),
-        },
-        _ => (None, None),
+        (Ok(user), Ok(password)) => Some((user, password)),
+        _ => None,
     };
 
     let options = eframe::NativeOptions::default();
     eframe::run_native(
         "Gmail Labels Prototype",
         options,
-        Box::new(move |_cc| Ok(Box::new(App::new(initial, initial_error)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc.egui_ctx.clone(), creds)))),
     )
 }
 
@@ -55,15 +57,29 @@ struct LoginForm {
 }
 
 struct App {
-    /// `None` until the user signs in or picks demo data.
-    backend: Option<Box<dyn MailBackend>>,
+    ctx: egui::Context,
+    /// The worker, once a connection attempt has started.
+    link: Option<Link>,
+    connecting: bool,
+    connected: bool,
     login: LoginForm,
-    /// A sign-in running on a background thread.
-    pending: Option<Receiver<ConnectResult>>,
+
     messages: Vec<Message>,
+    /// `(loaded, total)` while the initial list is loading.
+    loading: Option<(usize, usize)>,
+    checking: bool,
+    auto_check: bool,
+    last_check: Instant,
+    /// UIDs whose body has been asked for and not yet delivered.
+    requested_bodies: HashSet<u32>,
+    /// Cached plaintext of the open message: `(msgid, text)`.
+    rendered: Option<(u64, String)>,
+
     /// `None` shows All Mail, `Some(label)` filters by one raw label.
     filter: Option<String>,
+    /// Checked messages, by `X-GM-MSGID`.
     checked: BTreeSet<u64>,
+    /// The open message, by `X-GM-MSGID`.
     open: Option<u64>,
     label_input: String,
     /// IMAP commands issued this session, newest last.
@@ -72,92 +88,183 @@ struct App {
 }
 
 impl App {
-    fn new(backend: Option<Box<dyn MailBackend>>, login_error: Option<String>) -> Self {
-        let messages = backend.as_ref().map(|b| b.messages()).unwrap_or_default();
-        Self {
-            backend,
-            login: LoginForm {
-                error: login_error,
-                ..Default::default()
-            },
-            pending: None,
-            messages,
+    fn new(ctx: egui::Context, creds: Option<(String, String)>) -> Self {
+        let mut app = Self {
+            ctx,
+            link: None,
+            connecting: false,
+            connected: false,
+            login: LoginForm::default(),
+            messages: Vec::new(),
+            loading: None,
+            checking: false,
+            auto_check: false,
+            last_check: Instant::now(),
+            requested_bodies: HashSet::new(),
+            rendered: None,
             filter: None,
             checked: BTreeSet::new(),
             open: None,
             label_input: String::new(),
             log: Vec::new(),
             status: None,
+        };
+        if let Some((user, password)) = creds {
+            app.start_gmail(user, password);
+        }
+        app
+    }
+
+    fn start_gmail(&mut self, user: String, password: String) {
+        self.login.error = None;
+        self.connecting = true;
+        self.link = Some(worker::spawn_gmail(user, password, self.ctx.clone()));
+    }
+
+    fn start_demo(&mut self) {
+        self.login.error = None;
+        self.connecting = true;
+        self.link = Some(worker::spawn_mock(self.ctx.clone()));
+    }
+
+    fn send(&self, cmd: Command) {
+        if let Some(link) = &self.link {
+            let _ = link.commands.send(cmd);
         }
     }
 
-    fn set_backend(&mut self, backend: Box<dyn MailBackend>) {
-        self.messages = backend.messages();
-        self.backend = Some(backend);
-        self.login.password.clear();
-        self.login.error = None;
+    /// Applies everything the worker has reported since the last frame.
+    fn drain_events(&mut self) {
+        let events: Vec<Event> = match &self.link {
+            Some(link) => link.events.try_iter().collect(),
+            None => return,
+        };
+        for ev in events {
+            self.handle_event(ev);
+        }
     }
 
-    /// Starts a sign-in on a background thread so the window stays responsive.
-    fn start_sign_in(&mut self, ctx: &egui::Context) {
-        let email = self.login.email.trim().to_string();
-        let password = self.login.password.clone();
-        let (tx, rx) = mpsc::channel();
-        let ctx = ctx.clone();
-        thread::spawn(move || {
-            let _ = tx.send(live::connect_gmail(&email, &password));
-            ctx.request_repaint();
-        });
-        self.login.error = None;
-        self.pending = Some(rx);
-    }
-
-    /// Picks up a finished sign-in, if there is one.
-    fn poll_sign_in(&mut self) {
-        let Some(rx) = &self.pending else { return };
-        match rx.try_recv() {
-            Ok(Ok(backend)) => {
-                self.pending = None;
-                self.set_backend(backend);
+    fn handle_event(&mut self, ev: Event) {
+        match ev {
+            Event::Connected => {
+                self.connecting = false;
+                self.connected = true;
+                self.loading = Some((0, 0));
+                self.send(Command::Load { limit: LIVE_LIMIT });
             }
-            Ok(Err(e)) => {
-                self.pending = None;
+            Event::ConnectFailed(e) => {
+                self.connecting = false;
+                self.link = None;
                 self.login.error = Some(e);
             }
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => {
-                self.pending = None;
-                self.login.error = Some("Sign-in stopped unexpectedly.".into());
+            Event::Reset => {
+                self.messages.clear();
+                self.requested_bodies.clear();
+                self.rendered = None;
+                self.open = None;
+                self.checked.clear();
+            }
+            Event::LoadStarted { total } => self.loading = Some((0, total)),
+            Event::Batch(msgs) => {
+                if let Some((loaded, _)) = &mut self.loading {
+                    *loaded += msgs.len();
+                }
+                self.insert(msgs);
+            }
+            Event::LoadFinished => {
+                self.loading = None;
+                self.last_check = Instant::now();
+            }
+            Event::CheckFinished(msgs) => {
+                self.checking = false;
+                self.last_check = Instant::now();
+                self.insert(msgs);
+            }
+            Event::Body { uid, raw } => {
+                self.requested_bodies.remove(&uid);
+                if let Some(m) = self.messages.iter_mut().find(|m| m.uid == uid) {
+                    m.body = Some(raw);
+                }
+            }
+            Event::Labels { updates, command } => {
+                for (uid, labels) in updates {
+                    if let Some(m) = self.messages.iter_mut().find(|m| m.uid == uid) {
+                        m.labels = labels;
+                    }
+                }
+                self.log.push(command);
+            }
+            Event::Error(e) => {
+                self.checking = false;
+                self.loading = None;
+                self.status = Some(e);
             }
         }
     }
 
-    /// Checked messages if any, otherwise the open message.
-    fn targets(&self) -> Vec<u64> {
-        if !self.checked.is_empty() {
+    /// Adds messages, replacing any with the same UID, and keeps newest first.
+    fn insert(&mut self, msgs: Vec<Message>) {
+        for m in msgs {
+            match self.messages.iter_mut().find(|x| x.uid == m.uid) {
+                Some(existing) => {
+                    let body = existing.body.take();
+                    *existing = m;
+                    existing.body = body;
+                }
+                None => self.messages.push(m),
+            }
+        }
+        self.messages.sort_by_key(|m| std::cmp::Reverse(m.uid));
+    }
+
+    fn check_now(&mut self) {
+        if !self.connected || self.checking || self.loading.is_some() {
+            return;
+        }
+        self.checking = true;
+        self.last_check = Instant::now();
+        self.send(Command::CheckNew);
+    }
+
+    /// Asks the worker for a message's body unless it is already here or on its way.
+    fn request_body(&mut self, uid: u32) {
+        let has_body = self
+            .messages
+            .iter()
+            .any(|m| m.uid == uid && m.body.is_some());
+        if has_body || self.requested_bodies.contains(&uid) {
+            return;
+        }
+        self.requested_bodies.insert(uid);
+        self.send(Command::FetchBody { uid });
+    }
+
+    /// Checked messages if any, otherwise the open message. Returns UIDs.
+    fn target_uids(&self) -> Vec<u32> {
+        let msgids: Vec<u64> = if !self.checked.is_empty() {
             self.checked.iter().copied().collect()
         } else {
             self.open.into_iter().collect()
-        }
+        };
+        self.messages
+            .iter()
+            .filter(|m| msgids.contains(&m.msgid))
+            .map(|m| m.uid)
+            .collect()
     }
 
     fn apply(&mut self, action: LabelAction, labels: Vec<String>) {
-        let targets = self.targets();
-        if targets.is_empty() {
+        let uids = self.target_uids();
+        if uids.is_empty() {
             self.status = Some("Select a message or check some boxes first.".into());
             return;
         }
-        let Some(backend) = self.backend.as_mut() else {
-            return;
-        };
-        match backend.modify_labels(&targets, action, &labels) {
-            Ok(cmd) => {
-                self.log.push(cmd);
-                self.messages = backend.messages();
-                self.status = None;
-            }
-            Err(e) => self.status = Some(e),
-        }
+        self.status = None;
+        self.send(Command::Modify {
+            uids,
+            action,
+            labels,
+        });
     }
 
     /// Label name to count, including system labels, for the sidebar.
@@ -182,7 +289,7 @@ impl App {
     }
 
     fn login_dialog(&mut self, ui: &mut egui::Ui) {
-        let busy = self.pending.is_some();
+        let busy = self.connecting;
         ui.vertical_centered(|ui| {
             ui.add_space(ui.available_height() * 0.2);
             ui.heading("Sign in to Gmail");
@@ -209,30 +316,57 @@ impl App {
             ui.weak("Needs 2-Step Verification. Create one under Google Account > Security > App passwords.");
             ui.add_space(10.0);
 
-            let submit = ui.add_enabled(
-                !busy && !self.login.email.trim().is_empty() && !self.login.password.is_empty(),
-                egui::Button::new("Sign in"),
-            );
+            let can_submit = !busy
+                && !self.login.email.trim().is_empty()
+                && !self.login.password.is_empty();
+            let submit = ui.add_enabled(can_submit, egui::Button::new("Sign in"));
             let enter = (email.lost_focus() || password.lost_focus())
                 && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if (submit.clicked() || enter) && !busy && !self.login.password.is_empty() {
-                self.start_sign_in(ui.ctx());
+            if (submit.clicked() || enter) && can_submit {
+                let user = self.login.email.trim().to_string();
+                let pass = self.login.password.clone();
+                self.start_gmail(user, pass);
             }
 
             if ui.add_enabled(!busy, egui::Button::new("Use demo data")).clicked() {
-                self.set_backend(Box::new(MockBackend::demo()));
+                self.start_demo();
             }
 
             if busy {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("Connecting to imap.gmail.com…");
+                    ui.label("Connecting…");
                 });
             }
             if let Some(err) = &self.login.error {
                 ui.add_space(8.0);
                 ui.colored_label(egui::Color32::LIGHT_RED, err);
+            }
+        });
+    }
+
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if let Some((loaded, total)) = self.loading {
+                ui.spinner();
+                if total == 0 {
+                    ui.label("Loading messages…");
+                } else {
+                    ui.label(format!("Loading messages… {loaded} of {total}"));
+                }
+            } else {
+                let busy = self.checking;
+                let check = ui.add_enabled(!busy, egui::Button::new("Check for new"));
+                if check.clicked() {
+                    self.check_now();
+                }
+                if self.checking {
+                    ui.spinner();
+                    ui.label("Checking…");
+                }
+                ui.checkbox(&mut self.auto_check, "Check every 60s");
+                ui.weak(format!("{} messages", self.messages.len()));
             }
         });
     }
@@ -306,7 +440,7 @@ impl App {
     }
 
     fn message_list(&mut self, ui: &mut egui::Ui) {
-        let rows: Vec<(u64, u64, String, String, Vec<String>)> = self
+        let rows: Vec<(u64, u64, String, String, String, Vec<String>)> = self
             .visible()
             .into_iter()
             .map(|m| {
@@ -315,6 +449,7 @@ impl App {
                     m.thrid,
                     m.from.clone(),
                     m.subject.clone(),
+                    m.date.clone(),
                     m.labels.iter().map(|l| display_label(l)).collect(),
                 )
             })
@@ -324,9 +459,13 @@ impl App {
             .id_salt("message_list")
             .show(ui, |ui| {
                 if rows.is_empty() {
-                    ui.label("No messages with this label.");
+                    ui.label(if self.loading.is_some() {
+                        "Waiting for messages…"
+                    } else {
+                        "No messages with this label."
+                    });
                 }
-                for (msgid, thrid, from, subject, labels) in rows {
+                for (msgid, thrid, from, subject, date, labels) in rows {
                     ui.horizontal(|ui| {
                         let mut checked = self.checked.contains(&msgid);
                         if ui.checkbox(&mut checked, "").changed() {
@@ -343,7 +482,9 @@ impl App {
                             .clicked()
                         {
                             self.open = Some(msgid);
+                            self.rendered = None;
                         }
+                        ui.weak(date);
                         ui.weak(labels.join(", "));
                     });
                 }
@@ -355,10 +496,29 @@ impl App {
             ui.label("Open a message to read it.");
             return;
         };
-        let Some(msg) = self.messages.iter().find(|m| m.msgid == msgid) else {
+        let Some((uid, thrid, has_body)) = self
+            .messages
+            .iter()
+            .find(|m| m.msgid == msgid)
+            .map(|m| (m.uid, m.thrid, m.body.is_some()))
+        else {
             return;
         };
-        let open_url = (msg.thrid != 0).then(|| gmail_thread_url(msg.thrid));
+
+        if !has_body {
+            self.request_body(uid);
+        } else if self.rendered.as_ref().map(|(id, _)| *id) != Some(msgid) {
+            let text = self
+                .messages
+                .iter()
+                .find(|m| m.msgid == msgid)
+                .and_then(|m| m.body.as_deref())
+                .map(|b| render_plaintext(b).unwrap_or_else(|| "(could not parse message)".into()))
+                .unwrap_or_default();
+            self.rendered = Some((msgid, text));
+        }
+
+        let open_url = (thrid != 0).then(|| gmail_thread_url(thrid));
         ui.horizontal(|ui| {
             let button = ui.add_enabled(open_url.is_some(), egui::Button::new("Open in Gmail"));
             if button
@@ -369,16 +529,27 @@ impl App {
                 ui.ctx().open_url(egui::OpenUrl::new_tab(url));
             }
         });
-        ui.monospace(format!(
-            "msgid  {} (0x{:x})\nthrid  {} (0x{:x})",
-            msg.msgid, msg.msgid, msg.thrid, msg.thrid
-        ));
+        if let Some(m) = self.messages.iter().find(|m| m.msgid == msgid) {
+            ui.monospace(format!(
+                "msgid  {} (0x{:x})\nthrid  {} (0x{:x})",
+                m.msgid, m.msgid, m.thrid, m.thrid
+            ));
+        }
         ui.separator();
-        let text = render_plaintext(&msg.raw).unwrap_or_else(|| "(could not parse message)".into());
+
         egui::ScrollArea::vertical()
             .id_salt("reader")
-            .show(ui, |ui| {
-                ui.monospace(text);
+            .show(ui, |ui| match &self.rendered {
+                Some((id, text)) if *id == msgid => {
+                    ui.monospace(text);
+                }
+                _ => {
+                    ui.spinner();
+                    ui.label("Loading message…");
+                    if let Some(m) = self.messages.iter().find(|m| m.msgid == msgid) {
+                        ui.monospace(String::from_utf8_lossy(&m.headers));
+                    }
+                }
             });
     }
 
@@ -397,12 +568,27 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.poll_sign_in();
+        self.drain_events();
 
-        if self.backend.is_none() {
+        if !self.connected {
             egui::CentralPanel::default().show(ui, |ui| self.login_dialog(ui));
             return;
         }
+
+        // Auto-check: a timer that only runs while the toggle is on and nothing else is busy.
+        if self.auto_check {
+            if !self.checking
+                && self.loading.is_none()
+                && self.last_check.elapsed() >= AUTO_CHECK_INTERVAL
+            {
+                self.check_now();
+            }
+            let remaining = AUTO_CHECK_INTERVAL.saturating_sub(self.last_check.elapsed());
+            ui.ctx()
+                .request_repaint_after(remaining.max(Duration::from_secs(1)));
+        }
+
+        egui::Panel::top("status").show(ui, |ui| self.status_bar(ui));
 
         egui::Panel::left("sidebar")
             .resizable(true)

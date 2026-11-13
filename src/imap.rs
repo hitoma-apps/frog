@@ -48,6 +48,13 @@ impl From<io::Error> for ImapError {
 
 pub type Result<T> = std::result::Result<T, ImapError>;
 
+/// What SELECT reports about a mailbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selected {
+    pub exists: u32,
+    pub uidvalidity: u32,
+}
+
 /// Opens a TLS connection to `host:port` and reads the server greeting.
 pub fn connect_tls(
     host: &str,
@@ -163,27 +170,40 @@ impl<S: Read + Write> ImapConn<S> {
         Ok(caps)
     }
 
-    /// Selects a mailbox read-write and returns the number of messages in it.
-    pub fn select(&mut self, mailbox: &str) -> Result<u32> {
+    /// Selects a mailbox read-write. Returns its message count and UIDVALIDITY.
+    pub fn select(&mut self, mailbox: &str) -> Result<Selected> {
         let resp = self.command(&format!("SELECT {}", quote(mailbox)))?;
+        let mut exists = None;
         for line in &resp.untagged {
             let text = String::from_utf8_lossy(line);
             let mut parts = text.split_whitespace();
             if let (Some("*"), Some(n), Some("EXISTS")) = (parts.next(), parts.next(), parts.next())
             {
-                return n
-                    .parse()
-                    .map_err(|_| ImapError::Protocol(format!("bad EXISTS count: {n}")));
+                exists = n.parse().ok();
             }
         }
-        Err(ImapError::Protocol(
-            "SELECT returned no EXISTS count".into(),
-        ))
+        let uidvalidity = resp
+            .text
+            .split("UIDVALIDITY ")
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .and_then(|n| n.trim().parse().ok());
+        match (exists, uidvalidity) {
+            (Some(exists), Some(uidvalidity)) => Ok(Selected {
+                exists,
+                uidvalidity,
+            }),
+            _ => Err(ImapError::Protocol(
+                "SELECT did not report EXISTS and UIDVALIDITY".into(),
+            )),
+        }
     }
 
-    /// Every UID in the selected mailbox.
-    pub fn uid_search_all(&mut self) -> Result<Vec<u32>> {
-        let resp = self.command("UID SEARCH ALL")?;
+    /// UIDs in the selected mailbox that are at least `start`, ascending.
+    /// IMAP always returns the highest UID for `start:*` even when it is below
+    /// `start`, so callers should filter.
+    pub fn uid_search_from(&mut self, start: u32) -> Result<Vec<u32>> {
+        let resp = self.command(&format!("UID SEARCH UID {start}:*"))?;
         let mut uids = Vec::new();
         for line in &resp.untagged {
             let text = String::from_utf8_lossy(line);
@@ -196,6 +216,8 @@ impl<S: Read + Write> ImapConn<S> {
                 }
             }
         }
+        uids.retain(|&u| u >= start);
+        uids.sort_unstable();
         Ok(uids)
     }
 

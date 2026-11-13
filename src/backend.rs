@@ -1,69 +1,149 @@
-//! Mail backend abstraction. The GUI talks only to `MailBackend`.
+//! Message model and the `MailSource` trait that the worker thread drives.
 //!
-//! `MockBackend` keeps messages in memory and builds the same `UID STORE`
-//! commands a live IMAP backend would send. A live backend will implement
-//! this trait over a real connection.
+//! A `MailSource` owns one connection. The worker calls it from a background
+//! thread, so the GUI never blocks on the network.
 
 use std::collections::BTreeSet;
 
 use gmail_imap_proto::labels::{LabelAction, LabelRef, SystemLabel, uid_store_labels};
+use mail_parser::MessageParser;
 
-/// One message as the GUI sees it.
+/// One message as the GUI sees it. Headers are loaded with the list; the full
+/// body is loaded on demand.
 #[derive(Clone, Debug)]
 pub struct Message {
     /// `X-GM-MSGID`.
     pub msgid: u64,
     /// `X-GM-THRID`.
     pub thrid: u64,
-    /// IMAP UID in the All Mail folder.
+    /// IMAP UID in All Mail. Label changes and body fetches use this.
     pub uid: u32,
     /// Raw `X-GM-LABELS` names, e.g. `\Inbox` or `Work/Projects`.
     pub labels: BTreeSet<String>,
     pub from: String,
     pub subject: String,
-    /// Raw RFC 5322 bytes, rendered by `render_plaintext`.
-    pub raw: Vec<u8>,
+    pub date: String,
+    /// The header block, as sent by the server.
+    pub headers: Vec<u8>,
+    /// The full RFC 5322 message, once fetched.
+    pub body: Option<Vec<u8>>,
 }
 
-pub trait MailBackend {
-    fn messages(&self) -> Vec<Message>;
+impl Message {
+    /// Builds a listing entry from a header block. Parsing is best effort.
+    pub fn from_headers(
+        msgid: u64,
+        thrid: u64,
+        uid: u32,
+        labels: Vec<String>,
+        headers: Vec<u8>,
+    ) -> Self {
+        let parsed = MessageParser::default().parse(&headers);
+        let (from, subject, date) = match &parsed {
+            Some(m) => (
+                m.from()
+                    .and_then(|a| a.first())
+                    .and_then(|a| a.name().or(a.address()))
+                    .unwrap_or("(unknown)")
+                    .to_string(),
+                m.subject().unwrap_or("(no subject)").to_string(),
+                m.date().map(|d| d.to_rfc822()).unwrap_or_default(),
+            ),
+            None => (
+                "(unparseable)".into(),
+                "(unparseable)".into(),
+                String::new(),
+            ),
+        };
+        Self {
+            msgid,
+            thrid,
+            uid,
+            labels: labels.into_iter().collect(),
+            from,
+            subject,
+            date,
+            headers,
+            body: None,
+        }
+    }
+}
 
-    /// Applies a label change to the given messages and returns the IMAP
-    /// command that performed it, for display.
+/// New label sets for UIDs, as returned after a label change.
+pub type LabelUpdates = Vec<(u32, BTreeSet<String>)>;
+
+/// Everything the worker needs from a mailbox.
+pub trait MailSource: Send {
+    /// Selects All Mail and returns its UIDVALIDITY.
+    fn select(&mut self) -> Result<u32, String>;
+    /// UIDs at least `start`, ascending.
+    fn search_from(&mut self, start: u32) -> Result<Vec<u32>, String>;
+    /// Header-only listing entries, in the order the server returns them.
+    fn fetch_headers(&mut self, uids: &[u32]) -> Result<Vec<Message>, String>;
+    /// The full RFC 5322 message.
+    fn fetch_body(&mut self, uid: u32) -> Result<Vec<u8>, String>;
+    /// Applies a label change. Returns the command for the log and the
+    /// labels of each affected UID afterwards.
     fn modify_labels(
         &mut self,
-        msgids: &[u64],
+        uids: &[u32],
         action: LabelAction,
         labels: &[String],
-    ) -> Result<String, String>;
+    ) -> Result<(String, LabelUpdates), String>;
 }
 
-pub struct MockBackend {
-    messages: Vec<Message>,
+/// Maps label names to IMAP label references, recognizing system labels.
+pub fn label_refs(labels: &[String]) -> Vec<LabelRef<'_>> {
+    labels
+        .iter()
+        .map(|l| match SystemLabel::from_wire(l.as_str()) {
+            Some(sys) => LabelRef::System(sys),
+            None => LabelRef::Name(l.as_str()),
+        })
+        .collect()
 }
 
-impl MockBackend {
+/// The header block of a raw message: everything up to and including the first blank line.
+pub fn header_block(raw: &[u8]) -> Vec<u8> {
+    match raw.windows(4).position(|w| w == b"\r\n\r\n") {
+        Some(i) => raw[..i + 4].to_vec(),
+        None => raw.to_vec(),
+    }
+}
+
+struct MockEntry {
+    msgid: u64,
+    thrid: u64,
+    uid: u32,
+    labels: BTreeSet<String>,
+    raw: Vec<u8>,
+}
+
+/// In-memory mailbox for the demo and for tests.
+pub struct MockSource {
+    entries: Vec<MockEntry>,
+}
+
+impl MockSource {
     pub fn demo() -> Self {
-        let msg = |msgid, thrid, uid, labels: &[&str], from: &str, subject: &str, body: &str| {
+        let entry = |msgid, thrid, uid, labels: &[&str], from: &str, subject: &str, body: &str| {
             let raw = format!(
                 "From: {from}\r\nTo: me@example.com\r\nSubject: {subject}\r\n\
                  Date: Tue, 10 Nov 2026 09:30:00 +0000\r\n\
                  Content-Type: text/plain; charset=utf-8\r\n\r\n{body}\r\n"
             )
             .into_bytes();
-            Message {
+            MockEntry {
                 msgid,
                 thrid,
                 uid,
                 labels: labels.iter().map(|s| s.to_string()).collect(),
-                from: from.to_string(),
-                subject: subject.to_string(),
                 raw,
             }
         };
         Self {
-            messages: vec![
-                msg(
+            entries: vec![
+                entry(
                     1001,
                     9001,
                     1,
@@ -72,7 +152,7 @@ impl MockBackend {
                     "Q3 plan",
                     "Here is the draft of the Q3 plan.\nPlease review by Friday.",
                 ),
-                msg(
+                entry(
                     1002,
                     9001,
                     2,
@@ -81,7 +161,7 @@ impl MockBackend {
                     "Re: Q3 plan",
                     "Looks good. Two comments on the budget section.",
                 ),
-                msg(
+                entry(
                     1003,
                     9002,
                     3,
@@ -90,7 +170,7 @@ impl MockBackend {
                     "Your receipt",
                     "Thanks for your order #4411.",
                 ),
-                msg(
+                entry(
                     1004,
                     9003,
                     4,
@@ -99,7 +179,7 @@ impl MockBackend {
                     "Holiday photos",
                     "Uploaded the photos from the lake trip.",
                 ),
-                msg(
+                entry(
                     1005,
                     9004,
                     5,
@@ -108,7 +188,7 @@ impl MockBackend {
                     "Old newsletter",
                     "This one is in the trash.",
                 ),
-                msg(
+                entry(
                     1006,
                     9005,
                     6,
@@ -120,54 +200,85 @@ impl MockBackend {
             ],
         }
     }
-}
 
-fn to_label_ref(name: &str) -> LabelRef<'_> {
-    match SystemLabel::from_wire(name) {
-        Some(sys) => LabelRef::System(sys),
-        None => LabelRef::Name(name),
+    fn entry_mut(&mut self, uid: u32) -> Option<&mut MockEntry> {
+        self.entries.iter_mut().find(|e| e.uid == uid)
     }
 }
 
-impl MailBackend for MockBackend {
-    fn messages(&self) -> Vec<Message> {
-        self.messages.clone()
+impl MailSource for MockSource {
+    fn select(&mut self) -> Result<u32, String> {
+        Ok(1)
+    }
+
+    fn search_from(&mut self, start: u32) -> Result<Vec<u32>, String> {
+        let mut uids: Vec<u32> = self
+            .entries
+            .iter()
+            .map(|e| e.uid)
+            .filter(|&u| u >= start)
+            .collect();
+        uids.sort_unstable();
+        Ok(uids)
+    }
+
+    fn fetch_headers(&mut self, uids: &[u32]) -> Result<Vec<Message>, String> {
+        Ok(uids
+            .iter()
+            .filter_map(|&uid| self.entries.iter().find(|e| e.uid == uid))
+            .map(|e| {
+                Message::from_headers(
+                    e.msgid,
+                    e.thrid,
+                    e.uid,
+                    e.labels.iter().cloned().collect(),
+                    header_block(&e.raw),
+                )
+            })
+            .collect())
+    }
+
+    fn fetch_body(&mut self, uid: u32) -> Result<Vec<u8>, String> {
+        self.entries
+            .iter()
+            .find(|e| e.uid == uid)
+            .map(|e| e.raw.clone())
+            .ok_or_else(|| format!("no message with UID {uid}"))
     }
 
     fn modify_labels(
         &mut self,
-        msgids: &[u64],
+        uids: &[u32],
         action: LabelAction,
         labels: &[String],
-    ) -> Result<String, String> {
-        let targets: Vec<&mut Message> = self
-            .messages
-            .iter_mut()
-            .filter(|m| msgids.contains(&m.msgid))
+    ) -> Result<(String, LabelUpdates), String> {
+        let found: Vec<u32> = uids
+            .iter()
+            .copied()
+            .filter(|u| self.entries.iter().any(|e| e.uid == *u))
             .collect();
-        if targets.is_empty() {
+        if found.is_empty() {
             return Err("no messages selected".into());
         }
-
-        let uids: Vec<u32> = targets.iter().map(|m| m.uid).collect();
-        let refs: Vec<LabelRef<'_>> = labels.iter().map(|l| to_label_ref(l)).collect();
-        let command = uid_store_labels(&uids, action, &refs)
+        let command = uid_store_labels(&found, action, &label_refs(labels))
             .ok_or_else(|| "nothing to change".to_string())?;
 
-        for m in targets {
-            match action {
-                LabelAction::Add => m.labels.extend(labels.iter().cloned()),
-                LabelAction::Remove => {
-                    for l in labels {
-                        m.labels.remove(l);
+        let mut updates = Vec::new();
+        for &uid in &found {
+            if let Some(e) = self.entry_mut(uid) {
+                match action {
+                    LabelAction::Add => e.labels.extend(labels.iter().cloned()),
+                    LabelAction::Remove => {
+                        for l in labels {
+                            e.labels.remove(l);
+                        }
                     }
+                    LabelAction::Replace => e.labels = labels.iter().cloned().collect(),
                 }
-                LabelAction::Replace => {
-                    m.labels = labels.iter().cloned().collect();
-                }
+                updates.push((uid, e.labels.clone()));
             }
         }
-        Ok(command)
+        Ok((command, updates))
     }
 }
 
@@ -175,42 +286,45 @@ impl MailBackend for MockBackend {
 mod tests {
     use super::*;
 
-    fn labels_of(b: &MockBackend, msgid: u64) -> BTreeSet<String> {
-        b.messages()
-            .into_iter()
-            .find(|m| m.msgid == msgid)
-            .unwrap()
-            .labels
+    fn labels_of(src: &mut MockSource, uid: u32) -> BTreeSet<String> {
+        src.fetch_headers(&[uid]).unwrap().pop().unwrap().labels
     }
 
     #[test]
     fn archive_removes_inbox_and_returns_store_command() {
-        let mut b = MockBackend::demo();
-        let cmd = b
-            .modify_labels(&[1003], LabelAction::Remove, &["\\Inbox".to_string()])
+        let mut src = MockSource::demo();
+        let (cmd, _) = src
+            .modify_labels(&[3], LabelAction::Remove, &["\\Inbox".to_string()])
             .unwrap();
         assert_eq!(cmd, r#"UID STORE 3 -X-GM-LABELS ("\\Inbox")"#);
-        assert!(!labels_of(&b, 1003).contains("\\Inbox"));
-        assert!(labels_of(&b, 1003).contains("\\Starred"));
+        assert!(!labels_of(&mut src, 3).contains("\\Inbox"));
+        assert!(labels_of(&mut src, 3).contains("\\Starred"));
     }
 
     #[test]
     fn add_user_label_to_multiple_messages() {
-        let mut b = MockBackend::demo();
-        let cmd = b
-            .modify_labels(&[1001, 1002], LabelAction::Add, &["Later".to_string()])
+        let mut src = MockSource::demo();
+        let (cmd, updates) = src
+            .modify_labels(&[1, 2], LabelAction::Add, &["Later".to_string()])
             .unwrap();
         assert_eq!(cmd, r#"UID STORE 1:2 +X-GM-LABELS ("Later")"#);
-        assert!(labels_of(&b, 1001).contains("Later"));
-        assert!(labels_of(&b, 1002).contains("Later"));
+        assert_eq!(updates.len(), 2);
+        assert!(labels_of(&mut src, 1).contains("Later"));
+        assert!(labels_of(&mut src, 2).contains("Later"));
     }
 
     #[test]
-    fn unknown_message_is_an_error() {
-        let mut b = MockBackend::demo();
+    fn unknown_uid_is_an_error() {
+        let mut src = MockSource::demo();
         assert!(
-            b.modify_labels(&[9999], LabelAction::Add, &["x".to_string()])
+            src.modify_labels(&[9999], LabelAction::Add, &["x".to_string()])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn header_block_stops_at_blank_line() {
+        let raw = b"From: a\r\nSubject: b\r\n\r\nbody\r\n";
+        assert_eq!(header_block(raw), b"From: a\r\nSubject: b\r\n\r\n".to_vec());
     }
 }

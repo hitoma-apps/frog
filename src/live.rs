@@ -1,153 +1,142 @@
-//! Live IMAP backend. It connects to Gmail, loads recent messages from All
-//! Mail, and sends label changes with `UID STORE`.
+//! Gmail session: implements `MailSource` over IMAP.
 
 use std::io::{Read, Write};
 
-use gmail_imap_proto::imap::{ImapConn, ImapError};
-use gmail_imap_proto::labels::{LabelAction, LabelRef, SystemLabel};
+use gmail_imap_proto::imap::{ImapConn, connect_tls};
+use gmail_imap_proto::labels::LabelAction;
 use gmail_imap_proto::parse_gmail_fetch;
-use mail_parser::MessageParser;
 
-use crate::backend::{MailBackend, Message};
+use crate::backend::{LabelUpdates, MailSource, Message, label_refs};
 
 /// Gmail's All Mail folder holds every message, whatever its labels.
 pub const ALL_MAIL: &str = "[Gmail]/All Mail";
+/// How many UIDs go into one FETCH.
 const FETCH_CHUNK: usize = 50;
-/// Newest messages to load from All Mail.
-pub const LIVE_LIMIT: usize = 200;
 
-/// Connects to Gmail over TLS, logs in, and loads the newest `LIVE_LIMIT` messages.
-/// The error is a message for the user, not a typed error.
-pub fn connect_gmail(user: &str, password: &str) -> Result<Box<dyn MailBackend + Send>, String> {
-    let conn = gmail_imap_proto::imap::connect_tls("imap.gmail.com", 993)
-        .map_err(|e| format!("Could not connect to imap.gmail.com: {e}"))?;
-    let backend = LiveBackend::open(conn, user, password, LIVE_LIMIT)
-        .map_err(|e| format!("Gmail sign-in or load failed: {e}"))?;
-    Ok(Box::new(backend))
-}
-
-pub struct LiveBackend<S: Read + Write> {
+pub struct LiveSession<S: Read + Write> {
     conn: ImapConn<S>,
-    messages: Vec<Message>,
+    selected: bool,
 }
 
-impl<S: Read + Write> LiveBackend<S> {
-    /// Logs in, checks for the Gmail extension, and loads the newest `limit`
-    /// messages, newest first.
-    pub fn open(
-        mut conn: ImapConn<S>,
-        user: &str,
-        password: &str,
-        limit: usize,
-    ) -> Result<Self, ImapError> {
-        conn.login(user, password)?;
-
-        let caps = conn.capabilities()?;
+impl<S: Read + Write> LiveSession<S> {
+    /// Logs in and checks that the server is Gmail.
+    pub fn open(mut conn: ImapConn<S>, user: &str, password: &str) -> Result<Self, String> {
+        let err = |e: gmail_imap_proto::imap::ImapError| e.to_string();
+        conn.login(user, password).map_err(err)?;
+        let caps = conn.capabilities().map_err(err)?;
         if !caps.iter().any(|c| c.eq_ignore_ascii_case("X-GM-EXT-1")) {
-            return Err(ImapError::Protocol(
-                "server does not advertise X-GM-EXT-1; not a Gmail account?".into(),
-            ));
+            return Err("server does not advertise X-GM-EXT-1; not a Gmail account?".into());
         }
+        Ok(Self {
+            conn,
+            selected: false,
+        })
+    }
 
-        conn.select(ALL_MAIL)?;
-        let mut uids = conn.uid_search_all()?;
-        uids.sort_unstable_by(|a, b| b.cmp(a));
-        uids.truncate(limit);
-
-        let mut messages = Vec::with_capacity(uids.len());
-        for chunk in uids.chunks(FETCH_CHUNK) {
-            let items = "UID X-GM-MSGID X-GM-THRID X-GM-LABELS BODY.PEEK[]";
-            for raw in conn.uid_fetch(chunk, items)? {
-                let f = parse_gmail_fetch(&raw).map_err(|e| ImapError::Protocol(e.to_string()))?;
-                let (Some(uid), Some(msgid)) = (f.uid, f.msgid) else {
-                    continue;
-                };
-                let body = f.body.unwrap_or(&[]);
-                messages.push(to_message(msgid, f.thrid.unwrap_or(0), uid, f.labels, body));
-            }
+    fn ensure_selected(&mut self) -> Result<(), String> {
+        if !self.selected {
+            self.conn.select(ALL_MAIL).map_err(|e| e.to_string())?;
+            self.selected = true;
         }
-        messages.sort_by_key(|m| std::cmp::Reverse(m.uid));
-        Ok(Self { conn, messages })
+        Ok(())
     }
 }
 
-impl<S: Read + Write> Drop for LiveBackend<S> {
+impl<S: Read + Write + Send> MailSource for LiveSession<S> {
+    fn select(&mut self) -> Result<u32, String> {
+        let sel = self.conn.select(ALL_MAIL).map_err(|e| e.to_string())?;
+        self.selected = true;
+        Ok(sel.uidvalidity)
+    }
+
+    fn search_from(&mut self, start: u32) -> Result<Vec<u32>, String> {
+        self.ensure_selected()?;
+        self.conn.uid_search_from(start).map_err(|e| e.to_string())
+    }
+
+    fn fetch_headers(&mut self, uids: &[u32]) -> Result<Vec<Message>, String> {
+        self.ensure_selected()?;
+        let mut out = Vec::with_capacity(uids.len());
+        for chunk in uids.chunks(FETCH_CHUNK) {
+            let items = "UID X-GM-MSGID X-GM-THRID X-GM-LABELS BODY.PEEK[HEADER]";
+            for raw in self
+                .conn
+                .uid_fetch(chunk, items)
+                .map_err(|e| e.to_string())?
+            {
+                let f = parse_gmail_fetch(&raw).map_err(|e| e.to_string())?;
+                let (Some(uid), Some(msgid)) = (f.uid, f.msgid) else {
+                    continue;
+                };
+                let headers = f.header.unwrap_or(&[]).to_vec();
+                out.push(Message::from_headers(
+                    msgid,
+                    f.thrid.unwrap_or(0),
+                    uid,
+                    f.labels,
+                    headers,
+                ));
+            }
+        }
+        Ok(out)
+    }
+
+    fn fetch_body(&mut self, uid: u32) -> Result<Vec<u8>, String> {
+        self.ensure_selected()?;
+        for raw in self
+            .conn
+            .uid_fetch(&[uid], "BODY.PEEK[]")
+            .map_err(|e| e.to_string())?
+        {
+            let f = parse_gmail_fetch(&raw).map_err(|e| e.to_string())?;
+            if let Some(body) = f.body {
+                return Ok(body.to_vec());
+            }
+        }
+        Err(format!("server returned no body for UID {uid}"))
+    }
+
+    fn modify_labels(
+        &mut self,
+        uids: &[u32],
+        action: LabelAction,
+        labels: &[String],
+    ) -> Result<(String, LabelUpdates), String> {
+        self.ensure_selected()?;
+        let command = self
+            .conn
+            .uid_store(uids, action, &label_refs(labels))
+            .map_err(|e| e.to_string())?;
+
+        // Re-read labels so the view matches the server, not our guess.
+        let mut updates = Vec::new();
+        for raw in self
+            .conn
+            .uid_fetch(uids, "UID X-GM-LABELS")
+            .map_err(|e| e.to_string())?
+        {
+            let f = parse_gmail_fetch(&raw).map_err(|e| e.to_string())?;
+            if let Some(uid) = f.uid {
+                updates.push((uid, f.labels.into_iter().collect()));
+            }
+        }
+        Ok((command, updates))
+    }
+}
+
+impl<S: Read + Write> Drop for LiveSession<S> {
     fn drop(&mut self) {
         let _ = self.conn.logout();
     }
 }
 
-fn to_message(msgid: u64, thrid: u64, uid: u32, labels: Vec<String>, raw: &[u8]) -> Message {
-    let (from, subject) = match MessageParser::default().parse(raw) {
-        Some(m) => (
-            m.from()
-                .and_then(|a| a.first())
-                .and_then(|a| a.name().or(a.address()))
-                .unwrap_or("(unknown)")
-                .to_string(),
-            m.subject().unwrap_or("(no subject)").to_string(),
-        ),
-        None => ("(unparseable)".to_string(), "(unparseable)".to_string()),
-    };
-    Message {
-        msgid,
-        thrid,
-        uid,
-        labels: labels.into_iter().collect(),
-        from,
-        subject,
-        raw: raw.to_vec(),
-    }
-}
-
-impl<S: Read + Write> MailBackend for LiveBackend<S> {
-    fn messages(&self) -> Vec<Message> {
-        self.messages.clone()
-    }
-
-    fn modify_labels(
-        &mut self,
-        msgids: &[u64],
-        action: LabelAction,
-        labels: &[String],
-    ) -> Result<String, String> {
-        let uids: Vec<u32> = self
-            .messages
-            .iter()
-            .filter(|m| msgids.contains(&m.msgid))
-            .map(|m| m.uid)
-            .collect();
-        if uids.is_empty() {
-            return Err("no messages selected".into());
-        }
-
-        let refs: Vec<LabelRef<'_>> = labels
-            .iter()
-            .map(|l| match SystemLabel::from_wire(l.as_str()) {
-                Some(sys) => LabelRef::System(sys),
-                None => LabelRef::Name(l.as_str()),
-            })
-            .collect();
-        let cmd = self
-            .conn
-            .uid_store(&uids, action, &refs)
-            .map_err(|e| e.to_string())?;
-
-        // Re-read labels from the server so the view matches Gmail, not our guess.
-        let fresh = self
-            .conn
-            .uid_fetch(&uids, "UID X-GM-MSGID X-GM-LABELS")
-            .map_err(|e| e.to_string())?;
-        for raw in fresh {
-            let f = parse_gmail_fetch(&raw).map_err(|e| e.to_string())?;
-            if let Some(uid) = f.uid
-                && let Some(m) = self.messages.iter_mut().find(|m| m.uid == uid)
-            {
-                m.labels = f.labels.into_iter().collect();
-            }
-        }
-        Ok(cmd)
-    }
+/// Connects to Gmail over TLS and signs in.
+pub fn connect_gmail(user: &str, password: &str) -> Result<Box<dyn MailSource>, String> {
+    let conn = connect_tls("imap.gmail.com", 993)
+        .map_err(|e| format!("Could not connect to imap.gmail.com: {e}"))?;
+    let session = LiveSession::open(conn, user, password)
+        .map_err(|e| format!("Gmail sign-in failed: {e}"))?;
+    Ok(Box::new(session))
 }
 
 #[cfg(test)]
@@ -170,7 +159,7 @@ mod tests {
         out
     }
 
-    /// Builds the FETCH responses for the uids in `set`.
+    /// FETCH responses for the uids in `set`. Supports header-only and full-body items.
     fn fetch_response(set: &str, items: &str) -> String {
         let mut out = String::new();
         for uid in uids_in_set(set) {
@@ -181,10 +170,17 @@ mod tests {
                 2 => "(\"\\\\Inbox\")",
                 _ => "(\"Personal\")",
             };
-            if items.contains("BODY") {
-                let raw = format!(
-                    "From: sender{uid}@example.com\r\nSubject: Hello {uid}\r\n\r\nBody of message {uid}.\r\n"
-                );
+            let raw = format!(
+                "From: sender{uid}@example.com\r\nSubject: Hello {uid}\r\n\r\nBody of message {uid}.\r\n"
+            );
+            let header_len = raw.find("\r\n\r\n").unwrap() + 4;
+            if items.contains("BODY.PEEK[HEADER]") {
+                let header = &raw[..header_len];
+                out.push_str(&format!(
+                    "* {uid} FETCH (UID {uid} X-GM-MSGID {msgid} X-GM-THRID {thrid} X-GM-LABELS {labels} BODY[HEADER] {{{}}}\r\n{header})\r\n",
+                    header.len()
+                ));
+            } else if items.contains("BODY") {
                 out.push_str(&format!(
                     "* {uid} FETCH (UID {uid} X-GM-MSGID {msgid} X-GM-THRID {thrid} X-GM-LABELS {labels} BODY[] {{{}}}\r\n{raw})\r\n",
                     raw.len()
@@ -204,6 +200,17 @@ mod tests {
             let items = items.trim_end_matches(')');
             return format!("{}{tag} OK FETCH completed\r\n", fetch_response(set, items));
         }
+        if let Some(rest) = cmd.strip_prefix("UID SEARCH UID ") {
+            let start: u32 = rest.trim_end_matches(":*").parse().unwrap();
+            let uids: Vec<String> = (1..=3)
+                .filter(|u| *u >= start)
+                .map(|u| u.to_string())
+                .collect();
+            return format!(
+                "* SEARCH {}\r\n{tag} OK SEARCH completed\r\n",
+                uids.join(" ")
+            );
+        }
         match cmd {
             "LOGIN \"me@gmail.com\" \"app-pass\"" => format!("{tag} OK LOGIN completed\r\n"),
             c if c.starts_with("LOGIN") => {
@@ -212,10 +219,9 @@ mod tests {
             "CAPABILITY" => {
                 format!("* CAPABILITY IMAP4rev1 X-GM-EXT-1 UIDPLUS\r\n{tag} OK done\r\n")
             }
-            c if c.starts_with("SELECT") => {
-                format!("* 3 EXISTS\r\n* 0 RECENT\r\n{tag} OK [READ-WRITE] SELECT completed\r\n")
-            }
-            "UID SEARCH ALL" => format!("* SEARCH 1 2 3\r\n{tag} OK SEARCH completed\r\n"),
+            c if c.starts_with("SELECT") => format!(
+                "* 3 EXISTS\r\n* 0 RECENT\r\n{tag} OK [UIDVALIDITY 42] [READ-WRITE] SELECT completed\r\n"
+            ),
             c if c.starts_with("UID STORE") => format!("{tag} OK STORE completed\r\n"),
             "LOGOUT" => format!("* BYE bye\r\n{tag} OK LOGOUT completed\r\n"),
             _ => format!("{tag} BAD unknown command\r\n"),
@@ -248,49 +254,60 @@ mod tests {
         addr
     }
 
-    fn connect(addr: std::net::SocketAddr) -> ImapConn<TcpStream> {
-        ImapConn::new(TcpStream::connect(addr).unwrap()).unwrap()
+    fn session(
+        addr: std::net::SocketAddr,
+        password: &str,
+    ) -> Result<LiveSession<TcpStream>, String> {
+        let conn = ImapConn::new(TcpStream::connect(addr).unwrap()).unwrap();
+        LiveSession::open(conn, "me@gmail.com", password)
     }
 
     #[test]
-    fn loads_newest_first_with_gmail_fields() {
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let addr = spawn_fake(seen.clone());
-        let b = LiveBackend::open(connect(addr), "me@gmail.com", "app-pass", 10).unwrap();
+    fn lists_headers_newest_first_and_reports_uidvalidity() {
+        let addr = spawn_fake(Arc::new(Mutex::new(Vec::new())));
+        let mut s = session(addr, "app-pass").unwrap();
+        assert_eq!(s.select().unwrap(), 42);
+        let mut uids = s.search_from(1).unwrap();
+        uids.reverse();
+        assert_eq!(uids, vec![3, 2, 1]);
 
-        let msgs = b.messages();
-        assert_eq!(
-            msgs.iter().map(|m| m.uid).collect::<Vec<_>>(),
-            vec![3, 2, 1]
-        );
-        assert_eq!(msgs[0].subject, "Hello 3");
-        assert_eq!(msgs[0].from, "sender3@example.com");
-
+        let msgs = s.fetch_headers(&uids).unwrap();
         let m1 = msgs.iter().find(|m| m.uid == 1).unwrap();
         assert_eq!(m1.msgid, 1001);
         assert_eq!(m1.thrid, 901);
+        assert_eq!(m1.subject, "Hello 1");
+        assert_eq!(m1.from, "sender1@example.com");
         assert!(m1.labels.contains("\\Inbox") && m1.labels.contains("Work"));
-        assert!(String::from_utf8_lossy(&m1.raw).contains("Body of message 1."));
+        assert!(m1.body.is_none(), "headers only until a body is requested");
     }
 
     #[test]
-    fn label_change_sends_uid_store_and_refreshes() {
+    fn fetches_body_on_demand() {
+        let addr = spawn_fake(Arc::new(Mutex::new(Vec::new())));
+        let mut s = session(addr, "app-pass").unwrap();
+        s.select().unwrap();
+        let body = s.fetch_body(2).unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("Body of message 2."));
+    }
+
+    #[test]
+    fn label_change_sends_uid_store_and_returns_labels() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let addr = spawn_fake(seen.clone());
-        let mut b = LiveBackend::open(connect(addr), "me@gmail.com", "app-pass", 10).unwrap();
-
-        let cmd = b
-            .modify_labels(&[1001], LabelAction::Remove, &["\\Inbox".to_string()])
+        let mut s = session(addr, "app-pass").unwrap();
+        let (cmd, updates) = s
+            .modify_labels(&[1], LabelAction::Remove, &["\\Inbox".to_string()])
             .unwrap();
         assert_eq!(cmd, r#"UID STORE 1 -X-GM-LABELS ("\\Inbox")"#);
         assert!(seen.lock().unwrap().iter().any(|c| c == &cmd));
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].0, 1);
     }
 
     #[test]
     fn wrong_password_is_refused() {
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let addr = spawn_fake(seen);
-        let res = LiveBackend::open(connect(addr), "me@gmail.com", "wrong", 10);
-        assert!(matches!(res.err(), Some(ImapError::No(_))));
+        let addr = spawn_fake(Arc::new(Mutex::new(Vec::new())));
+        let res = session(addr, "wrong");
+        assert!(res.is_err());
     }
 }

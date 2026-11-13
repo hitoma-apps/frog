@@ -262,6 +262,8 @@ pub struct GmailFetch<'a> {
     pub labels: Vec<String>,
     /// `BODY[]` / `BODY.PEEK[]` payload, if requested.
     pub body: Option<&'a [u8]>,
+    /// `BODY[HEADER]` payload (message headers only), if requested.
+    pub header: Option<&'a [u8]>,
 }
 
 /// Parses a FETCH response and extracts the Gmail attributes.
@@ -280,6 +282,11 @@ pub fn parse_gmail_fetch(buf: &[u8]) -> Result<GmailFetch<'_>, ParseError> {
             "BODY[]" => {
                 if let Value::Bytes(b) = value {
                     out.body = Some(b);
+                }
+            }
+            "BODY[HEADER]" => {
+                if let Value::Bytes(b) = value {
+                    out.header = Some(b);
                 }
             }
             _ => {}
