@@ -1,7 +1,7 @@
 //! Prototype Gmail label manager.
 //!
 //! With `GMAIL_USER` and `GMAIL_APP_PASSWORD` set, it signs in at startup.
-//! Otherwise it shows a sign-in dialog, which also offers demo data.
+//! Otherwise it shows a sign-in dialog.
 //! Mail access runs on a worker thread (see `worker.rs`).
 
 mod backend;
@@ -68,6 +68,8 @@ struct App {
     mailbox_total: usize,
     /// Headers held locally, out of `mailbox_total`.
     cached_count: usize,
+    /// A notice such as where the cache lives.
+    info: Option<String>,
     login: LoginForm,
 
     messages: Vec<Message>,
@@ -103,6 +105,7 @@ impl App {
             reconnecting: false,
             mailbox_total: 0,
             cached_count: 0,
+            info: None,
             login: LoginForm::default(),
             messages: Vec::new(),
             loading: None,
@@ -128,12 +131,6 @@ impl App {
         self.login.error = None;
         self.connecting = true;
         self.link = Some(worker::spawn_gmail(user, password, self.ctx.clone()));
-    }
-
-    fn start_demo(&mut self) {
-        self.login.error = None;
-        self.connecting = true;
-        self.link = Some(worker::spawn_mock(self.ctx.clone()));
     }
 
     fn send(&self, cmd: Command) {
@@ -174,6 +171,7 @@ impl App {
                 self.open = None;
                 self.checked.clear();
             }
+            Event::Info(msg) => self.info = Some(msg),
             Event::Progress { cached, total } => {
                 self.cached_count = cached;
                 self.mailbox_total = total;
@@ -347,9 +345,6 @@ impl App {
                 self.start_gmail(user, pass);
             }
 
-            if ui.add_enabled(!busy, egui::Button::new("Use demo data")).clicked() {
-                self.start_demo();
-            }
 
             if busy {
                 ui.add_space(8.0);
@@ -389,6 +384,9 @@ impl App {
                     ui.label("Checking…");
                 }
                 ui.checkbox(&mut self.auto_check, "Check every 60s");
+            }
+            if let Some(info) = &self.info {
+                ui.weak(info);
             }
             ui.weak(format!(
                 "{} in mailbox · {} cached",

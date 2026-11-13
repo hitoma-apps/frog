@@ -8,15 +8,16 @@
 //! reconnects when the connection drops, retrying the failed command once.
 
 use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::thread;
 use std::time::Duration;
 
 use eframe::egui;
 use gmail_imap_proto::labels::LabelAction;
-use gmail_imap_proto::store::{DEFAULT_BODY_CAP, MailboxState, Store, account_cache_path};
+use gmail_imap_proto::store::{MailboxState, Store, account_cache_path};
 
-use crate::backend::{MailSource, MailboxInfo, Message, MockSource, SourceError};
+use crate::backend::{MailSource, MailboxInfo, Message, SourceError};
 use crate::live;
 
 /// Messages per header FETCH, so the list fills in steadily.
@@ -72,6 +73,8 @@ pub enum Event {
         updates: Vec<(u32, BTreeSet<String>)>,
         command: String,
     },
+    /// A notice for the user, not an error (for example, where the cache lives).
+    Info(String),
     Error(String),
 }
 
@@ -84,46 +87,36 @@ pub struct Link {
 /// Opens a new connection. Called once at start, and again on each reconnect.
 type Connector = Box<dyn FnMut() -> Result<Box<dyn MailSource>, String> + Send>;
 
-/// Opens the account's cache file. A failure isn't fatal: returns the error to show.
-pub fn open_cache(email: &str) -> (Option<Store>, Option<String>) {
-    match account_cache_path(email) {
-        None => (
-            None,
-            Some("No data directory found; running without a cache.".into()),
+/// Opens the account's cache file, returning the path too. The error is for the user.
+pub fn open_cache(email: &str) -> Result<(Store, PathBuf), String> {
+    let path = account_cache_path(email)
+        .ok_or_else(|| "No data directory found; running without a cache.".to_string())?;
+    let store = Store::open(&path)
+        .map_err(|e| format!("Could not open the cache; running without it. {e}"))?;
+    Ok((store, path))
+}
+
+/// The account's cache, plus the startup notices to send once connected.
+fn cache_for(email: &str) -> (Option<Store>, Vec<Event>) {
+    match open_cache(email) {
+        Ok((store, path)) => (
+            Some(store),
+            vec![Event::Info(format!("Cache file: {}", path.display()))],
         ),
-        Some(path) => match Store::open(&path) {
-            Ok(store) => (Some(store), None),
-            Err(e) => (
-                None,
-                Some(format!("Could not open the cache; running without it. {e}")),
-            ),
-        },
+        Err(e) => (None, vec![Event::Error(e)]),
     }
 }
 
 /// Starts a worker that signs in to Gmail and uses that account's cache.
 pub fn spawn_gmail(user: String, password: String, ctx: egui::Context) -> Link {
-    let (store, cache_error) = open_cache(&user);
+    let (store, startup) = cache_for(&user);
     spawn(
         ctx,
         Box::new(move || live::connect_gmail(&user, &password)),
         KEEPALIVE,
         RETRY_BASE,
         store,
-        cache_error,
-    )
-}
-
-/// Starts a worker on the in-memory demo mailbox, with an in-memory cache.
-pub fn spawn_mock(ctx: egui::Context) -> Link {
-    let store = Store::open_in_memory(DEFAULT_BODY_CAP).ok();
-    spawn(
-        ctx,
-        Box::new(|| Ok(Box::new(MockSource::demo()) as Box<dyn MailSource>)),
-        KEEPALIVE,
-        RETRY_BASE,
-        store,
-        None,
+        startup,
     )
 }
 
@@ -133,7 +126,7 @@ fn spawn(
     keepalive: Duration,
     retry_base: Duration,
     store: Option<Store>,
-    startup_error: Option<String>,
+    startup: Vec<Event>,
 ) -> Link {
     let (cmd_tx, cmd_rx) = channel();
     let (ev_tx, ev_rx) = channel();
@@ -143,8 +136,8 @@ fn spawn(
         match connect() {
             Ok(source) => {
                 emit.send(Event::Connected);
-                if let Some(e) = startup_error {
-                    emit.send(Event::Error(e));
+                for ev in startup {
+                    emit.send(ev);
                 }
                 Worker {
                     source: Some(source),
@@ -668,6 +661,8 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::MockSource;
+    use gmail_imap_proto::store::DEFAULT_BODY_CAP;
     use std::collections::HashSet;
 
     /// Wraps the demo mailbox and fails with a dropped connection while `fail` is set.
@@ -737,8 +732,16 @@ mod tests {
         }
     }
 
+    /// A worker on the mock mailbox, with an in-memory cache.
     fn mock_link() -> Link {
-        spawn_mock(egui::Context::default())
+        spawn(
+            egui::Context::default(),
+            Box::new(|| Ok(Box::new(MockSource::demo()) as Box<dyn MailSource>)),
+            KEEPALIVE,
+            FAST,
+            Some(Store::open_in_memory(DEFAULT_BODY_CAP).unwrap()),
+            Vec::new(),
+        )
     }
 
     #[test]
@@ -869,7 +872,7 @@ mod tests {
             KEEPALIVE,
             FAST,
             Some(Store::open(&path).unwrap()),
-            None,
+            Vec::new(),
         );
         assert!(matches!(next_significant(&first), Event::Connected));
         first.commands.send(Command::Load { limit: 500 }).unwrap();
@@ -893,7 +896,7 @@ mod tests {
             KEEPALIVE,
             FAST,
             Some(Store::open(&path).unwrap()),
-            None,
+            Vec::new(),
         );
         assert!(matches!(next_significant(&second), Event::Connected));
         second.commands.send(Command::Load { limit: 500 }).unwrap();
@@ -926,7 +929,7 @@ mod tests {
             KEEPALIVE,
             FAST,
             None,
-            None,
+            Vec::new(),
         );
         assert!(matches!(next_significant(&link), Event::Connected));
 
@@ -955,7 +958,7 @@ mod tests {
             Duration::from_millis(20),
             FAST,
             None,
-            None,
+            Vec::new(),
         );
         assert!(matches!(next_significant(&link), Event::Connected));
         assert!(matches!(next_significant(&link), Event::Reconnecting));
@@ -982,7 +985,7 @@ mod tests {
             KEEPALIVE,
             FAST,
             None,
-            None,
+            Vec::new(),
         );
         assert!(matches!(next_significant(&link), Event::Connected));
         link.commands.send(Command::Load { limit: 500 }).unwrap();

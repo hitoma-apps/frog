@@ -5,7 +5,9 @@
 
 use std::collections::BTreeSet;
 
-use gmail_imap_proto::labels::{LabelAction, LabelRef, SystemLabel, uid_store_labels};
+#[cfg(test)]
+use gmail_imap_proto::labels::uid_store_labels;
+use gmail_imap_proto::labels::{LabelAction, LabelRef, SystemLabel};
 use gmail_imap_proto::store::CachedMessage;
 use mail_parser::MessageParser;
 
@@ -172,6 +174,7 @@ pub fn label_refs(labels: &[String]) -> Vec<LabelRef<'_>> {
 }
 
 /// The header block of a raw message: everything up to and including the first blank line.
+#[cfg(test)]
 pub fn header_block(raw: &[u8]) -> Vec<u8> {
     match raw.windows(4).position(|w| w == b"\r\n\r\n") {
         Some(i) => raw[..i + 4].to_vec(),
@@ -179,6 +182,7 @@ pub fn header_block(raw: &[u8]) -> Vec<u8> {
     }
 }
 
+#[cfg(test)]
 struct MockEntry {
     msgid: u64,
     thrid: u64,
@@ -188,10 +192,12 @@ struct MockEntry {
 }
 
 /// In-memory mailbox for the demo and for tests.
+#[cfg(test)]
 pub struct MockSource {
     entries: Vec<MockEntry>,
 }
 
+#[cfg(test)]
 impl MockSource {
     pub fn demo() -> Self {
         let entry = |msgid, thrid, uid, labels: &[&str], from: &str, subject: &str, body: &str| {
@@ -274,6 +280,7 @@ impl MockSource {
     }
 }
 
+#[cfg(test)]
 impl MailSource for MockSource {
     fn select(&mut self) -> Result<MailboxInfo, SourceError> {
         Ok(MailboxInfo {
