@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+directories = "6.0.0"
 eframe = "0.37.0"
 mail-parser = "0.11.9"
+rusqlite = { version = "0.42.0", features = ["bundled"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1.0.12"
+zstd = "0.14.4"

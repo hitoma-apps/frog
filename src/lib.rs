@@ -6,6 +6,7 @@ pub mod labels;
 pub mod links;
 pub mod render;
 pub mod response;
+pub mod store;
 
 pub use labels::{Label, LabelAction, LabelRef, SystemLabel, uid_store_labels};
 pub use render::render_plaintext;

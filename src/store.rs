@@ -1,0 +1,571 @@
+//! Local cache for one Gmail account, stored in SQLite.
+//!
+//! What's cached:
+//! - Message headers, keyed by `X-GM-MSGID`, with their UIDs and labels.
+//!   A UID is only valid within one UIDVALIDITY, so `invalidate_uids` clears
+//!   them when that changes. The messages themselves stay.
+//! - Full message bodies, zstd-compressed, in an LRU cache capped by
+//!   compressed size (1 GiB by default).
+//!
+//! There's one file per account, and each file holds one mailbox (All Mail).
+//! Plaintext for now. Encryption at rest is planned.
+
+use std::collections::BTreeSet;
+use std::fmt;
+use std::path::{Path, PathBuf};
+
+use directories::ProjectDirs;
+use rusqlite::{Connection, OptionalExtension, params};
+
+/// Default body cache size, in compressed bytes.
+pub const DEFAULT_BODY_CAP: u64 = 1 << 30;
+
+/// zstd level. Mail is text, so a low level compresses well and stays fast.
+const ZSTD_LEVEL: i32 = 3;
+
+const SCHEMA_VERSION: i64 = 1;
+
+#[derive(Debug)]
+pub enum StoreError {
+    Sql(rusqlite::Error),
+    Io(std::io::Error),
+    /// A value doesn't fit the column type. Gmail IDs are 64-bit, so this
+    /// only happens with corrupt input.
+    OutOfRange(u64),
+}
+
+impl fmt::Display for StoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StoreError::Sql(e) => write!(f, "cache database error: {e}"),
+            StoreError::Io(e) => write!(f, "cache file error: {e}"),
+            StoreError::OutOfRange(v) => write!(f, "value {v} does not fit the cache"),
+        }
+    }
+}
+
+impl std::error::Error for StoreError {}
+
+impl From<rusqlite::Error> for StoreError {
+    fn from(e: rusqlite::Error) -> Self {
+        StoreError::Sql(e)
+    }
+}
+
+impl From<std::io::Error> for StoreError {
+    fn from(e: std::io::Error) -> Self {
+        StoreError::Io(e)
+    }
+}
+
+pub type Result<T> = std::result::Result<T, StoreError>;
+
+/// A cached message header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedMessage {
+    /// `X-GM-MSGID`.
+    pub msgid: u64,
+    /// `X-GM-THRID`.
+    pub thrid: u64,
+    /// UID in the current UIDVALIDITY, or `None` if that has been invalidated.
+    pub uid: Option<u32>,
+    pub labels: BTreeSet<String>,
+    pub from: String,
+    pub subject: String,
+    pub date: String,
+    /// The header block as the server sent it.
+    pub headers: Vec<u8>,
+}
+
+/// What the cache knows about the mailbox's sync position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MailboxState {
+    pub uidvalidity: u32,
+    pub highest_uid: Option<u32>,
+}
+
+pub struct Store {
+    conn: Connection,
+    body_cap: u64,
+}
+
+/// Where an account's cache file lives: `<data dir>/accounts/<sanitized email>.sqlite`.
+/// Returns `None` if the platform has no data directory.
+pub fn account_cache_path(email: &str) -> Option<PathBuf> {
+    let dirs = ProjectDirs::from("", "", "gmail-labels-proto")?;
+    let safe: String = email
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '@' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    Some(
+        dirs.data_local_dir()
+            .join("accounts")
+            .join(format!("{safe}.sqlite")),
+    )
+}
+
+fn to_i64(v: u64) -> Result<i64> {
+    i64::try_from(v).map_err(|_| StoreError::OutOfRange(v))
+}
+
+impl Store {
+    /// Opens or creates the cache file at `path` with the default body cap.
+    pub fn open(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        Self::init(Connection::open(path)?, DEFAULT_BODY_CAP)
+    }
+
+    /// An in-memory cache, for tests.
+    pub fn open_in_memory(body_cap: u64) -> Result<Self> {
+        Self::init(Connection::open_in_memory()?, body_cap)
+    }
+
+    fn init(conn: Connection, body_cap: u64) -> Result<Self> {
+        conn.pragma_update(None, "foreign_keys", true)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        let mut store = Self { conn, body_cap };
+        store.migrate()?;
+        Ok(store)
+    }
+
+    fn migrate(&mut self) -> Result<()> {
+        let version: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version >= SCHEMA_VERSION {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE sync (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 uidvalidity INTEGER NOT NULL,
+                 highest_uid INTEGER
+             );
+             CREATE TABLE messages (
+                 msgid INTEGER PRIMARY KEY,
+                 thrid INTEGER NOT NULL,
+                 uid INTEGER,
+                 from_addr TEXT NOT NULL,
+                 subject TEXT NOT NULL,
+                 date TEXT NOT NULL,
+                 headers BLOB NOT NULL
+             );
+             CREATE INDEX messages_uid ON messages(uid);
+             CREATE TABLE message_labels (
+                 msgid INTEGER NOT NULL REFERENCES messages(msgid) ON DELETE CASCADE,
+                 label TEXT NOT NULL,
+                 PRIMARY KEY (msgid, label)
+             );
+             CREATE INDEX message_labels_by_label ON message_labels(label, msgid);
+             CREATE TABLE bodies (
+                 msgid INTEGER PRIMARY KEY,
+                 data BLOB NOT NULL,
+                 raw_size INTEGER NOT NULL,
+                 stored_size INTEGER NOT NULL,
+                 last_access INTEGER NOT NULL
+             );
+             CREATE INDEX bodies_lru ON bodies(last_access);",
+        )?;
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The sync position, or `None` if nothing has been cached yet.
+    pub fn mailbox_state(&self) -> Result<Option<MailboxState>> {
+        let state = self
+            .conn
+            .query_row(
+                "SELECT uidvalidity, highest_uid FROM sync WHERE id = 1",
+                [],
+                |r| {
+                    Ok(MailboxState {
+                        uidvalidity: r.get(0)?,
+                        highest_uid: r.get(1)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(state)
+    }
+
+    pub fn set_mailbox_state(&self, state: MailboxState) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO sync (id, uidvalidity, highest_uid) VALUES (1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET uidvalidity = excluded.uidvalidity,
+                                           highest_uid = excluded.highest_uid",
+            params![state.uidvalidity, state.highest_uid],
+        )?;
+        Ok(())
+    }
+
+    /// Inserts or updates headers and labels. Labels are replaced, not merged.
+    pub fn upsert_messages(&mut self, msgs: &[CachedMessage]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for m in msgs {
+            let msgid = to_i64(m.msgid)?;
+            tx.execute(
+                "INSERT INTO messages (msgid, thrid, uid, from_addr, subject, date, headers)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(msgid) DO UPDATE SET
+                     thrid = excluded.thrid, uid = excluded.uid,
+                     from_addr = excluded.from_addr, subject = excluded.subject,
+                     date = excluded.date, headers = excluded.headers",
+                params![
+                    msgid,
+                    to_i64(m.thrid)?,
+                    m.uid,
+                    m.from,
+                    m.subject,
+                    m.date,
+                    m.headers
+                ],
+            )?;
+            tx.execute(
+                "DELETE FROM message_labels WHERE msgid = ?1",
+                params![msgid],
+            )?;
+            for label in &m.labels {
+                tx.execute(
+                    "INSERT INTO message_labels (msgid, label) VALUES (?1, ?2)",
+                    params![msgid, label],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Replaces one message's labels, for example after a server-confirmed change.
+    pub fn set_labels(&mut self, msgid: u64, labels: &BTreeSet<String>) -> Result<()> {
+        let msgid = to_i64(msgid)?;
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM message_labels WHERE msgid = ?1",
+            params![msgid],
+        )?;
+        for label in labels {
+            tx.execute(
+                "INSERT INTO message_labels (msgid, label) VALUES (?1, ?2)",
+                params![msgid, label],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Clears every UID. Call this when UIDVALIDITY changes. The messages
+    /// themselves are kept, and the next sync assigns new UIDs.
+    pub fn invalidate_uids(&mut self) -> Result<()> {
+        self.conn.execute("UPDATE messages SET uid = NULL", [])?;
+        self.conn.execute("DELETE FROM sync", [])?;
+        Ok(())
+    }
+
+    /// Cached headers, newest first, optionally limited to one label.
+    pub fn list_messages(&self, label: Option<&str>, limit: usize) -> Result<Vec<CachedMessage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT msgid, thrid, uid, from_addr, subject, date, headers FROM messages m
+             WHERE ?1 IS NULL OR EXISTS (
+                 SELECT 1 FROM message_labels l WHERE l.msgid = m.msgid AND l.label = ?1)
+             ORDER BY uid IS NULL, uid DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![label, limit as i64], |r| {
+            Ok(CachedMessage {
+                msgid: r.get::<_, i64>(0)? as u64,
+                thrid: r.get::<_, i64>(1)? as u64,
+                uid: r.get(2)?,
+                labels: BTreeSet::new(),
+                from: r.get(3)?,
+                subject: r.get(4)?,
+                date: r.get(5)?,
+                headers: r.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let mut m = row?;
+            m.labels = self.labels_of(m.msgid)?;
+            out.push(m);
+        }
+        Ok(out)
+    }
+
+    fn labels_of(&self, msgid: u64) -> Result<BTreeSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT label FROM message_labels WHERE msgid = ?1")?;
+        let labels = stmt
+            .query_map(params![to_i64(msgid)?], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+        Ok(labels)
+    }
+
+    /// Returns the full message if it's cached, and marks it recently used.
+    pub fn get_body(&mut self, msgid: u64) -> Result<Option<Vec<u8>>> {
+        let msgid = to_i64(msgid)?;
+        let data: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT data FROM bodies WHERE msgid = ?1",
+                params![msgid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(data) = data else {
+            return Ok(None);
+        };
+        self.conn.execute(
+            "UPDATE bodies SET last_access = (SELECT COALESCE(MAX(last_access), 0) + 1 FROM bodies)
+             WHERE msgid = ?1",
+            params![msgid],
+        )?;
+        Ok(Some(zstd::decode_all(&data[..])?))
+    }
+
+    /// Caches a full message, then evicts least recently used bodies until the
+    /// cache is within its cap.
+    pub fn put_body(&mut self, msgid: u64, raw: &[u8]) -> Result<()> {
+        let msgid = to_i64(msgid)?;
+        let data = zstd::encode_all(raw, ZSTD_LEVEL)?;
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO bodies (msgid, data, raw_size, stored_size, last_access)
+             VALUES (?1, ?2, ?3, ?4, (SELECT COALESCE(MAX(last_access), 0) + 1 FROM bodies))
+             ON CONFLICT(msgid) DO UPDATE SET
+                 data = excluded.data, raw_size = excluded.raw_size,
+                 stored_size = excluded.stored_size, last_access = excluded.last_access",
+            params![msgid, data, raw.len() as i64, data.len() as i64],
+        )?;
+        loop {
+            let total: i64 = tx.query_row(
+                "SELECT COALESCE(SUM(stored_size), 0) FROM bodies",
+                [],
+                |r| r.get(0),
+            )?;
+            if total as u64 <= self.body_cap {
+                break;
+            }
+            let evicted = tx.execute(
+                "DELETE FROM bodies WHERE msgid = (
+                     SELECT msgid FROM bodies ORDER BY last_access ASC LIMIT 1)",
+                [],
+            )?;
+            if evicted == 0 {
+                break;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Total compressed bytes of cached bodies.
+    pub fn body_bytes(&self) -> Result<u64> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(stored_size), 0) FROM bodies",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(total as u64)
+    }
+
+    /// Drops all cached bodies. Headers and sync state are kept.
+    pub fn clear_bodies(&mut self) -> Result<()> {
+        self.conn.execute("DELETE FROM bodies", [])?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(msgid: u64, uid: u32, labels: &[&str]) -> CachedMessage {
+        CachedMessage {
+            msgid,
+            thrid: msgid + 100,
+            uid: Some(uid),
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+            from: format!("sender{uid}@example.com"),
+            subject: format!("Hello {uid}"),
+            date: "Tue, 10 Nov 2026 09:30:00 +0000".into(),
+            headers: format!("Subject: Hello {uid}\r\n\r\n").into_bytes(),
+        }
+    }
+
+    /// Pseudo-random bytes. They don't compress, so body size is predictable.
+    fn noise(len: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (0..len)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (x >> 33) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn headers_round_trip_newest_first_with_labels() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        s.upsert_messages(&[
+            msg(1001, 1, &["\\Inbox", "Work"]),
+            msg(1002, 2, &["\\Inbox"]),
+        ])
+        .unwrap();
+        let listed = s.list_messages(None, 10).unwrap();
+        assert_eq!(
+            listed.iter().map(|m| m.uid).collect::<Vec<_>>(),
+            vec![Some(2), Some(1)]
+        );
+        assert_eq!(listed[1].labels.len(), 2);
+        assert!(listed[1].labels.contains("Work"));
+        assert_eq!(listed[0].headers, b"Subject: Hello 2\r\n\r\n".to_vec());
+    }
+
+    #[test]
+    fn label_filter_and_limit() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        s.upsert_messages(&[
+            msg(1, 1, &["Work"]),
+            msg(2, 2, &["Personal"]),
+            msg(3, 3, &["Work", "\\Starred"]),
+        ])
+        .unwrap();
+        let work: Vec<u64> = s
+            .list_messages(Some("Work"), 10)
+            .unwrap()
+            .iter()
+            .map(|m| m.msgid)
+            .collect();
+        assert_eq!(work, vec![3, 1]);
+        assert_eq!(s.list_messages(None, 2).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn set_labels_replaces_rather_than_merges() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        s.upsert_messages(&[msg(7, 7, &["\\Inbox", "Work"])])
+            .unwrap();
+        s.set_labels(7, &BTreeSet::from(["Archive".to_string()]))
+            .unwrap();
+        let m = &s.list_messages(None, 1).unwrap()[0];
+        assert_eq!(m.labels, BTreeSet::from(["Archive".to_string()]));
+    }
+
+    #[test]
+    fn upsert_replaces_labels_from_the_server() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        s.upsert_messages(&[msg(7, 7, &["\\Inbox"])]).unwrap();
+        s.upsert_messages(&[msg(7, 7, &["Work"])]).unwrap();
+        let m = &s.list_messages(None, 1).unwrap()[0];
+        assert_eq!(m.labels, BTreeSet::from(["Work".to_string()]));
+    }
+
+    #[test]
+    fn invalidating_uids_keeps_messages_but_clears_uids() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        s.set_mailbox_state(MailboxState {
+            uidvalidity: 5,
+            highest_uid: Some(9),
+        })
+        .unwrap();
+        s.upsert_messages(&[msg(1, 1, &["\\Inbox"])]).unwrap();
+        s.invalidate_uids().unwrap();
+        assert_eq!(s.mailbox_state().unwrap(), None);
+        let listed = s.list_messages(None, 10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].uid, None);
+    }
+
+    #[test]
+    fn mailbox_state_round_trips() {
+        let s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        assert_eq!(s.mailbox_state().unwrap(), None);
+        let st = MailboxState {
+            uidvalidity: 42,
+            highest_uid: Some(7),
+        };
+        s.set_mailbox_state(st).unwrap();
+        assert_eq!(s.mailbox_state().unwrap(), Some(st));
+    }
+
+    #[test]
+    fn body_round_trips_through_compression() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        let raw = "Hello, body text. ".repeat(500).into_bytes();
+        assert_eq!(s.get_body(1).unwrap(), None);
+        s.put_body(1, &raw).unwrap();
+        assert_eq!(s.get_body(1).unwrap(), Some(raw));
+        assert!(s.body_bytes().unwrap() < 1000, "text should compress well");
+    }
+
+    #[test]
+    fn evicts_least_recently_used_bodies_over_the_cap() {
+        // Each body is about 1 KB of incompressible data, so the cap holds two.
+        let mut s = Store::open_in_memory(2_500).unwrap();
+        s.put_body(1, &noise(1000, 1)).unwrap();
+        s.put_body(2, &noise(1000, 2)).unwrap();
+        // Touch message 1 so message 2 is now the least recently used.
+        assert!(s.get_body(1).unwrap().is_some());
+        s.put_body(3, &noise(1000, 3)).unwrap();
+
+        assert!(s.body_bytes().unwrap() <= 2_500);
+        assert!(
+            s.get_body(2).unwrap().is_none(),
+            "LRU body should be evicted"
+        );
+        assert!(s.get_body(1).unwrap().is_some());
+        assert!(s.get_body(3).unwrap().is_some());
+    }
+
+    #[test]
+    fn clear_bodies_keeps_headers() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        s.upsert_messages(&[msg(1, 1, &["\\Inbox"])]).unwrap();
+        s.put_body(1, b"body").unwrap();
+        s.clear_bodies().unwrap();
+        assert_eq!(s.body_bytes().unwrap(), 0);
+        assert!(s.get_body(1).unwrap().is_none());
+        assert_eq!(s.list_messages(None, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cache_survives_reopening_the_file() {
+        let dir = std::env::temp_dir().join(format!("gmail-store-test-{}", std::process::id()));
+        let path = dir.join("cache.sqlite");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut s = Store::open(&path).unwrap();
+            s.upsert_messages(&[msg(1, 1, &["\\Inbox"])]).unwrap();
+            s.put_body(1, b"kept").unwrap();
+        }
+        let mut s = Store::open(&path).unwrap();
+        assert_eq!(s.list_messages(None, 10).unwrap().len(), 1);
+        assert_eq!(s.get_body(1).unwrap(), Some(b"kept".to_vec()));
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn account_path_is_sanitized_and_under_the_data_dir() {
+        let p = account_cache_path("Me+test/../x@Gmail.com").unwrap();
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(name, "me_test_.._x@gmail.com.sqlite");
+        assert!(p.to_string_lossy().contains("accounts"));
+    }
+}
