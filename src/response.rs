@@ -278,7 +278,7 @@ pub fn parse_gmail_fetch(buf: &[u8]) -> Result<GmailFetch<'_>, ParseError> {
             "UID" => out.uid = number_as(&value).and_then(|n| u32::try_from(n).ok()),
             "X-GM-MSGID" => out.msgid = number_as(&value),
             "X-GM-THRID" => out.thrid = number_as(&value),
-            "X-GM-LABELS" => out.labels = labels_from(&value)?,
+            "X-GM-LABELS" => out.labels = labels_from(&value),
             "BODY[]" => {
                 if let Value::Bytes(b) = value {
                     out.body = Some(b);
@@ -302,17 +302,38 @@ fn number_as(v: &Value<'_>) -> Option<u64> {
     }
 }
 
-fn labels_from(v: &Value<'_>) -> Result<Vec<String>, ParseError> {
-    match v {
-        Value::Nil => Ok(Vec::new()),
-        Value::List(items) => items
-            .iter()
-            .map(|item| {
-                item.as_str()
-                    .map(str::to_owned)
-                    .ok_or(ParseError::BadFetch("label is not a string"))
-            })
-            .collect(),
-        _ => Err(ParseError::BadFetch("X-GM-LABELS is not a list")),
+/// Label names from an `X-GM-LABELS` list. A name can arrive as a quoted
+/// string, a bare atom, a literal, or, if it's all digits, a number. Anything
+/// else is skipped, so one odd label doesn't fail the whole message.
+fn labels_from(v: &Value<'_>) -> Vec<String> {
+    let Value::List(items) = v else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| match item {
+            Value::Number(n) => Some(n.to_string()),
+            Value::Bytes(b) => Some(String::from_utf8_lossy(b).into_owned()),
+            other => other.as_str().map(str::to_owned),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+
+    #[test]
+    fn numeric_and_literal_label_names_are_kept() {
+        let raw = b"* 1 FETCH (UID 5 X-GM-LABELS (\"\\\\Inbox\" 2024 Work) X-GM-MSGID 9)\r\n";
+        let f = parse_gmail_fetch(raw).unwrap();
+        assert_eq!(f.labels, vec!["\\Inbox", "2024", "Work"]);
+    }
+
+    #[test]
+    fn literal_label_name_is_kept() {
+        let raw = b"* 1 FETCH (UID 5 X-GM-LABELS ({4}\r\nWork) X-GM-MSGID 9)\r\n";
+        let f = parse_gmail_fetch(raw).unwrap();
+        assert_eq!(f.labels, vec!["Work"]);
     }
 }
