@@ -3,6 +3,7 @@
 
 pub mod imap;
 pub mod labels;
+pub mod links;
 pub mod render;
 pub mod response;
 

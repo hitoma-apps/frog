@@ -21,6 +21,8 @@ pub struct Message {
     pub labels: BTreeSet<String>,
     pub from: String,
     pub subject: String,
+    /// `Message-ID` header without angle brackets, if the message has one.
+    pub message_id: Option<String>,
     /// Raw RFC 5322 bytes, rendered by `render_plaintext`.
     pub raw: Vec<u8>,
 }
@@ -58,6 +60,7 @@ impl MockBackend {
                 labels: labels.iter().map(|s| s.to_string()).collect(),
                 from: from.to_string(),
                 subject: subject.to_string(),
+                message_id: Some(format!("{msgid}@mock.example")),
                 raw,
             }
         };
