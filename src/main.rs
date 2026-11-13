@@ -946,18 +946,33 @@ impl App {
                         let open = self.open == Some(row.rep);
                         // Subject cell (title on the left, chips on the right), then the date.
                         let total = ui.available_width();
-                        let date_w = (total * 0.2).clamp(60.0, 160.0);
+                        let date_w = (total * 0.2).clamp(60.0, 200.0);
                         let chips_w = (total * 0.35).clamp(0.0, CHIPS_MAX_WIDTH);
                         let title_w = (total - date_w - chips_w).max(80.0);
 
-                        let title =
-                            egui::Button::selectable(open, row_title(m, row.count, row.unread))
-                                .truncate();
-                        if ui
-                            .add_sized([title_w, row_height], title)
-                            .on_hover_text(format!("thread {}", m.thrid))
-                            .clicked()
-                        {
+                        // A left-aligned label, not a button: buttons centre their text.
+                        // The open row gets a background band behind it.
+                        let title = ui
+                            .allocate_ui_with_layout(
+                                egui::vec2(title_w, row_height),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    if open {
+                                        ui.painter().rect_filled(
+                                            ui.max_rect(),
+                                            4.0,
+                                            ui.visuals().selection.bg_fill,
+                                        );
+                                    }
+                                    ui.add(
+                                        egui::Label::new(row_title(m, row.count, row.unread))
+                                            .truncate()
+                                            .sense(egui::Sense::click()),
+                                    )
+                                },
+                            )
+                            .inner;
+                        if title.on_hover_text(format!("thread {}", m.thrid)).clicked() {
                             self.open = Some(row.rep);
                         }
 
