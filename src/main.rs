@@ -10,6 +10,7 @@
 
 mod backend;
 mod live;
+mod reader;
 mod worker;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -21,6 +22,7 @@ use gmail_imap_proto::links::gmail_thread_url;
 use gmail_imap_proto::render_plaintext;
 
 use backend::Message;
+use reader::{Block, Segment};
 use worker::{Command, Event, Link};
 
 /// Newest messages to show on load, before the rest of the cache fills in.
@@ -67,6 +69,32 @@ fn adjust_counts(counts: &mut BTreeMap<String, usize>, labels: &BTreeSet<String>
     }
 }
 
+/// Draws one line of a message. Long lines wrap, and links are clickable.
+fn render_line(ui: &mut egui::Ui, line: &str) {
+    if line.is_empty() {
+        ui.add_space(ui.text_style_height(&egui::TextStyle::Monospace) * 0.6);
+        return;
+    }
+    let segments = reader::split_links(line);
+    if segments.iter().all(|s| matches!(s, Segment::Text(_))) {
+        ui.label(egui::RichText::new(line).monospace());
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        for segment in segments {
+            match segment {
+                Segment::Text(text) => {
+                    ui.label(egui::RichText::new(text).monospace());
+                }
+                Segment::Link(url) => {
+                    ui.hyperlink_to(egui::RichText::new(url).monospace(), url);
+                }
+            }
+        }
+    });
+}
+
 #[derive(Default)]
 struct LoginForm {
     email: String,
@@ -105,8 +133,8 @@ struct App {
     last_check: Instant,
     /// UIDs whose body has been asked for and not yet delivered.
     requested_bodies: HashSet<u32>,
-    /// Cached plaintext of the open message: `(uid, text)`.
-    rendered: Option<(u32, String)>,
+    /// Cached blocks of the open message: `(uid, blocks)`.
+    rendered: Option<(u32, Vec<Block>)>,
 
     /// `None` shows All Mail, `Some(label)` filters by one raw label.
     filter: Option<String>,
@@ -558,13 +586,17 @@ impl App {
         if !has_body {
             self.request_body(uid);
         } else if self.rendered.as_ref().map(|(id, _)| *id) != Some(uid) {
-            let text = self
+            let blocks = self
                 .messages
                 .get(&uid)
                 .and_then(|m| m.body.as_deref())
-                .map(|b| render_plaintext(b).unwrap_or_else(|| "(could not parse message)".into()))
+                .map(|b| {
+                    let text =
+                        render_plaintext(b).unwrap_or_else(|| "(could not parse message)".into());
+                    reader::blocks(&text)
+                })
                 .unwrap_or_default();
-            self.rendered = Some((uid, text));
+            self.rendered = Some((uid, blocks));
         }
 
         let open_url = (thrid != 0).then(|| gmail_thread_url(thrid));
@@ -586,8 +618,26 @@ impl App {
         egui::ScrollArea::vertical()
             .id_salt("reader")
             .show(ui, |ui| match &self.rendered {
-                Some((id, text)) if *id == uid => {
-                    ui.monospace(text);
+                Some((id, blocks)) if *id == uid => {
+                    for (i, block) in blocks.iter().enumerate() {
+                        match block {
+                            Block::Line(line) => render_line(ui, line),
+                            Block::Quote(lines) => {
+                                ui.push_id(i, |ui| {
+                                    egui::CollapsingHeader::new(format!(
+                                        "▸ Quoted text ({} lines)",
+                                        lines.len()
+                                    ))
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        for line in lines {
+                                            render_line(ui, line);
+                                        }
+                                    });
+                                });
+                            }
+                        }
+                    }
                 }
                 _ => {
                     ui.spinner();
