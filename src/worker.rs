@@ -373,6 +373,16 @@ impl Worker {
                     self.emit
                         .send(Event::Error(format!("cache reset failed: {e}")));
                 }
+                // Record the UIDVALIDITY now, not at the end of the load. If the
+                // app quits mid-load, the next start can then keep the UIDs.
+                let state = MailboxState {
+                    uidvalidity: info.uidvalidity,
+                    highest_uid: None,
+                };
+                if let Err(e) = store.set_mailbox_state(state) {
+                    self.emit
+                        .send(Event::Error(format!("cache write failed: {e}")));
+                }
             }
         }
         self.state.uidvalidity = Some(info.uidvalidity);
