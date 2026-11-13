@@ -205,6 +205,20 @@ pub trait MailSource: Send {
     fn fetch_headers(&mut self, uids: &[u32]) -> Result<Vec<Message>, SourceError>;
     /// The full RFC 5322 message.
     fn fetch_body(&mut self, uid: u32) -> Result<Vec<u8>, SourceError>;
+    /// The full messages for several UIDs, in one request where the source can manage it.
+    /// Messages the server doesn't return (expunged since they were listed) are left out.
+    /// A dropped connection is passed on.
+    fn fetch_bodies(&mut self, uids: &[u32]) -> Result<Vec<(u32, Vec<u8>)>, SourceError> {
+        let mut out = Vec::with_capacity(uids.len());
+        for &uid in uids {
+            match self.fetch_body(uid) {
+                Ok(raw) => out.push((uid, raw)),
+                Err(e @ SourceError::Disconnected(_)) => return Err(e),
+                Err(_) => {}
+            }
+        }
+        Ok(out)
+    }
     /// Applies a label change. Returns the command for the log and the new
     /// state of each affected message.
     fn modify_labels(
@@ -689,5 +703,22 @@ mod cached_tests {
             "the header block survives the cache"
         );
         assert_eq!(back.auth, m.auth);
+    }
+}
+
+#[cfg(test)]
+mod body_batch_tests {
+    use super::*;
+
+    #[test]
+    fn fetch_bodies_returns_what_the_server_has_in_order() {
+        let mut src = MockSource::demo();
+        // UID 99 doesn't exist (say, expunged since it was listed): it's left out.
+        let got = src.fetch_bodies(&[3, 99, 1]).unwrap();
+        assert_eq!(
+            got.iter().map(|(uid, _)| *uid).collect::<Vec<_>>(),
+            vec![3, 1]
+        );
+        assert!(got.iter().all(|(_, raw)| !raw.is_empty()));
     }
 }

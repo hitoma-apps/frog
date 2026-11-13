@@ -921,17 +921,32 @@ impl Store {
     /// Caches a full message, then evicts least recently used bodies until the
     /// cache is within its cap.
     pub fn put_body(&mut self, msgid: u64, raw: &[u8]) -> Result<()> {
-        let msgid = to_i64(msgid)?;
-        let data = zstd::encode_all(raw, ZSTD_LEVEL)?;
+        self.put_bodies(&[(msgid, raw)])
+    }
+
+    /// Stores several bodies in one transaction, then evicts the least recently used
+    /// bodies if the cache is over its cap.
+    pub fn put_bodies(&mut self, bodies: &[(u64, &[u8])]) -> Result<()> {
+        // Compress before the transaction opens, so the write lock is held only briefly.
+        let mut encoded = Vec::with_capacity(bodies.len());
+        for &(msgid, raw) in bodies {
+            encoded.push((
+                to_i64(msgid)?,
+                zstd::encode_all(raw, ZSTD_LEVEL)?,
+                raw.len() as i64,
+            ));
+        }
         let tx = self.conn.transaction()?;
-        tx.execute(
-            "INSERT INTO bodies (msgid, data, raw_size, stored_size, last_access)
-             VALUES (?1, ?2, ?3, ?4, (SELECT COALESCE(MAX(last_access), 0) + 1 FROM bodies))
-             ON CONFLICT(msgid) DO UPDATE SET
-                 data = excluded.data, raw_size = excluded.raw_size,
-                 stored_size = excluded.stored_size, last_access = excluded.last_access",
-            params![msgid, data, raw.len() as i64, data.len() as i64],
-        )?;
+        for (msgid, data, raw_size) in &encoded {
+            tx.execute(
+                "INSERT INTO bodies (msgid, data, raw_size, stored_size, last_access)
+                 VALUES (?1, ?2, ?3, ?4, (SELECT COALESCE(MAX(last_access), 0) + 1 FROM bodies))
+                 ON CONFLICT(msgid) DO UPDATE SET
+                     data = excluded.data, raw_size = excluded.raw_size,
+                     stored_size = excluded.stored_size, last_access = excluded.last_access",
+                params![msgid, data, raw_size, data.len() as i64],
+            )?;
+        }
         loop {
             let total: i64 = tx.query_row(
                 "SELECT COALESCE(SUM(stored_size), 0) FROM bodies",
@@ -1304,6 +1319,17 @@ mod tests {
             1,
             "the rebuilt search index finds the subject \"Hello 1\""
         );
+    }
+
+    #[test]
+    fn a_batch_of_bodies_round_trips() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        s.upsert_messages(&[msg(1, 1, &[]), msg(2, 2, &[])])
+            .unwrap();
+        s.put_bodies(&[(1, b"first body"), (2, b"second body")])
+            .unwrap();
+        assert_eq!(s.get_body(1).unwrap().as_deref(), Some(&b"first body"[..]));
+        assert_eq!(s.get_body(2).unwrap().as_deref(), Some(&b"second body"[..]));
     }
 
     #[test]

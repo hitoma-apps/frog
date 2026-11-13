@@ -140,6 +140,22 @@ impl<S: Read + Write + Send + SetReadTimeout> MailSource for LiveSession<S> {
         )))
     }
 
+    fn fetch_bodies(&mut self, uids: &[u32]) -> Result<Vec<(u32, Vec<u8>)>, SourceError> {
+        self.ensure_selected()?;
+        let mut out = Vec::with_capacity(uids.len());
+        for raw in self
+            .conn
+            .uid_fetch(uids, "UID BODY.PEEK[]")
+            .map_err(to_source_error)?
+        {
+            let f = parse_gmail_fetch(&raw).map_err(|e| SourceError::Failed(e.to_string()))?;
+            if let (Some(uid), Some(body)) = (f.uid, f.body) {
+                out.push((uid, body.to_vec()));
+            }
+        }
+        Ok(out)
+    }
+
     fn modify_labels(
         &mut self,
         uids: &[u32],

@@ -27,6 +27,9 @@ use crate::live;
 const IDLE_POLL: Duration = Duration::from_secs(1);
 /// Messages per header FETCH, so the list fills in steadily.
 const BATCH: usize = 200;
+/// Bodies per request during background prefetch. Small, so a request from the reader
+/// doesn't wait long behind one.
+const BODY_BATCH: usize = 10;
 /// Quiet time before a NOOP keeps the connection open.
 pub const KEEPALIVE: Duration = Duration::from_secs(240);
 /// Reconnect attempts before giving up.
@@ -429,7 +432,7 @@ impl Worker {
     fn idle_step(&mut self) {
         let result = self.with_source(|w, src| {
             if w.state.pending_headers.is_empty() {
-                w.op_prefetch_one(src)
+                w.op_prefetch_batch(src)
             } else {
                 w.op_fill_headers(src)
             }
@@ -622,6 +625,29 @@ impl Worker {
                     .send(Event::Error(format!("cache read failed: {e}")));
                 None
             }
+        }
+    }
+
+    /// Writes a batch of bodies to the cache in one transaction.
+    fn cache_bodies(&mut self, bodies: &[(u32, Vec<u8>)]) {
+        let Some(store) = self.store.as_mut() else {
+            return;
+        };
+        let mut pairs: Vec<(u64, &[u8])> = Vec::with_capacity(bodies.len());
+        for (uid, raw) in bodies {
+            match store.msgid_for_uid(*uid) {
+                Ok(Some(msgid)) => pairs.push((msgid, raw.as_slice())),
+                Ok(None) => {}
+                Err(e) => {
+                    self.emit
+                        .send(Event::Error(format!("cache write failed: {e}")));
+                    return;
+                }
+            }
+        }
+        if let Err(e) = store.put_bodies(&pairs) {
+            self.emit
+                .send(Event::Error(format!("cache write failed: {e}")));
         }
     }
 
@@ -876,27 +902,41 @@ impl Worker {
     }
 
     /// Fetches one body, from the cache if possible. On failure it goes back on the queue.
-    fn op_prefetch_one(&mut self, src: &mut dyn MailSource) -> Result<(), SourceError> {
-        let Some(uid) = self.state.prefetch.pop_front() else {
-            return Ok(());
-        };
-        if let Some(raw) = self.cached_body(uid) {
-            self.emit.send(Event::Body { uid, raw });
+    /// Fetches the next batch of bodies that aren't cached yet, in one request. Cached
+    /// bodies are sent straight away. A batch is small, so a request from the reader
+    /// waits behind one request at most.
+    fn op_prefetch_batch(&mut self, src: &mut dyn MailSource) -> Result<(), SourceError> {
+        let mut wanted: Vec<u32> = Vec::new();
+        while wanted.len() < BODY_BATCH {
+            let Some(uid) = self.state.prefetch.pop_front() else {
+                break;
+            };
+            match self.cached_body(uid) {
+                Some(raw) => self.emit.send(Event::Body { uid, raw }),
+                None => wanted.push(uid),
+            }
+        }
+        if wanted.is_empty() {
             return Ok(());
         }
-        match src.fetch_body(uid) {
-            Ok(raw) => {
-                self.cache_body(uid, &raw);
-                self.emit.send(Event::Body { uid, raw });
+        match src.fetch_bodies(&wanted) {
+            Ok(bodies) => {
+                // Anything the server didn't return was expunged since it was listed.
+                // It's skipped here, and opening it reports the error.
+                self.cache_bodies(&bodies);
+                for (uid, raw) in bodies {
+                    self.emit.send(Event::Body { uid, raw });
+                }
                 Ok(())
             }
-            // The connection dropped: try this one again after reconnecting.
+            // The connection dropped: try the batch again after reconnecting.
             Err(e @ SourceError::Disconnected(_)) => {
-                self.state.prefetch.push_front(uid);
+                for uid in wanted.into_iter().rev() {
+                    self.state.prefetch.push_front(uid);
+                }
                 Err(e)
             }
-            // The server couldn't give this body, typically because it was
-            // expunged after it was listed. Skip it. Opening it reports the error.
+            // Any other failure skips the batch. Each message can still be opened on demand.
             Err(_) => Ok(()),
         }
     }
