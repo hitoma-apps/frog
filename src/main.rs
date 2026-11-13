@@ -15,7 +15,7 @@ mod notify;
 mod reader;
 mod worker;
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -177,8 +177,10 @@ struct App {
     last_check: Instant,
     /// UIDs whose body has been asked for and not yet delivered.
     requested_bodies: HashSet<u32>,
-    /// Cached blocks of the open message: `(uid, blocks)`.
-    rendered: Option<(u32, Vec<Block>)>,
+    /// Rendered blocks of messages in the reader, by UID.
+    rendered: HashMap<u32, Vec<Block>>,
+    /// UIDs of cached messages, grouped by `X-GM-THRID`.
+    threads: HashMap<u64, BTreeSet<u32>>,
     /// A suspicious link waiting for the user to confirm it.
     pending_link: Option<LinkInfo>,
 
@@ -237,7 +239,8 @@ impl App {
             auto_check: false,
             last_check: Instant::now(),
             requested_bodies: HashSet::new(),
-            rendered: None,
+            rendered: HashMap::new(),
+            threads: HashMap::new(),
             pending_link: None,
             filter: None,
             checked: BTreeSet::new(),
@@ -300,7 +303,8 @@ impl App {
                 self.view_dirty = true;
                 self.cached_count = 0;
                 self.requested_bodies.clear();
-                self.rendered = None;
+                self.rendered.clear();
+                self.threads.clear();
                 self.open = None;
                 self.checked.clear();
             }
@@ -352,12 +356,18 @@ impl App {
                 for uid in uids {
                     if let Some(m) = self.messages.remove(&uid) {
                         adjust_counts(&mut self.counts, &m.labels, false);
+                        if let Some(set) = self.threads.get_mut(&m.thrid) {
+                            set.remove(&uid);
+                            if set.is_empty() {
+                                self.threads.remove(&m.thrid);
+                            }
+                        }
                     }
                     self.checked.remove(&uid);
                     self.requested_bodies.remove(&uid);
                     if self.open == Some(uid) {
                         self.open = None;
-                        self.rendered = None;
+                        self.rendered.remove(&uid);
                     }
                 }
                 self.view_dirty = true;
@@ -402,6 +412,7 @@ impl App {
                 }
                 None => {
                     adjust_counts(&mut self.counts, &m.labels, true);
+                    self.threads.entry(m.thrid).or_default().insert(m.uid);
                     self.messages.insert(m.uid, m);
                 }
             }
@@ -837,7 +848,6 @@ impl App {
                             .clicked()
                         {
                             self.open = Some(uid);
-                            self.rendered = None;
                         }
                         let date_w = (ui.available_width() * 0.4).max(60.0);
                         let date = egui::RichText::new(&m.date).weak();
@@ -853,33 +863,38 @@ impl App {
         self.view = view;
     }
 
+    /// The reader: the whole conversation the open message belongs to, oldest first.
     fn reader(&mut self, ui: &mut egui::Ui) {
-        let Some(uid) = self.open else {
+        let Some(open) = self.open else {
             ui.label("Open a message to read it.");
             return;
         };
-        let Some((msgid, thrid, has_body)) = self
-            .messages
-            .get(&uid)
-            .map(|m| (m.msgid, m.thrid, m.body.is_some()))
-        else {
+        let Some((thrid, msgid)) = self.messages.get(&open).map(|m| (m.thrid, m.msgid)) else {
             return;
         };
+        let thread: Vec<u32> = self
+            .threads
+            .get(&thrid)
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_else(|| vec![open]);
 
-        if !has_body {
+        // Bodies for the whole conversation, fetched in the background, and
+        // each one rendered once.
+        for &uid in &thread {
             self.request_body(uid);
-        } else if self.rendered.as_ref().map(|(id, _)| *id) != Some(uid) {
-            let blocks = self
-                .messages
-                .get(&uid)
-                .and_then(|m| m.body.as_deref())
-                .map(|b| {
-                    let text =
-                        render_plaintext(b).unwrap_or_else(|| "(could not parse message)".into());
-                    reader::blocks(&text)
-                })
-                .unwrap_or_default();
-            self.rendered = Some((uid, blocks));
+        }
+        for &uid in &thread {
+            if self.rendered.contains_key(&uid) {
+                continue;
+            }
+            let Some(body) = self.messages.get(&uid).and_then(|m| m.body.as_deref()) else {
+                continue;
+            };
+            let text = render_plaintext(body).unwrap_or_else(|| "(could not parse message)".into());
+            self.rendered.insert(uid, reader::blocks(&text));
+        }
+        if self.rendered.len() > 300 {
+            self.rendered.retain(|uid, _| thread.contains(uid));
         }
 
         let open_url = (thrid != 0).then(|| gmail_thread_url(thrid));
@@ -896,39 +911,59 @@ impl App {
         ui.monospace(format!(
             "msgid  {msgid} (0x{msgid:x})\nthrid  {thrid} (0x{thrid:x})"
         ));
+        ui.weak(format!("{} messages in this conversation", thread.len()));
         ui.separator();
 
+        let newest = thread.last().copied();
         let mut pending: Option<LinkInfo> = None;
         egui::ScrollArea::vertical()
             .id_salt("reader")
-            .show(ui, |ui| match &self.rendered {
-                Some((id, blocks)) if *id == uid => {
-                    for (i, block) in blocks.iter().enumerate() {
-                        match block {
-                            Block::Line(line) => render_line(ui, line, &mut pending),
-                            Block::Quote(lines) => {
-                                ui.push_id(i, |ui| {
-                                    egui::CollapsingHeader::new(format!(
-                                        "▸ Quoted text ({} lines)",
-                                        lines.len()
-                                    ))
-                                    .default_open(false)
-                                    .show(ui, |ui| {
-                                        for line in lines {
-                                            render_line(ui, line, &mut pending);
+            .show(ui, |ui| {
+                for &uid in &thread {
+                    let Some(m) = self.messages.get(&uid) else {
+                        continue;
+                    };
+                    let title = format!("{} — {}   {}", m.from, m.subject, m.date);
+                    let title = if m.seen {
+                        egui::RichText::new(title)
+                    } else {
+                        egui::RichText::new(title).strong()
+                    };
+                    let expanded = uid == open || Some(uid) == newest;
+                    ui.push_id(uid, |ui| {
+                        egui::CollapsingHeader::new(title)
+                            .default_open(expanded)
+                            .show(ui, |ui| match self.rendered.get(&uid) {
+                                Some(blocks) => {
+                                    for (i, block) in blocks.iter().enumerate() {
+                                        match block {
+                                            Block::Line(line) => {
+                                                render_line(ui, line, &mut pending)
+                                            }
+                                            Block::Quote(lines) => {
+                                                ui.push_id(i, |ui| {
+                                                    egui::CollapsingHeader::new(format!(
+                                                        "▸ Quoted text ({} lines)",
+                                                        lines.len()
+                                                    ))
+                                                    .default_open(false)
+                                                    .show(ui, |ui| {
+                                                        for line in lines {
+                                                            render_line(ui, line, &mut pending);
+                                                        }
+                                                    });
+                                                });
+                                            }
                                         }
-                                    });
-                                });
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    ui.spinner();
-                    ui.label("Loading message…");
-                    if let Some(m) = self.messages.get(&uid) {
-                        ui.monospace(String::from_utf8_lossy(&m.headers));
-                    }
+                                    }
+                                }
+                                None => {
+                                    ui.spinner();
+                                    ui.label("Loading message…");
+                                    ui.monospace(String::from_utf8_lossy(&m.headers));
+                                }
+                            });
+                    });
                 }
             });
         if pending.is_some() {
