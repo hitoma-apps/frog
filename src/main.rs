@@ -581,7 +581,9 @@ impl App {
             });
             return;
         }
-        let row_height = ui.text_style_height(&egui::TextStyle::Body);
+        // Every row is exactly one widget tall, so the virtual list can place rows
+        // without measuring them. Long text is truncated, never wrapped.
+        let row_height = ui.spacing().interact_size.y;
         // Take the order out of `self` so rows can borrow the rest of it.
         let view = std::mem::take(&mut self.view);
         egui::ScrollArea::vertical()
@@ -601,18 +603,24 @@ impl App {
                             }
                         }
                         let open = self.open == Some(uid);
+                        let title_w = (ui.available_width() * 0.6).max(120.0);
+                        let title = egui::Button::selectable(open, unread_title(m)).truncate();
                         if ui
-                            .selectable_label(open, unread_title(m))
+                            .add_sized([title_w, row_height], title)
                             .on_hover_text(format!("thread {}", m.thrid))
                             .clicked()
                         {
                             self.open = Some(uid);
                             self.rendered = None;
                         }
-                        ui.weak(&m.date);
+                        let date_w = (ui.available_width() * 0.4).max(60.0);
+                        let date = egui::RichText::new(&m.date).weak();
+                        ui.add_sized([date_w, row_height], egui::Label::new(date).truncate());
                         let labels: Vec<String> =
                             m.labels.iter().map(|l| display_label(l)).collect();
-                        ui.weak(labels.join(", "));
+                        let labels_w = ui.available_width().max(0.0);
+                        let labels = egui::RichText::new(labels.join(", ")).weak();
+                        ui.add_sized([labels_w, row_height], egui::Label::new(labels).truncate());
                     });
                 }
             });
