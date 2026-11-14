@@ -1,6 +1,7 @@
 //! Prototype Gmail IMAP client pieces: a small IMAP client, `X-GM-*` response
 //! parsing, label operations, and plaintext message rendering.
 
+pub mod attachments;
 pub mod auth;
 pub mod imap;
 pub mod labels;

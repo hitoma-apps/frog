@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use gmail_imap_proto::attachments::{self, AttachmentInfo};
 use gmail_imap_proto::auth::AuthCheck;
 use gmail_imap_proto::labels::{LabelAction, SystemLabel};
 use gmail_imap_proto::linkcheck::{self, LinkInfo};
@@ -93,6 +94,44 @@ fn base_subject(subject: &str) -> String {
         if s.len() == before {
             return s;
         }
+    }
+}
+
+/// Where saved attachments go: the Downloads folder, or the current folder if there's none.
+fn download_dir() -> PathBuf {
+    directories::UserDirs::new()
+        .and_then(|dirs| dirs.download_dir().map(Path::to_path_buf))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// `dir/name`, or with " (2)", " (3)"… before the extension if that name is taken.
+fn unique_path(dir: &Path, name: &str) -> PathBuf {
+    let first = dir.join(name);
+    if !first.exists() {
+        return first;
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem.to_string(), format!(".{ext}")),
+        _ => (name.to_string(), String::new()),
+    };
+    (2..)
+        .map(|n| dir.join(format!("{stem} ({n}){ext}")))
+        .find(|p| !p.exists())
+        .unwrap_or(first)
+}
+
+/// A size for people: KB or MB above a kilobyte, else bytes.
+fn human_size(bytes: usize) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * KB;
+    let b = bytes as f64;
+    if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.0} KB", b / KB)
+    } else {
+        format!("{bytes} B")
     }
 }
 
@@ -408,6 +447,8 @@ struct App {
     checked: BTreeSet<u64>,
     /// The open conversation, by thread ID.
     open_thread: Option<u64>,
+    /// Attachments of each message in the reader, by UID. Read once the body is here.
+    attachments: HashMap<u32, Vec<AttachmentInfo>>,
     /// The message whose original is open in the dialog, by UID.
     original: Option<u32>,
     /// The messages of the open conversation, by UID. Bodies arrive separately.
@@ -482,6 +523,7 @@ impl App {
             open_thread: None,
             thread_msgs: BTreeMap::new(),
             original: None,
+            attachments: HashMap::new(),
             mark_read_on_open: false,
             label_input: String::new(),
             log: Vec::new(),
@@ -770,6 +812,7 @@ impl App {
         self.thread_msgs.clear();
         self.rendered.clear();
         self.requested_bodies.clear();
+        self.attachments.clear();
         self.send(Command::Thread { thrid });
     }
 
@@ -1501,6 +1544,16 @@ impl App {
             let text = render_plaintext(body).unwrap_or_else(|| "(could not parse message)".into());
             self.rendered.insert(uid, reader::blocks(&text));
         }
+        for &uid in &thread {
+            if self.attachments.contains_key(&uid) {
+                continue;
+            }
+            let Some(body) = self.thread_msgs.get(&uid).and_then(|m| m.body.as_deref()) else {
+                continue;
+            };
+            let list = attachments::list(body);
+            self.attachments.insert(uid, list);
+        }
         if self.rendered.len() > 300 {
             let present = &self.thread_msgs;
             self.rendered.retain(|uid, _| present.contains_key(uid));
@@ -1569,6 +1622,8 @@ impl App {
 
         let newest = thread.first().copied();
         let mut open_original: Option<u32> = None;
+        // An attachment chosen to save, as (message, index in its attachment list).
+        let mut save_request: Option<(u32, usize)> = None;
         let mut pending: Option<LinkInfo> = None;
         egui::ScrollArea::vertical()
             .id_salt("reader")
@@ -1610,6 +1665,27 @@ impl App {
                                                 }
                                             });
                                             auth_line(ui, &m.auth);
+                                            if let Some(list) = self.attachments.get(&uid).filter(|l| !l.is_empty()) {
+                                                ui.horizontal_wrapped(|ui| {
+                                                    ui.weak("Attachments:");
+                                                    for (i, att) in list.iter().enumerate() {
+                                                        let mut hover = format!("{}\nSave to your Downloads folder.", att.content_type);
+                                                        let program = attachments::is_program(&att.name);
+                                                        if program {
+                                                            hover.push_str("\nA program file: review it before opening.");
+                                                        }
+                                                        let text = format!(
+                                                            "{}{} ({})",
+                                                            if program { "⚠ " } else { "" },
+                                                            att.name,
+                                                            human_size(att.size)
+                                                        );
+                                                        if ui.button(text).on_hover_text(hover).clicked() {
+                                                            save_request = Some((uid, i));
+                                                        }
+                                                    }
+                                                });
+                                            }
                                             match self.rendered.get(&uid) {
                                                 Some(blocks) => {
                                                     for (i, block) in blocks.iter().enumerate() {
@@ -1668,10 +1744,38 @@ impl App {
         if pending.is_some() {
             self.pending_link = pending;
         }
+        if let Some((uid, index)) = save_request {
+            self.save_attachment(uid, index);
+        }
         if let Some(uid) = open_original {
             self.original = Some(uid);
             self.request_body(uid);
         }
+    }
+
+    /// Writes an attachment to the Downloads folder, under a name that doesn't overwrite
+    /// anything already there.
+    fn save_attachment(&mut self, uid: u32, index: usize) {
+        let Some(raw) = self.thread_msgs.get(&uid).and_then(|m| m.body.as_deref()) else {
+            self.status = Some("The message isn't loaded yet.".into());
+            return;
+        };
+        let Some(bytes) = attachments::contents(raw, index) else {
+            self.status = Some("Could not read that attachment.".into());
+            return;
+        };
+        let name = self
+            .attachments
+            .get(&uid)
+            .and_then(|list| list.get(index))
+            .map_or_else(|| "attachment".to_string(), |a| a.name.clone());
+        let dir = download_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let path = unique_path(&dir, &name);
+        self.status = Some(match std::fs::write(&path, &bytes) {
+            Ok(()) => format!("Saved {}", path.display()),
+            Err(e) => format!("Could not save {}: {e}", path.display()),
+        });
     }
 
     /// The original message, shown as Gmail's "Show original" shows it: a summary, the
