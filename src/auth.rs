@@ -12,15 +12,31 @@ pub struct AuthCheck {
     pub detail: String,
 }
 
-/// The checks recorded in a header block's `Authentication-Results` headers. Only the
-/// message's own verdicts are returned. Those nested inside an ARC clause are not.
+/// The server whose verdicts are trusted. Gmail adds its own header when it receives a
+/// message, above anything the sender wrote.
+const TRUSTED_AUTHSERV: &str = "mx.google.com";
+
+/// The checks Gmail recorded in a header block. Only the topmost `Authentication-Results`
+/// header counts, and only if Gmail wrote it: a sender can put any number of these headers
+/// in a message, so a lower one, or one from another server, proves nothing. Verdicts
+/// nested inside an ARC clause aren't returned either.
 pub fn checks(headers: &[u8]) -> Vec<AuthCheck> {
     let text = String::from_utf8_lossy(headers);
-    header_values(&text, "authentication-results")
-        .iter()
-        .flat_map(|value| top_level_clauses(value))
-        .filter_map(|clause| parse_clause(&clause))
-        .collect()
+    let Some(top) = header_values(&text, "authentication-results")
+        .into_iter()
+        .next()
+    else {
+        return Vec::new();
+    };
+    let clauses = top_level_clauses(&top);
+    let authserv = clauses
+        .first()
+        .and_then(|c| c.split_whitespace().next())
+        .unwrap_or("");
+    if !authserv.eq_ignore_ascii_case(TRUSTED_AUTHSERV) {
+        return Vec::new();
+    }
+    clauses.iter().filter_map(|c| parse_clause(c)).collect()
 }
 
 /// The values of every header with this name, with folded lines joined.
@@ -140,11 +156,26 @@ mod tests {
 
     #[test]
     fn folded_headers_are_joined() {
-        let headers = b"From: a@example.com\r\nAuthentication-Results: mx.example.com;\r\n\tspf=fail smtp.mailfrom=x@example.com;\r\n dmarc=none\r\n\r\nBody: spf=pass\r\n";
+        let headers = b"From: a@example.com\r\nAuthentication-Results: mx.google.com;\r\n\tspf=fail smtp.mailfrom=x@example.com;\r\n dmarc=none\r\n\r\nBody: spf=pass\r\n";
         let all = checks(headers);
         assert_eq!(find(&all, "spf")[0].result, "fail");
         assert_eq!(find(&all, "dmarc")[0].result, "none");
         assert!(find(&all, "body").is_empty(), "the body is not a header");
+    }
+
+    #[test]
+    fn a_forged_header_below_gmails_is_ignored() {
+        // Gmail's real verdict is a fail. The sender added a header claiming a pass.
+        let headers = b"Authentication-Results: mx.google.com; dmarc=fail header.from=bank.example\r\nFrom: Bank <alerts@bank.example>\r\nAuthentication-Results: mx.google.com; dmarc=pass header.from=bank.example\r\n\r\n";
+        let all = checks(headers);
+        assert_eq!(all.len(), 1, "{all:?}");
+        assert_eq!(all[0].result, "fail");
+    }
+
+    #[test]
+    fn a_header_from_another_server_is_not_trusted() {
+        let headers = b"Authentication-Results: mail.attacker.example; spf=pass; dkim=pass; dmarc=pass\r\n\r\n";
+        assert!(checks(headers).is_empty());
     }
 
     #[test]
@@ -155,7 +186,7 @@ mod tests {
 
     #[test]
     fn semicolons_inside_comments_do_not_split_clauses() {
-        let headers = b"Authentication-Results: mx; spf=softfail (no record; see notes) smtp.mailfrom=x\r\n\r\n";
+        let headers = b"Authentication-Results: mx.google.com; spf=softfail (no record; see notes) smtp.mailfrom=x\r\n\r\n";
         let all = checks(headers);
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].result, "softfail");
