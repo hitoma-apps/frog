@@ -360,6 +360,10 @@ struct App {
     settings_open: bool,
     /// The IMAP command log is open in its own window.
     log_open: bool,
+    /// The sign-in, kept in memory for the session so a crashed worker can be restarted.
+    credentials: Option<(String, String)>,
+    /// Why the background work stopped, if a thread crashed. The status bar offers a restart.
+    crashed: Option<String>,
     /// The signed-in account, shown in the window title.
     account: Option<String>,
     /// The account the window title was last set for.
@@ -466,6 +470,8 @@ impl App {
             settings_open: false,
             log_open: false,
             account: None,
+            credentials: None,
+            crashed: None,
             title_for: None,
             cache_bytes: 0,
             cache_checked: None,
@@ -515,6 +521,8 @@ impl App {
 
     fn start_gmail(&mut self, user: String, password: String) {
         self.login.error = None;
+        // Kept in memory only, for the session, so a crashed worker can be restarted.
+        self.credentials = Some((user.clone(), password.clone()));
         self.account = Some(user.clone());
         if self.settings.email.as_deref() != Some(user.as_str()) {
             self.settings.email = Some(user.clone());
@@ -706,6 +714,11 @@ impl App {
                 self.checking = false;
                 self.loading = None;
                 self.status = Some(e);
+            }
+            Event::Crashed(why) => {
+                self.checking = false;
+                self.loading = None;
+                self.crashed = Some(why);
             }
         }
     }
@@ -1009,7 +1022,42 @@ impl App {
             .and_then(gmail_imap_proto::store::account_cache_path)
     }
 
+    /// Starts a new worker after the old one crashed. The cache is checked on the way in,
+    /// since the crashed worker didn't close it cleanly.
+    fn restart_worker(&mut self) {
+        let Some((user, password)) = self.credentials.clone() else {
+            self.status = Some("Sign in again to restart.".into());
+            return;
+        };
+        self.crashed = None;
+        // Dropping the old link ends the old threads, once they notice.
+        self.link = None;
+        self.change_list();
+        self.thread_msgs.clear();
+        self.rendered.clear();
+        self.requested_bodies.clear();
+        self.open_thread = None;
+        self.reconnecting = false;
+        self.start_gmail(user, password);
+    }
+
     fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let mut restart = false;
+        if let Some(why) = &self.crashed {
+            ui.horizontal(|ui| {
+                ui.colored_label(egui::Color32::LIGHT_RED, why);
+                if ui
+                    .button("Restart")
+                    .on_hover_text("Start the background work again. The cache is checked first.")
+                    .clicked()
+                {
+                    restart = true;
+                }
+            });
+        }
+        if restart {
+            self.restart_worker();
+        }
         ui.horizontal(|ui| {
             if self.reconnecting {
                 ui.spinner();

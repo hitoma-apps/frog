@@ -142,7 +142,9 @@ impl Drop for Store {
     fn drop(&mut self) {
         // Marks the cache as closed cleanly, so the next start can skip the checks. Only the
         // writing connection does: a reader closing says nothing about the writer.
-        if !self.read_only {
+        // A thread that's panicking didn't close the cache cleanly, so it isn't marked clean:
+        // the next start then runs the checks.
+        if !self.read_only && !std::thread::panicking() {
             let _ = self
                 .conn
                 .execute("UPDATE cache_state SET clean = 1 WHERE id = 1", []);
@@ -654,6 +656,9 @@ impl Store {
         // last few commits, but never leaves a half-written one, and the next sync re-fetches
         // what was lost. The clean-shutdown checks cover the rest.
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // A second writer (an old worker finishing after a restart) makes this one wait,
+        // rather than fail at once.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let mut store = Self {
             conn,
             body_cap,
@@ -2222,6 +2227,27 @@ mod tests {
         s.set_seen_for_threads(&[103], true).unwrap();
         s.apply_updates(&[(3, &home, false)]).unwrap();
         assert_eq!(s.thread_totals().unwrap(), (2, 0));
+    }
+
+    #[test]
+    fn a_panic_leaves_the_cache_marked_not_clean() {
+        let dir = std::env::temp_dir().join(format!("gmail-panic-test-{}", std::process::id()));
+        let path = dir.join("cache.sqlite");
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(Store::open(&path).unwrap());
+        assert!(Store::open(&path).unwrap().opened_cleanly());
+
+        let in_thread = path.clone();
+        let outcome = std::panic::catch_unwind(move || {
+            let _store = Store::open(&in_thread).unwrap();
+            panic!("a bug while the cache is open");
+        });
+        assert!(outcome.is_err());
+        assert!(
+            !Store::open(&path).unwrap().opened_cleanly(),
+            "the next start runs the checks"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -8,6 +8,7 @@
 //! reconnects when the connection drops, retrying the failed command once.
 
 use std::collections::{BTreeSet, VecDeque};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::thread;
 use std::time::Duration;
@@ -141,6 +142,8 @@ pub enum Event {
     },
     /// Messages were removed on the server.
     Removed(Vec<u32>),
+    /// A background thread stopped because of a bug. The GUI can start a new worker.
+    Crashed(String),
     /// Whether live updates (IDLE) are running, so the GUI can stop polling.
     IdleState(bool),
     Error(String),
@@ -232,10 +235,58 @@ fn spawn_with_reader(
     let reads = reader.map(|reader| {
         let (read_tx, read_rx) = channel();
         let emit = emit.clone();
-        thread::spawn(move || read_loop(reader, read_rx, emit));
+        thread::spawn(move || {
+            let crash = emit.clone();
+            let outcome = catch_unwind(AssertUnwindSafe(move || read_loop(reader, read_rx, emit)));
+            if let Err(payload) = outcome {
+                crash.send(Event::Crashed(format!(
+                    "The cache reader stopped: {}",
+                    panic_message(&payload)
+                )));
+            }
+        });
         read_tx
     });
+    let crash = emit.clone();
     thread::spawn(move || {
+        // A panic is caught here, so the GUI can offer a restart instead of going quiet.
+        let outcome = catch_unwind(AssertUnwindSafe(move || {
+            run_worker(connect, emit, startup, keepalive, retry_base, store, cmd_rx)
+        }));
+        if let Err(payload) = outcome {
+            crash.send(Event::Crashed(format!(
+                "The background worker stopped: {}",
+                panic_message(&payload)
+            )));
+        }
+    });
+    Link {
+        commands: cmd_tx,
+        events: ev_rx,
+        reads,
+    }
+}
+
+/// The text of a panic, for the user.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "an unexpected error".into())
+}
+
+/// Connects, then runs the worker until the GUI goes away.
+fn run_worker(
+    connect: Connector,
+    emit: Emitter,
+    startup: Vec<Event>,
+    keepalive: Duration,
+    retry_base: Duration,
+    store: Option<Store>,
+    cmd_rx: Receiver<Command>,
+) {
+    {
         let mut connect = connect;
         match connect() {
             Ok(source) => {
@@ -256,11 +307,6 @@ fn spawn_with_reader(
             }
             Err(e) => emit.send(Event::ConnectFailed(e)),
         }
-    });
-    Link {
-        commands: cmd_tx,
-        events: ev_rx,
-        reads,
     }
 }
 
@@ -1874,6 +1920,22 @@ mod tests {
     }
 
     #[test]
+    fn a_panicking_worker_reports_a_crash() {
+        let link = spawn(
+            egui::Context::default(),
+            Box::new(|| panic!("boom")),
+            KEEPALIVE,
+            FAST,
+            None,
+            Vec::new(),
+        );
+        match next(&link) {
+            Event::Crashed(why) => assert!(why.contains("boom"), "{why}"),
+            _ => panic!("expected a crash report"),
+        }
+    }
+
+    #[test]
     fn the_list_reads_any_slice_of_the_cache() {
         let dir =
             std::env::temp_dir().join(format!("gmail-worker-page-test-{}", std::process::id()));
@@ -2102,6 +2164,7 @@ mod sync_tests {
             Event::Removed(_) => "Removed",
             Event::IdleState(_) => "IdleState",
             Event::Error(_) => "Error",
+            Event::Crashed(_) => "Crashed",
         }
     }
 
