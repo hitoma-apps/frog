@@ -25,7 +25,7 @@ use eframe::egui;
 use gmail_imap_proto::auth::AuthCheck;
 use gmail_imap_proto::labels::{LabelAction, SystemLabel};
 use gmail_imap_proto::linkcheck::{self, LinkInfo};
-use gmail_imap_proto::links::{gmail_original_url, gmail_thread_url};
+use gmail_imap_proto::links::gmail_thread_url;
 use gmail_imap_proto::render_plaintext;
 use gmail_imap_proto::settings::{self, CHECK_INTERVAL_RANGE, PAGE_SIZE_RANGE, Settings};
 
@@ -408,6 +408,8 @@ struct App {
     checked: BTreeSet<u64>,
     /// The open conversation, by thread ID.
     open_thread: Option<u64>,
+    /// The message whose original is open in the dialog, by UID.
+    original: Option<u32>,
     /// The messages of the open conversation, by UID. Bodies arrive separately.
     thread_msgs: BTreeMap<u32, Message>,
     /// The conversation was just opened, so its first load marks it read. Later loads don't,
@@ -479,6 +481,7 @@ impl App {
             checked: BTreeSet::new(),
             open_thread: None,
             thread_msgs: BTreeMap::new(),
+            original: None,
             mark_read_on_open: false,
             label_input: String::new(),
             log: Vec::new(),
@@ -896,22 +899,6 @@ impl App {
                     &mut self.settings.notifications,
                     "Show desktop notifications for new mail",
                 );
-                ui.add_space(8.0);
-                ui.label(
-                    "Gmail session key, for \"View original\" (the ik= value from a Gmail URL):",
-                );
-                let mut key = self.settings.gmail_session_key.clone().unwrap_or_default();
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut key)
-                            .hint_text("optional")
-                            .desired_width(240.0),
-                    )
-                    .changed()
-                {
-                    let key = key.trim();
-                    self.settings.gmail_session_key = (!key.is_empty()).then(|| key.to_string());
-                }
                 ui.weak("The page size applies the next time the mailbox loads.");
                 ui.add_space(8.0);
                 if let Some(email) = self.settings.email.clone()
@@ -1578,7 +1565,7 @@ impl App {
         }
 
         let newest = thread.first().copied();
-        let session_key = self.settings.gmail_session_key.clone();
+        let mut open_original: Option<u32> = None;
         let mut pending: Option<LinkInfo> = None;
         egui::ScrollArea::vertical()
             .id_salt("reader")
@@ -1616,11 +1603,7 @@ impl App {
                                                     m.msgid, m.msgid
                                                 ));
                                                 if ui.small_button("View original").clicked() {
-                                                    let url = gmail_original_url(
-                                                        m.msgid,
-                                                        session_key.as_deref(),
-                                                    );
-                                                    ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                                                    open_original = Some(uid);
                                                 }
                                             });
                                             auth_line(ui, &m.auth);
@@ -1681,6 +1664,82 @@ impl App {
             });
         if pending.is_some() {
             self.pending_link = pending;
+        }
+        if let Some(uid) = open_original {
+            self.original = Some(uid);
+            self.request_body(uid);
+        }
+    }
+
+    /// The original message, shown as Gmail's "Show original" shows it: a summary, the
+    /// authentication checks, then the raw source. The source is read in full from the cache
+    /// or the server, and shown up to a limit, since a very large message is slow to draw.
+    fn original_window(&mut self, ctx: &egui::Context) {
+        const SHOWN_CHARS: usize = 200_000;
+        let Some(uid) = self.original else {
+            return;
+        };
+        let mut open = true;
+        let mut copy: Option<String> = None;
+        egui::Window::new("Original message")
+            .default_size([760.0, 600.0])
+            .resizable(true)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                let Some(m) = self.thread_msgs.get(&uid) else {
+                    ui.label("This message is no longer in the list.");
+                    return;
+                };
+                egui::Grid::new("original_summary")
+                    .num_columns(2)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for (name, value) in gmail_imap_proto::original::summary(&m.headers) {
+                            ui.strong(name);
+                            ui.label(value);
+                            ui.end_row();
+                        }
+                        for check in &m.auth {
+                            ui.strong(check.method.to_uppercase());
+                            ui.label(format!("{} — {}", check.result, check.detail));
+                            ui.end_row();
+                        }
+                    });
+                ui.separator();
+                match &m.body {
+                    Some(raw) => {
+                        let text = String::from_utf8_lossy(raw).into_owned();
+                        if ui.button("Copy to clipboard").clicked() {
+                            copy = Some(text.clone());
+                        }
+                        let total = text.chars().count();
+                        let shown: String = text.chars().take(SHOWN_CHARS).collect();
+                        if total > SHOWN_CHARS {
+                            ui.weak(format!(
+                                "Showing the first {SHOWN_CHARS} of {total} characters. Copy has all of it."
+                            ));
+                        }
+                        egui::ScrollArea::both()
+                            .id_salt("original_source")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(shown).monospace())
+                                        .wrap_mode(egui::TextWrapMode::Extend),
+                                );
+                            });
+                    }
+                    None => {
+                        ui.spinner();
+                        ui.label("Loading the message…");
+                    }
+                }
+            });
+        if let Some(text) = copy {
+            ctx.copy_text(text);
+        }
+        if !open {
+            self.original = None;
         }
     }
 
@@ -1841,6 +1900,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.link_confirmation(&ctx);
         self.settings_window(&ctx);
+        self.original_window(&ctx);
         self.log_window(&ctx);
     }
 }

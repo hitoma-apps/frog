@@ -6,6 +6,7 @@ pub mod imap;
 pub mod labels;
 pub mod linkcheck;
 pub mod links;
+pub mod original;
 pub mod render;
 pub mod response;
 pub mod settings;

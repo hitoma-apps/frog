@@ -30,8 +30,6 @@ pub struct Settings {
     pub notifications: bool,
     /// Raw label names pinned to the top of the sidebar, in the order they were added.
     pub favorite_labels: Vec<String>,
-    /// Gmail's session key (the `ik` value in a Gmail URL), used by "View original". Optional.
-    pub gmail_session_key: Option<String>,
 }
 
 impl Default for Settings {
@@ -43,7 +41,6 @@ impl Default for Settings {
             page_size: 500,
             notifications: true,
             favorite_labels: Vec::new(),
-            gmail_session_key: None,
         }
     }
 }
@@ -113,7 +110,6 @@ mod tests {
             check_interval_secs: 120,
             page_size: 200,
             notifications: false,
-            gmail_session_key: Some("abc123".into()),
             favorite_labels: vec!["\\Starred".into(), "Work".into()],
         };
         s.save_to(&path).unwrap();
