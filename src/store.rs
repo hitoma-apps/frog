@@ -177,6 +177,44 @@ pub fn account_cache_path(email: &str) -> Option<PathBuf> {
     )
 }
 
+/// Creates the cache's folder and file so only the owner can read them. The cache holds mail
+/// bodies, so other users on the computer must not be able to open it.
+fn prepare_private_file(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Limits an existing cache file and its journal files to the owner.
+fn restrict_cache_files(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["", "-wal", "-shm"] {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            let file = PathBuf::from(name);
+            if file.exists() {
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))?;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 /// The sent time (Unix seconds) from a header block's Date line, or 0 if there isn't one.
 pub fn sent_timestamp(headers: &[u8]) -> i64 {
     mail_parser::MessageParser::default()
@@ -510,10 +548,9 @@ fn to_i64(v: u64) -> Result<i64> {
 impl Store {
     /// Opens or creates the cache file at `path` with the default body cap.
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        prepare_private_file(path)?;
         let conn = Connection::open(path)?;
+        restrict_cache_files(path)?;
         // A cache from an older version is copied before any migration rewrites it.
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version > 0 && version < SCHEMA_VERSION {
@@ -2553,5 +2590,24 @@ mod bulk_timing {
         let stale: Vec<u32> = (1..=1000).collect();
         s.remove_uids(&stale).unwrap();
         println!("remove 1000 stale uids: {:?}", t.elapsed());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod permission_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn the_cache_file_and_its_folder_are_owner_only() {
+        let dir = std::env::temp_dir().join(format!("gmail-perm-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("accounts").join("me@example.com.sqlite");
+        let store = Store::open(&path).unwrap();
+        drop(store);
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

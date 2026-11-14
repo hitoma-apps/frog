@@ -79,6 +79,11 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long any single read or write may stall before the connection is treated as dead.
 pub const IO_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Longest line the server may send. Real responses are far shorter.
+pub const MAX_LINE: usize = 8 << 20;
+/// Largest literal (such as a message body) the server may announce. Gmail caps messages at 50 MB.
+pub const MAX_LITERAL: usize = 64 << 20;
+
 pub fn connect_tls(
     host: &str,
     port: u16,
@@ -172,11 +177,24 @@ impl<S: Read + Write> ImapConn<S> {
     /// read so far are kept, and the next call continues the same line.
     fn read_line(&mut self) -> Result<Vec<u8>> {
         loop {
-            let n = self.reader.read_until(b'\n', &mut self.partial)?;
-            if n == 0 {
+            // Read in pieces, so the line can be capped as it grows.
+            let buf = self.reader.fill_buf()?;
+            if buf.is_empty() {
                 return Err(ImapError::Closed);
             }
-            if self.partial.ends_with(b"\n") {
+            let (used, complete) = match buf.iter().position(|&b| b == b'\n') {
+                Some(i) => (i + 1, true),
+                None => (buf.len(), false),
+            };
+            self.partial.extend_from_slice(&buf[..used]);
+            self.reader.consume(used);
+            if self.partial.len() > MAX_LINE {
+                self.partial.clear();
+                return Err(ImapError::Protocol(
+                    "the server sent a line that is too long".into(),
+                ));
+            }
+            if complete {
                 return Ok(std::mem::take(&mut self.partial));
             }
         }
@@ -203,6 +221,11 @@ impl<S: Read + Write> ImapConn<S> {
             // A line ending in `{n}` announces a literal of n bytes. The rest of
             // the logical response follows the literal on the next line.
             while let Some(n) = literal_len(&item) {
+                if n > MAX_LITERAL {
+                    return Err(ImapError::Protocol(format!(
+                        "the server announced a {n}-byte literal, which is too large"
+                    )));
+                }
                 let start = item.len();
                 item.resize(start + n, 0);
                 self.reader.read_exact(&mut item[start..])?;
@@ -742,5 +765,46 @@ mod list_tests {
     #[test]
     fn non_list_lines_are_ignored() {
         assert!(parse_list_line("* 5 EXISTS").is_none());
+    }
+}
+
+#[cfg(test)]
+mod size_limit_tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    /// Serves one greeting, reads the client's command, then sends `reply`.
+    fn one_reply(reply: Vec<u8>) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let _ = s.write_all(b"* OK ready\r\n");
+            let mut reader = BufReader::new(s.try_clone().unwrap());
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            let _ = s.write_all(&reply);
+        });
+        (addr, handle)
+    }
+
+    #[test]
+    fn an_oversized_literal_is_refused_without_allocating_it() {
+        let (addr, server) = one_reply(b"* 1 FETCH (BODY[] {99999999999}\r\n".to_vec());
+        let mut conn = ImapConn::new(TcpStream::connect(addr).unwrap()).unwrap();
+        let err = conn.command("FETCH 1 BODY[]").unwrap_err();
+        assert!(matches!(err, ImapError::Protocol(_)), "{err:?}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn an_endless_line_is_refused() {
+        let mut reply = b"* ".to_vec();
+        reply.resize(MAX_LINE + 16, b'a');
+        let (addr, server) = one_reply(reply);
+        let mut conn = ImapConn::new(TcpStream::connect(addr).unwrap()).unwrap();
+        let err = conn.command("NOOP").unwrap_err();
+        assert!(matches!(err, ImapError::Protocol(_)), "{err:?}");
+        server.join().unwrap();
     }
 }
