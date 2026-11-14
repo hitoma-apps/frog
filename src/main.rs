@@ -1062,17 +1062,6 @@ impl App {
         let selected = self.filter.as_deref() == key;
         let mut toggle = false;
         ui.horizontal(|ui| {
-            if key.is_some() {
-                let star = if is_fav { "★" } else { "☆" };
-                let hover = if is_fav {
-                    "Unpin from favorites"
-                } else {
-                    "Pin to favorites"
-                };
-                if ui.small_button(star).on_hover_text(hover).clicked() {
-                    toggle = true;
-                }
-            }
             // Truncate to the space the sidebar has, so a long name can't stop it shrinking.
             let width = ui.available_width().max(40.0);
             let height = ui.spacing().interact_size.y;
@@ -1101,6 +1090,20 @@ impl App {
                 .on_hover_text(hover);
             if response.clicked() {
                 self.set_label_filter(key.map(str::to_owned));
+            }
+            // Right-click toggles the favourite. All Mail has no menu, since it can't be one.
+            if key.is_some() {
+                response.context_menu(|ui| {
+                    let text = if is_fav {
+                        "Remove from favorites"
+                    } else {
+                        "Add to favorites"
+                    };
+                    if ui.button(text).clicked() {
+                        toggle = true;
+                        ui.close();
+                    }
+                });
             }
         });
         if toggle && let Some(k) = key {
