@@ -30,7 +30,13 @@ pub struct Settings {
     pub notifications: bool,
     /// Raw label names pinned to the top of the sidebar, in the order they were added.
     pub favorite_labels: Vec<String>,
+    /// Searches saved in the sidebar, in the order they were saved.
+    #[serde(default)]
+    pub saved_searches: Vec<String>,
 }
+
+/// Most searches kept in the sidebar.
+pub const MAX_SAVED_SEARCHES: usize = 10;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -41,6 +47,7 @@ impl Default for Settings {
             page_size: 500,
             notifications: true,
             favorite_labels: Vec::new(),
+            saved_searches: Vec::new(),
         }
     }
 }
@@ -54,7 +61,29 @@ impl Settings {
         self.page_size = self
             .page_size
             .clamp(*PAGE_SIZE_RANGE.start(), *PAGE_SIZE_RANGE.end());
+        // A hand-edited file can't keep more searches than the sidebar shows, or repeats.
+        let mut kept: Vec<String> = Vec::new();
+        for search in self.saved_searches.drain(..) {
+            if !search.trim().is_empty() && !kept.contains(&search) {
+                kept.push(search);
+            }
+        }
+        kept.truncate(MAX_SAVED_SEARCHES);
+        self.saved_searches = kept;
         self
+    }
+
+    /// Saves a search. Returns `false` if it's blank, already saved, or the list is full.
+    pub fn save_search(&mut self, text: &str) -> bool {
+        let text = text.trim();
+        if text.is_empty()
+            || self.saved_searches.len() >= MAX_SAVED_SEARCHES
+            || self.saved_searches.iter().any(|s| s == text)
+        {
+            return false;
+        }
+        self.saved_searches.push(text.to_string());
+        true
     }
 
     /// Reads settings from `path`. A missing or unreadable file gives the defaults.
@@ -111,6 +140,7 @@ mod tests {
             page_size: 200,
             notifications: false,
             favorite_labels: vec!["\\Starred".into(), "Work".into()],
+            saved_searches: Vec::new(),
         };
         s.save_to(&path).unwrap();
         assert_eq!(Settings::load_from(&path), s);
@@ -142,5 +172,33 @@ mod tests {
         let s = Settings::load_from(&path);
         assert_eq!(s.page_size, 300);
         assert_eq!(s.check_interval_secs, 60);
+    }
+
+    #[test]
+    fn saved_searches_are_unique_and_capped_at_ten() {
+        let mut s = Settings::default();
+        assert!(s.save_search("  invoice  "));
+        assert!(!s.save_search("invoice"), "a repeat is refused");
+        assert!(!s.save_search("   "), "a blank search is refused");
+        for i in 0..MAX_SAVED_SEARCHES - 1 {
+            assert!(s.save_search(&format!("search {i}")));
+        }
+        assert_eq!(s.saved_searches.len(), MAX_SAVED_SEARCHES);
+        assert!(!s.save_search("one too many"), "the list is full");
+    }
+
+    #[test]
+    fn a_hand_edited_file_is_brought_back_into_range() {
+        let s = Settings {
+            saved_searches: (0..15)
+                .map(|i| format!("s{}", i % 12))
+                .chain(std::iter::once(String::new()))
+                .collect(),
+            ..Settings::default()
+        }
+        .clamped();
+        assert_eq!(s.saved_searches.len(), MAX_SAVED_SEARCHES);
+        let unique: std::collections::BTreeSet<_> = s.saved_searches.iter().collect();
+        assert_eq!(unique.len(), s.saved_searches.len());
     }
 }

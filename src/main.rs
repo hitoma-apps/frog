@@ -1110,7 +1110,15 @@ impl App {
             }
             if self.cached_count < self.mailbox_total {
                 ui.spinner();
-                ui.label("Caching headers…");
+                let fraction = self.cached_count as f32 / self.mailbox_total.max(1) as f32;
+                ui.add(
+                    egui::ProgressBar::new(fraction)
+                        .desired_width(200.0)
+                        .text(format!(
+                            "Caching headers {} of {}",
+                            self.cached_count, self.mailbox_total
+                        )),
+                );
             }
 
             // Right-aligned: the first button added sits at the far right.
@@ -1199,6 +1207,46 @@ impl App {
         }
     }
 
+    /// One saved search in the sidebar. Clicking it runs the search, and the list follows the
+    /// cache as it changes. Returns whether the user asked to remove it.
+    fn search_row(&mut self, ui: &mut egui::Ui, text: &str) -> bool {
+        let selected = self.search.trim() == text;
+        let width = ui.available_width().max(40.0);
+        let height = ui.spacing().interact_size.y;
+        let band = if selected {
+            ui.visuals().selection.bg_fill
+        } else {
+            egui::Color32::TRANSPARENT
+        };
+        let frame = egui::Frame::new()
+            .fill(band)
+            .corner_radius(4)
+            .show(ui, |ui| {
+                ui.set_min_size(egui::vec2(width, height));
+                ui.set_max_width(width);
+                ui.add(egui::Label::new(text).truncate());
+            });
+        let response = ui
+            .interact(
+                frame.response.rect,
+                ui.scope_id().with(("search", text)),
+                egui::Sense::click(),
+            )
+            .on_hover_text(format!("Search: {text}"));
+        if response.clicked() {
+            self.search = text.to_string();
+            self.change_list();
+        }
+        let mut remove = false;
+        response.context_menu(|ui| {
+            if ui.button("Remove saved search").clicked() {
+                remove = true;
+                ui.close();
+            }
+        });
+        remove
+    }
+
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         // Shared handles, so the rows can call `&mut self` methods without copying the labels.
         let counts = Arc::clone(&self.counts);
@@ -1224,6 +1272,22 @@ impl App {
                         Some(k) => counts.get(k).copied().unwrap_or((0, 0)),
                     };
                     self.label_row(ui, key, name, count);
+                }
+
+                if !self.settings.saved_searches.is_empty() {
+                    ui.separator();
+                    ui.heading("Searches");
+                    let searches = self.settings.saved_searches.clone();
+                    let mut remove: Option<usize> = None;
+                    for (i, text) in searches.iter().enumerate() {
+                        if self.search_row(ui, text) {
+                            remove = Some(i);
+                        }
+                    }
+                    if let Some(i) = remove {
+                        self.settings.saved_searches.remove(i);
+                        self.save_settings();
+                    }
                 }
 
                 // Labels from the server, plus any seen in the cache, with counts.
@@ -1337,6 +1401,16 @@ impl App {
             if search.changed() {
                 self.change_list();
             }
+            let text = self.search.trim().to_string();
+            let saveable = !text.is_empty()
+                && !self.settings.saved_searches.contains(&text)
+                && self.settings.saved_searches.len() < settings::MAX_SAVED_SEARCHES;
+            let save = ui
+                .add_enabled(saveable, egui::Button::new("Save search"))
+                .on_disabled_hover_text("Type a search that isn't saved yet. Up to 10 are kept.");
+            if save.clicked() && self.settings.save_search(&text) {
+                self.save_settings();
+            }
             ui.separator();
             ui.add(
                 egui::TextEdit::singleline(&mut self.label_input)
@@ -1373,7 +1447,10 @@ impl App {
         if self.window_filter.as_ref() != Some(&filter) {
             // A new list, or one that was reset: read its first rows.
             self.request_window(0, WINDOW_CHUNK);
-            ui.label("Loading…");
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Loading…");
+            });
             return;
         }
         if self.window_total == 0 {
@@ -1386,6 +1463,16 @@ impl App {
         }
 
         let row_height = ui.spacing().interact_size.y;
+        // How many threads the list holds, so a search's size is known at a glance.
+        let noun = if self.window_total == 1 {
+            "thread"
+        } else {
+            "threads"
+        };
+        ui.weak(match &filter {
+            ThreadFilter::Search(text) => format!("{} {noun} match \"{text}\"", self.window_total),
+            _ => format!("{} {noun}", self.window_total),
+        });
         let filter_label: Option<String> = match &filter {
             ThreadFilter::Label(label) => Some(label.clone()),
             _ => None,
