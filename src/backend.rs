@@ -63,6 +63,8 @@ pub struct StructureInfo {
     pub uid: u32,
     pub attachment: bool,
     pub received: Option<i64>,
+    /// The message's size in bytes, if the source reported it.
+    pub size: Option<u64>,
 }
 
 /// Something the server told us while idle.
@@ -637,6 +639,7 @@ impl MailSource for MockSource {
                 uid,
                 attachment: false,
                 received: None,
+                size: Some(u64::from(uid) * 1_000),
             })
             .collect())
     }

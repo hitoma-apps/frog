@@ -182,7 +182,7 @@ impl<S: Read + Write + Send + SetReadTimeout> MailSource for LiveSession<S> {
         let mut out = Vec::with_capacity(uids.len());
         for raw in self
             .conn
-            .uid_fetch(uids, "UID BODYSTRUCTURE INTERNALDATE")
+            .uid_fetch(uids, "UID BODYSTRUCTURE INTERNALDATE RFC822.SIZE")
             .map_err(to_source_error)?
         {
             let f = parse_gmail_fetch(&raw).map_err(|e| SourceError::Failed(e.to_string()))?;
@@ -191,6 +191,7 @@ impl<S: Read + Write + Send + SetReadTimeout> MailSource for LiveSession<S> {
                     uid,
                     attachment,
                     received: f.internal_date,
+                    size: f.size,
                 });
             }
         }

@@ -25,7 +25,7 @@ pub const DEFAULT_BODY_CAP: u64 = 1 << 30;
 /// zstd level. Mail is text, so a low level compresses well and stays fast.
 const ZSTD_LEVEL: i32 = 3;
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -215,6 +215,28 @@ fn restrict_cache_files(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A message in the storage view: one of the largest cached messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LargeMessage {
+    pub uid: u32,
+    pub thrid: u64,
+    pub from: String,
+    pub subject: String,
+    pub received: Option<i64>,
+    pub size: u64,
+    pub attachment: bool,
+}
+
+/// The storage view: the largest cached messages, and how many messages have a known size.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StorageView {
+    pub rows: Vec<LargeMessage>,
+    /// Messages whose size is known.
+    pub sized: usize,
+    /// Cached messages with a UID, whether or not their size is known.
+    pub total: usize,
+}
+
 /// The sent time (Unix seconds) from a header block's Date line, or 0 if there isn't one.
 pub fn sent_timestamp(headers: &[u8]) -> i64 {
     mail_parser::MessageParser::default()
@@ -233,6 +255,19 @@ pub struct CheckReport {
 
 /// Adds the received-time column (schema v12), and renames the thread sort key from the sent
 /// time to a time that's received when known. Does nothing if that's already done.
+fn upgrade_size(tx: &Transaction) -> Result<()> {
+    let has_size: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'size'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_size == 0 {
+        tx.execute_batch("ALTER TABLE messages ADD COLUMN size INTEGER;")?;
+    }
+    tx.execute_batch("CREATE INDEX IF NOT EXISTS messages_size ON messages(size);")?;
+    Ok(())
+}
+
 fn upgrade_received(tx: &Transaction) -> Result<()> {
     let has_received: i64 = tx.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'received'",
@@ -989,6 +1024,10 @@ impl Store {
             upgrade_threads(&tx)?;
             rebuild_derived(&tx)?;
         }
+        if version < 13 {
+            // Message sizes, for the storage view. They don't affect thread summaries.
+            upgrade_size(&tx)?;
+        }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
@@ -1461,10 +1500,10 @@ impl Store {
 
     /// Records each message's attachment flag and received time, by UID, and refreshes their
     /// threads. A `None` time keeps the one the cache has.
-    pub fn set_structures(&mut self, rows: &[(u32, bool, Option<i64>)]) -> Result<()> {
+    pub fn set_structures(&mut self, rows: &[(u32, bool, Option<i64>, Option<u64>)]) -> Result<()> {
         let tx = self.conn.transaction()?;
         let mut affected: BTreeSet<u64> = BTreeSet::new();
-        for &(uid, has, received) in rows {
+        for &(uid, has, received, size) in rows {
             let thread: Option<i64> = tx
                 .query_row(
                     "SELECT thrid FROM messages WHERE uid = ?1",
@@ -1474,8 +1513,8 @@ impl Store {
                 .optional()?;
             affected.extend(thread.map(|t| t as u64));
             tx.execute(
-                "UPDATE messages SET attachment = ?2, received = COALESCE(?3, received) WHERE uid = ?1",
-                params![uid, has, received],
+                "UPDATE messages SET attachment = ?2, received = COALESCE(?3, received), size = COALESCE(?4, size) WHERE uid = ?1",
+                params![uid, has, received, size.map(|s| s as i64)],
             )?;
         }
         refresh_threads(&tx, &affected)?;
@@ -1486,12 +1525,50 @@ impl Store {
     /// UIDs of cached messages whose attachments haven't been looked at yet.
     pub fn uids_missing_attachment_info(&self) -> Result<Vec<u32>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT uid FROM messages WHERE uid IS NOT NULL AND (attachment IS NULL OR received IS NULL)",
+            "SELECT uid FROM messages WHERE uid IS NOT NULL AND (attachment IS NULL OR received IS NULL OR size IS NULL)",
         )?;
         let uids = stmt
             .query_map([], |r| r.get::<_, u32>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(uids)
+    }
+
+    /// The largest cached messages, biggest first, at most `limit` of them.
+    pub fn storage_view(&self, limit: usize) -> Result<StorageView> {
+        let sized: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE size IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        let total: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE uid IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT uid, thrid, from_addr, subject, received, size, attachment FROM messages
+             WHERE uid IS NOT NULL AND size IS NOT NULL
+             ORDER BY size DESC, msgid
+             LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| {
+                Ok(LargeMessage {
+                    uid: r.get(0)?,
+                    thrid: r.get::<_, i64>(1)? as u64,
+                    from: r.get(2)?,
+                    subject: r.get(3)?,
+                    received: r.get(4)?,
+                    size: r.get::<_, i64>(5)? as u64,
+                    attachment: r.get::<_, Option<bool>>(6)?.unwrap_or(false),
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(StorageView {
+            rows,
+            sized: sized as usize,
+            total: total as usize,
+        })
     }
 
     /// The UIDs that have a cached header, as a set.
@@ -1719,6 +1796,29 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_view_lists_the_largest_sized_messages_first() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        s.upsert_messages(&[
+            msg(1, 1, &["Work"]),
+            msg(2, 2, &["Work"]),
+            msg(3, 3, &["Work"]),
+        ])
+        .unwrap();
+        s.set_structures(&[
+            (1, false, None, Some(100)),
+            (2, true, None, Some(9_000)),
+            (3, false, None, None),
+        ])
+        .unwrap();
+        let v = s.storage_view(10).unwrap();
+        assert_eq!((v.sized, v.total), (2, 3));
+        let uids: Vec<u32> = v.rows.iter().map(|r| r.uid).collect();
+        assert_eq!(uids, vec![2, 1]);
+        assert!(v.rows[0].attachment);
+        assert_eq!(s.storage_view(1).unwrap().rows.len(), 1);
+    }
 
     fn msg(msgid: u64, uid: u32, labels: &[&str]) -> CachedMessage {
         CachedMessage {
@@ -2027,8 +2127,11 @@ mod tests {
         missing.sort();
         assert_eq!(missing, vec![1, 2]);
 
-        s.set_structures(&[(2, true, Some(1_000)), (1, false, Some(2_000))])
-            .unwrap();
+        s.set_structures(&[
+            (2, true, Some(1_000), Some(10)),
+            (1, false, Some(2_000), Some(20)),
+        ])
+        .unwrap();
         assert!(s.uids_missing_attachment_info().unwrap().is_empty());
         assert!(s.thread_page(&ThreadFilter::All, 0, 5).unwrap()[0].attachments);
         assert!(s.check().unwrap().logical.is_empty());

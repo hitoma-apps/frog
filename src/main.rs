@@ -30,9 +30,12 @@ use gmail_imap_proto::render_plaintext;
 use gmail_imap_proto::settings::{self, CHECK_INTERVAL_RANGE, PAGE_SIZE_RANGE, Settings};
 
 use backend::Message;
-use gmail_imap_proto::store::ThreadFilter;
+use gmail_imap_proto::store::{StorageView, ThreadFilter};
 use reader::{Block, Segment};
 use worker::{Command, Event, Link, ThreadEntry};
+
+/// How many of the largest messages the storage view lists.
+const STORAGE_ROWS: usize = 500;
 
 fn main() -> eframe::Result {
     let creds = match (
@@ -389,6 +392,12 @@ struct App {
     settings_open: bool,
     /// The IMAP command log is open in its own window.
     log_open: bool,
+    /// The largest cached messages, once the storage view has asked for them.
+    storage: Option<Arc<StorageView>>,
+    /// Whether the list shows the storage view instead of threads.
+    storage_open: bool,
+    /// When the storage view last asked the cache, so it refreshes while sizes arrive.
+    storage_asked: Instant,
     /// Whether the sign-in is the automatic one at startup, so the window can say so.
     auto_signin: bool,
     /// Whether the window layout has changed since it was last saved.
@@ -510,6 +519,9 @@ impl App {
             log_open: false,
             account: None,
             credentials: None,
+            storage: None,
+            storage_open: false,
+            storage_asked: Instant::now(),
             auto_signin: false,
             layout_dirty: false,
             layout_saved: Instant::now(),
@@ -722,6 +734,7 @@ impl App {
                     }
                 }
             }
+            Event::Largest(view) => self.storage = Some(Arc::new(view)),
             Event::Window {
                 filter,
                 start,
@@ -783,6 +796,7 @@ impl App {
     /// Drops the list rows, so the next list is read from the cache. The row numbers
     /// mean something else in the next list, so the shift-click anchor goes too.
     fn change_list(&mut self) {
+        self.storage_open = false;
         self.window_filter = None;
         self.window_rows.clear();
         self.window_total = 0;
@@ -848,6 +862,80 @@ impl App {
     }
 
     /// Opens a conversation. Its messages are read from the cache, and their bodies follow.
+    /// Opens the storage view: the largest cached messages, biggest first.
+    fn open_storage(&mut self) {
+        self.storage_open = true;
+        self.storage_asked = Instant::now();
+        self.send(Command::Largest {
+            limit: STORAGE_ROWS,
+        });
+    }
+
+    /// While sizes are still being backfilled, asks the cache again every few seconds.
+    fn refresh_storage(&mut self, ctx: &egui::Context) {
+        let complete = self.storage.as_ref().is_some_and(|v| v.sized >= v.total);
+        if !self.storage_open || complete {
+            return;
+        }
+        if self.storage_asked.elapsed() >= Duration::from_secs(3) {
+            self.storage_asked = Instant::now();
+            self.send(Command::Largest {
+                limit: STORAGE_ROWS,
+            });
+        }
+        ctx.request_repaint_after(Duration::from_secs(3));
+    }
+
+    /// The storage view. Each row shows a message's size and opens its thread.
+    fn storage_list(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Largest messages");
+            if ui.button("Refresh").clicked() {
+                self.storage_asked = Instant::now();
+                self.send(Command::Largest {
+                    limit: STORAGE_ROWS,
+                });
+            }
+        });
+        let Some(view) = self.storage.clone() else {
+            ui.weak("Loading…");
+            return;
+        };
+        ui.weak(format!(
+            "Sizes are known for {} of {} messages. The list fills in as the cache is checked.",
+            view.sized, view.total
+        ));
+        ui.separator();
+        let row_height = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
+        egui::ScrollArea::vertical()
+            .id_salt("storage")
+            .auto_shrink([false, false])
+            .show_rows(ui, row_height, view.rows.len(), |ui, range| {
+                for row in &view.rows[range] {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([80.0, row_height], egui::Label::new(fmt_bytes(row.size)));
+                        let subject = if row.subject.is_empty() {
+                            "(no subject)"
+                        } else {
+                            row.subject.as_str()
+                        };
+                        if ui
+                            .selectable_label(false, format!("{} — {}", row.from, subject))
+                            .clicked()
+                        {
+                            self.open_conversation(row.thrid);
+                        }
+                        if row.attachment {
+                            ui.weak("attachment");
+                        }
+                        if let Some(t) = row.received {
+                            ui.weak(format_time(t));
+                        }
+                    });
+                }
+            });
+    }
+
     fn open_conversation(&mut self, thrid: u64) {
         self.open_thread = Some(thrid);
         self.mark_read_on_open = true;
@@ -1316,6 +1404,9 @@ impl App {
                         Some(k) => counts.get(k).copied().unwrap_or((0, 0)),
                     };
                     self.label_row(ui, key, name, count);
+                }
+                if ui.selectable_label(self.storage_open, "Storage").clicked() {
+                    self.open_storage();
                 }
 
                 if !self.settings.saved_searches.is_empty() {
@@ -2161,6 +2252,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_events();
         self.remember_window_position(ui.ctx());
+        self.refresh_storage(ui.ctx());
 
         if !self.connected {
             egui::CentralPanel::default().show(ui, |ui| {
@@ -2228,7 +2320,13 @@ impl eframe::App for App {
             let list = egui::Panel::top("list")
                 .resizable(true)
                 .default_size(self.settings.window.list_height)
-                .show(ui, |ui| self.message_list(ui));
+                .show(ui, |ui| {
+                    if self.storage_open {
+                        self.storage_list(ui);
+                    } else {
+                        self.message_list(ui);
+                    }
+                });
             let height = list.response.rect.height().round();
             self.remember(|w| w.list_height = height);
             egui::CentralPanel::default().show(ui, |ui| self.reader(ui));

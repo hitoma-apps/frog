@@ -272,6 +272,8 @@ pub struct GmailFetch<'a> {
     pub structure: Option<Value<'a>>,
     /// `INTERNALDATE`: when the server received the message, as a Unix time, if requested.
     pub internal_date: Option<i64>,
+    /// `RFC822.SIZE`: the message's size in bytes, if requested.
+    pub size: Option<u64>,
 }
 
 impl GmailFetch<'_> {
@@ -305,6 +307,7 @@ pub fn parse_gmail_fetch(buf: &[u8]) -> Result<GmailFetch<'_>, ParseError> {
             "MODSEQ" => out.modseq = modseq_from(&value),
             "BODYSTRUCTURE" => out.structure = Some(value),
             "INTERNALDATE" => out.internal_date = internal_date_from(&value),
+            "RFC822.SIZE" => out.size = number_as(&value),
             "BODY[]" => {
                 if let Value::Bytes(b) = value {
                     out.body = Some(b);

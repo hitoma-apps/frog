@@ -69,6 +69,8 @@ pub enum Command {
     },
     /// Reads every cached message of one thread.
     Thread { thrid: u64 },
+    /// Reads the largest cached messages, at most `limit` of them.
+    Largest { limit: usize },
 }
 
 /// A row of the thread list: a conversation, its counts, and its newest message.
@@ -135,6 +137,8 @@ pub enum Event {
         threads: Vec<ThreadEntry>,
         total: usize,
     },
+    /// The largest cached messages, and how many messages have a known size.
+    Largest(gmail_imap_proto::store::StorageView),
     /// Every cached message of one thread, newest first.
     Thread {
         thrid: u64,
@@ -537,7 +541,10 @@ impl Worker {
             }
             Command::SetSeen { thrids, seen } => self.op_set_seen(src, thrids, *seen),
             // Cache reads are answered in `dispatch`, before a connection is needed.
-            Command::Window { .. } | Command::Thread { .. } | Command::ThreadRange { .. } => Ok(()),
+            Command::Window { .. }
+            | Command::Thread { .. }
+            | Command::ThreadRange { .. }
+            | Command::Largest { .. } => Ok(()),
         }
     }
 
@@ -1026,9 +1033,9 @@ impl Worker {
         let batch: Vec<u32> = self.state.pending_structure.drain(..n).collect();
         match src.fetch_structures(&batch) {
             Ok(infos) => {
-                let rows: Vec<(u32, bool, Option<i64>)> = infos
+                let rows: Vec<(u32, bool, Option<i64>, Option<u64>)> = infos
                     .iter()
-                    .map(|i| (i.uid, i.attachment, i.received))
+                    .map(|i| (i.uid, i.attachment, i.received, i.size))
                     .collect();
                 if let Some(store) = self.store.as_mut()
                     && let Err(e) = store.set_structures(&rows)
@@ -1312,6 +1319,7 @@ fn answer_read(store: Option<&Store>, emit: &Emitter, cmd: &Command) {
             count,
         } => read_window(store, emit, filter, *start, *count),
         Command::Thread { thrid } => read_thread(store, emit, *thrid),
+        Command::Largest { limit } => read_largest(store, emit, *limit),
         Command::ThreadRange {
             filter,
             start,
@@ -1326,8 +1334,24 @@ fn answer_read(store: Option<&Store>, emit: &Emitter, cmd: &Command) {
 pub fn is_cache_read(cmd: &Command) -> bool {
     matches!(
         cmd,
-        Command::Window { .. } | Command::Thread { .. } | Command::ThreadRange { .. }
+        Command::Window { .. }
+            | Command::Thread { .. }
+            | Command::ThreadRange { .. }
+            | Command::Largest { .. }
     )
+}
+
+/// Answers the storage view with the largest cached messages.
+fn read_largest(store: Option<&Store>, emit: &Emitter, limit: usize) {
+    use gmail_imap_proto::store::StorageView;
+    let view = match store {
+        Some(store) => store.storage_view(limit),
+        None => Ok(StorageView::default()),
+    };
+    match view {
+        Ok(view) => emit.send(Event::Largest(view)),
+        Err(e) => emit.send(Event::Error(format!("cache read failed: {e}"))),
+    }
 }
 
 /// The reader thread: answers cache reads from its own connection, so they never wait for
@@ -2158,6 +2182,7 @@ mod sync_tests {
             Event::LoadFinished => "LoadFinished",
             Event::CheckFinished => "CheckFinished",
             Event::Window { .. } => "Window",
+            Event::Largest(_) => "Largest",
             Event::ThreadRange { .. } => "ThreadRange",
             Event::Thread { .. } => "Thread",
             Event::NewArrivals(_) => "NewArrivals",
