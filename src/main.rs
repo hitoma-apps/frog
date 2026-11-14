@@ -340,6 +340,8 @@ struct App {
     window_total: usize,
     /// The list the window rows belong to. `None` until the first answer for a list.
     window_filter: Option<ThreadFilter>,
+    /// The row of the last checkbox click, for a shift-click to extend from.
+    check_anchor: Option<usize>,
     /// The last window asked for, so the same one isn't asked for twice.
     sent_window: Option<(ThreadFilter, usize, usize)>,
     /// Something on screen has changed. Refreshes are throttled.
@@ -424,6 +426,7 @@ impl App {
             window_total: 0,
             window_filter: None,
             sent_window: None,
+            check_anchor: None,
             view_stale: false,
             view_asked: Instant::now(),
             loading: None,
@@ -583,6 +586,23 @@ impl App {
                 );
                 self.totals = (threads, unread);
             }
+            Event::ThreadRange {
+                filter,
+                thrids,
+                checked,
+                ..
+            } => {
+                // A range for a list that has since changed is dropped.
+                if filter == self.thread_filter() {
+                    for thrid in thrids {
+                        if checked {
+                            self.checked.insert(thrid);
+                        } else {
+                            self.checked.remove(&thrid);
+                        }
+                    }
+                }
+            }
             Event::Window {
                 filter,
                 start,
@@ -636,12 +656,25 @@ impl App {
         }
     }
 
-    /// Drops the list rows, so the next list is read from the cache.
+    /// Drops the list rows, so the next list is read from the cache. The row numbers
+    /// mean something else in the next list, so the shift-click anchor goes too.
     fn change_list(&mut self) {
         self.window_filter = None;
         self.window_rows.clear();
         self.window_total = 0;
         self.sent_window = None;
+        self.check_anchor = None;
+    }
+
+    /// Checks or unchecks the threads in a range of the list, once the worker has them.
+    fn request_thread_range(&mut self, start: usize, count: usize, checked: bool) {
+        let filter = self.thread_filter();
+        self.send(Command::ThreadRange {
+            filter,
+            start,
+            count,
+            checked,
+        });
     }
 
     /// Shows the threads with one label, or All Mail for `None`. Clears the search.
@@ -1179,6 +1212,8 @@ impl App {
         let mut wanted: Option<(usize, usize)> = None;
         let mut clicked_label: Option<String> = None;
         let mut opened: Option<u64> = None;
+        // Checkbox clicks in this frame: row, the state it was set to, and whether shift was held.
+        let mut box_clicks: Vec<(usize, bool, bool)> = Vec::new();
         egui::ScrollArea::vertical()
             .id_salt("message_list")
             .show_rows(ui, row_height, total, |ui, range| {
@@ -1214,6 +1249,8 @@ impl App {
                             } else {
                                 self.checked.remove(&thrid);
                             }
+                            let shift = ui.input(|input| input.modifiers.shift);
+                            box_clicks.push((i, checked, shift));
                         }
                         let open = self.open_thread == Some(thrid);
                         // Every item has a fixed width, so the row can't grow frame to frame.
@@ -1288,6 +1325,17 @@ impl App {
                 }
             });
         self.window_rows = rows;
+
+        // A shift-click checks or unchecks every thread from the last plain click to this row.
+        for (row, state, shift) in box_clicks {
+            if let Some(anchor) = self.check_anchor
+                && shift
+            {
+                let (first, last) = (anchor.min(row), anchor.max(row));
+                self.request_thread_range(first, last - first + 1, state);
+            }
+            self.check_anchor = Some(row);
+        }
 
         if let Some(thrid) = opened {
             self.open_conversation(thrid);

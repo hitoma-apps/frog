@@ -53,6 +53,13 @@ pub enum Command {
     /// Marks every message in the given threads read or unread. The cache changes at once,
     /// and the server is told next, retrying until it confirms.
     SetSeen { thrids: Vec<u64>, seen: bool },
+    /// The IDs of the threads in a range of the list, to check or uncheck them all.
+    ThreadRange {
+        filter: ThreadFilter,
+        start: usize,
+        count: usize,
+        checked: bool,
+    },
     /// Reads one window of the thread list from the cache.
     Window {
         filter: ThreadFilter,
@@ -111,6 +118,12 @@ pub enum Event {
         labels: Vec<(String, usize, usize)>,
         threads: usize,
         unread: usize,
+    },
+    /// The threads in a range of the list, for a shift-click. `checked` is the state to apply.
+    ThreadRange {
+        filter: ThreadFilter,
+        thrids: Vec<u64>,
+        checked: bool,
     },
     /// One window of the thread list, starting at `start`, out of `total` threads.
     Window {
@@ -393,6 +406,15 @@ impl Worker {
                 self.op_thread(*thrid);
                 return;
             }
+            Command::ThreadRange {
+                filter,
+                start,
+                count,
+                checked,
+            } => {
+                self.op_thread_range(filter, *start, *count, *checked);
+                return;
+            }
             _ => {}
         }
         let mut retried = false;
@@ -437,7 +459,7 @@ impl Worker {
             }
             Command::SetSeen { thrids, seen } => self.op_set_seen(src, thrids, *seen),
             // Cache reads are answered in `dispatch`, before a connection is needed.
-            Command::Window { .. } | Command::Thread { .. } => Ok(()),
+            Command::Window { .. } | Command::Thread { .. } | Command::ThreadRange { .. } => Ok(()),
         }
     }
 
@@ -1074,6 +1096,26 @@ impl Worker {
         Ok(())
     }
 
+    /// Sends the thread IDs of a range of the list, read from the cache.
+    fn op_thread_range(&self, filter: &ThreadFilter, start: usize, count: usize, checked: bool) {
+        let thrids: Vec<u64> = match self.store.as_ref() {
+            Some(store) => match store.thread_page(filter, start, count) {
+                Ok(page) => page.into_iter().map(|t| t.thrid).collect(),
+                Err(e) => {
+                    self.emit
+                        .send(Event::Error(format!("cache read failed: {e}")));
+                    return;
+                }
+            },
+            None => Vec::new(),
+        };
+        self.emit.send(Event::ThreadRange {
+            filter: filter.clone(),
+            thrids,
+            checked,
+        });
+    }
+
     /// Sends one window of the thread list, read from the cache.
     fn op_window(&self, filter: &ThreadFilter, start: usize, count: usize) {
         let Some(store) = self.store.as_ref() else {
@@ -1559,6 +1601,35 @@ mod tests {
     }
 
     #[test]
+    fn a_range_of_threads_is_read_in_list_order() {
+        let link = mock_link();
+        assert!(matches!(next_significant(&link), Event::Connected));
+        link.commands.send(Command::Load { limit: 500 }).unwrap();
+        while !matches!(next_significant(&link), Event::LoadFinished) {}
+
+        let (list, _) = threads(&link);
+        link.commands
+            .send(Command::ThreadRange {
+                filter: ThreadFilter::All,
+                start: 0,
+                count: 3,
+                checked: true,
+            })
+            .unwrap();
+        loop {
+            if let Event::ThreadRange {
+                thrids, checked, ..
+            } = next(&link)
+            {
+                assert!(checked);
+                let expected: Vec<u64> = list.iter().take(3).map(|t| t.thrid).collect();
+                assert_eq!(thrids, expected);
+                break;
+            }
+        }
+    }
+
+    #[test]
     fn check_with_nothing_new_reports_no_arrivals() {
         let link = mock_link();
         assert!(matches!(next_significant(&link), Event::Connected));
@@ -1840,6 +1911,7 @@ mod sync_tests {
             Event::LoadFinished => "LoadFinished",
             Event::CheckFinished => "CheckFinished",
             Event::Window { .. } => "Window",
+            Event::ThreadRange { .. } => "ThreadRange",
             Event::Thread { .. } => "Thread",
             Event::NewArrivals(_) => "NewArrivals",
             Event::Progress { .. } => "Progress",
