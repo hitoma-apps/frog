@@ -1200,8 +1200,6 @@ impl App {
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Labels");
-        ui.separator();
         // Shared handles, so the rows can call `&mut self` methods without copying the labels.
         let counts = Arc::clone(&self.counts);
         let known = Arc::clone(&self.known_labels);
@@ -1219,7 +1217,7 @@ impl App {
                     ui.separator();
                 }
 
-                ui.weak("Mailboxes");
+                ui.heading("Mailboxes");
                 for (name, key) in MAILBOXES {
                     let count = match key {
                         None => self.totals,
@@ -1239,7 +1237,7 @@ impl App {
                 }
                 if !user.is_empty() {
                     ui.separator();
-                    ui.weak("Labels");
+                    ui.heading("Labels");
                     let tree = label_tree(user.keys());
                     self.label_tree(ui, &tree, &user, "");
                 }
