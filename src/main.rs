@@ -389,6 +389,8 @@ struct App {
     settings_open: bool,
     /// The IMAP command log is open in its own window.
     log_open: bool,
+    /// Whether the sign-in is the automatic one at startup, so the window can say so.
+    auto_signin: bool,
     /// Whether the window layout has changed since it was last saved.
     layout_dirty: bool,
     /// When the layout was last saved.
@@ -508,6 +510,7 @@ impl App {
             log_open: false,
             account: None,
             credentials: None,
+            auto_signin: false,
             layout_dirty: false,
             layout_saved: Instant::now(),
             crashed: None,
@@ -553,7 +556,9 @@ impl App {
             status: None,
         };
         // Environment variables take precedence over a remembered password.
+        let auto_signin = creds.is_none() && auto_login.is_some();
         if let Some((user, password)) = creds.or(auto_login) {
+            app.auto_signin = auto_signin;
             app.start_gmail(user, password);
         }
         app
@@ -1045,6 +1050,7 @@ impl App {
                 let user = self.login.email.trim().to_string();
                 let pass = self.login.password.clone();
                 self.remember_password(&user, &pass);
+                self.auto_signin = false;
                 self.start_gmail(user, pass);
             }
 
@@ -1052,7 +1058,12 @@ impl App {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("Connecting…");
+                    let text = if self.auto_signin {
+                        format!("Signing in automatically as {}…", self.login.email.trim())
+                    } else {
+                        "Connecting…".to_string()
+                    };
+                    ui.label(text);
                 });
             }
             if let Some(err) = &self.login.error {
@@ -2153,7 +2164,11 @@ impl eframe::App for App {
 
         if !self.connected {
             egui::CentralPanel::default().show(ui, |ui| {
-                ui.weak("Sign in to load your mail.");
+                ui.weak(if self.connecting {
+                    "Signing in…"
+                } else {
+                    "Sign in to load your mail."
+                });
             });
             let ctx = ui.ctx().clone();
             self.login_window(&ctx);
