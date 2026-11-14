@@ -1410,7 +1410,12 @@ impl App {
                     self.open_storage();
                 }
 
-                if !self.settings.saved_searches.is_empty() {
+                let active = self.search.trim().to_string();
+                let recent = self.settings.recent_searches.clone();
+                if !self.settings.saved_searches.is_empty()
+                    || !active.is_empty()
+                    || !recent.is_empty()
+                {
                     ui.separator();
                     ui.heading("Searches");
                     let searches = self.settings.saved_searches.clone();
@@ -1423,6 +1428,26 @@ impl App {
                     if let Some(i) = remove {
                         self.settings.saved_searches.remove(i);
                         self.save_settings();
+                    }
+                    // The search on screen, in small type under the saved ones.
+                    if !active.is_empty() {
+                        ui.small(format!("Showing: {active}"));
+                    }
+                    if !recent.is_empty() {
+                        egui::CollapsingHeader::new("Most recent")
+                            .id_salt("recent_searches")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                for text in &recent {
+                                    let selected = active == *text;
+                                    if ui.selectable_label(selected, text).clicked() {
+                                        self.search = text.clone();
+                                        self.settings.note_search(text);
+                                        self.save_settings();
+                                        self.change_list();
+                                    }
+                                }
+                            });
                     }
                 }
 
@@ -1536,6 +1561,12 @@ impl App {
             );
             if search.changed() {
                 self.change_list();
+            }
+            // Leaving the box, or pressing Enter in it, counts as running the search.
+            if search.lost_focus() {
+                let text = self.search.clone();
+                self.settings.note_search(&text);
+                self.save_settings();
             }
             let text = self.search.trim().to_string();
             let saveable = !text.is_empty()

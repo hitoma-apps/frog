@@ -35,6 +35,9 @@ pub struct Settings {
     /// Searches saved in the sidebar, in the order they were saved.
     #[serde(default)]
     pub saved_searches: Vec<String>,
+    /// The most recent searches, newest first, saved or not.
+    #[serde(default)]
+    pub recent_searches: Vec<String>,
     /// The main window's size and position, and the sidebar and list sizes, from last time.
     #[serde(default)]
     pub window: WindowLayout,
@@ -64,6 +67,8 @@ impl Default for WindowLayout {
 
 /// Most searches kept in the sidebar.
 pub const MAX_SAVED_SEARCHES: usize = 10;
+/// Most recent searches kept, whether or not they were saved.
+pub const MAX_RECENT_SEARCHES: usize = 5;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -76,6 +81,7 @@ impl Default for Settings {
             notifications: true,
             favorite_labels: Vec::new(),
             saved_searches: Vec::new(),
+            recent_searches: Vec::new(),
             window: WindowLayout::default(),
         }
     }
@@ -99,6 +105,14 @@ impl Settings {
         }
         kept.truncate(MAX_SAVED_SEARCHES);
         self.saved_searches = kept;
+        let mut recent: Vec<String> = Vec::new();
+        for search in self.recent_searches.drain(..) {
+            if !search.trim().is_empty() && !recent.contains(&search) {
+                recent.push(search);
+            }
+        }
+        recent.truncate(MAX_RECENT_SEARCHES);
+        self.recent_searches = recent;
         self.window.size = [
             self.window.size[0].max(480.0),
             self.window.size[1].max(320.0),
@@ -106,6 +120,18 @@ impl Settings {
         self.window.sidebar_width = self.window.sidebar_width.clamp(120.0, 600.0);
         self.window.list_height = self.window.list_height.clamp(80.0, 2000.0);
         self
+    }
+
+    /// Notes that a search was run, so it appears in the recent list. Running it again moves it
+    /// to the top.
+    pub fn note_search(&mut self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        self.recent_searches.retain(|s| s != text);
+        self.recent_searches.insert(0, text.to_string());
+        self.recent_searches.truncate(MAX_RECENT_SEARCHES);
     }
 
     /// Saves a search. Returns `false` if it's blank, already saved, or the list is full.
@@ -178,6 +204,7 @@ mod tests {
             notifications: false,
             favorite_labels: vec!["\\Starred".into(), "Work".into()],
             saved_searches: Vec::new(),
+            recent_searches: Vec::new(),
         };
         s.save_to(&path).unwrap();
         assert_eq!(Settings::load_from(&path), s);
@@ -278,5 +305,35 @@ mod window_layout_tests {
         assert_eq!(s.window.size, [480.0, 320.0]);
         assert_eq!(s.window.sidebar_width, 600.0);
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod recent_search_tests {
+    use super::*;
+
+    #[test]
+    fn recent_searches_are_newest_first_without_repeats_and_capped() {
+        let mut s = Settings::default();
+        for q in ["a", "b", "c", "d", "e", "f"] {
+            s.note_search(q);
+        }
+        assert_eq!(s.recent_searches, vec!["f", "e", "d", "c", "b"]);
+        s.note_search("c");
+        assert_eq!(s.recent_searches, vec!["c", "f", "e", "d", "b"]);
+        s.note_search("   ");
+        assert_eq!(s.recent_searches.len(), 5);
+    }
+
+    #[test]
+    fn clamping_drops_repeats_and_extra_recent_searches() {
+        let s = Settings {
+            recent_searches: ["x", "x", "", "y", "z", "w", "v", "u"]
+                .map(String::from)
+                .to_vec(),
+            ..Settings::default()
+        };
+        let s = s.clamped();
+        assert_eq!(s.recent_searches, vec!["x", "y", "z", "w", "v"]);
     }
 }
