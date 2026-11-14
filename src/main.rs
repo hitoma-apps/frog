@@ -1209,7 +1209,7 @@ impl App {
             .show(ui, |ui| {
                 let favorites = self.settings.favorite_labels.clone();
                 if !favorites.is_empty() {
-                    ui.weak("Favorites");
+                    ui.heading("Favorites");
                     for key in &favorites {
                         let count = counts.get(key).copied().unwrap_or((0, 0));
                         self.label_row(ui, Some(key), &display_label(key), count);
