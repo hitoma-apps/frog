@@ -194,6 +194,9 @@ fn sender_line(m: &Message) -> String {
     }
 }
 
+/// Width of the expand/collapse arrow's gutter in the label tree. Every label row has one.
+const ARROW_GUTTER: f32 = 14.0;
+
 /// Gap between the items of a row.
 const ROW_GAP: f32 = 4.0;
 /// Width of the checkbox column, on the far left of every row.
@@ -391,6 +394,8 @@ struct App {
     window_total: usize,
     /// The list the window rows belong to. `None` until the first answer for a list.
     window_filter: Option<ThreadFilter>,
+    /// Parent labels in the sidebar whose children are showing.
+    label_open: HashSet<String>,
     /// The row of the last checkbox click, for a shift-click to extend from.
     check_anchor: Option<usize>,
     /// The last window asked for, so the same one isn't asked for twice.
@@ -480,6 +485,7 @@ impl App {
             window_filter: None,
             sent_window: None,
             check_anchor: None,
+            label_open: HashSet::new(),
             view_stale: false,
             view_asked: Instant::now(),
             loading: None,
@@ -1192,26 +1198,38 @@ impl App {
                 .and_then(|l| counts.get(l))
                 .copied()
                 .unwrap_or((0, 0));
-            if child.children.is_empty() {
-                if let Some(raw) = &child.label {
-                    self.label_row(ui, Some(raw.as_str()), segment, count);
+            // Every row starts with the same gutter, so the names at one level line up.
+            // A parent's arrow sits in that gutter, and leaves leave it empty.
+            let open = self.label_open.contains(&child_path);
+            ui.horizontal(|ui| {
+                let height = ui.spacing().interact_size.y;
+                if child.children.is_empty() {
+                    ui.allocate_exact_size(egui::vec2(ARROW_GUTTER, height), egui::Sense::hover());
+                } else {
+                    let arrow = if open { "▾" } else { "▸" };
+                    let toggle = ui.add_sized(
+                        [ARROW_GUTTER, height],
+                        egui::Button::new(arrow).frame(false),
+                    );
+                    if toggle.clicked() {
+                        if open {
+                            self.label_open.remove(&child_path);
+                        } else {
+                            self.label_open.insert(child_path.clone());
+                        }
+                    }
                 }
-            } else {
-                // The header is the parent's own row (when it is a label), so the parent
-                // appears once. Its arrow opens the children.
-                let id = ui.scope_id().with(("label_tree", child_path.as_str()));
-                let state = egui::collapsing_header::CollapsingState::load_with_default_open(
-                    ui.ctx(),
-                    id,
-                    false,
-                );
-                let header = state.show_header(ui, |ui| match &child.label {
+                match &child.label {
                     Some(raw) => self.label_row(ui, Some(raw.as_str()), segment, count),
                     None => {
                         ui.weak(segment.as_str());
                     }
+                }
+            });
+            if open && !child.children.is_empty() {
+                ui.indent(child_path.as_str(), |ui| {
+                    self.label_tree(ui, child, counts, &child_path)
                 });
-                header.body(|ui| self.label_tree(ui, child, counts, &child_path));
             }
         }
     }
@@ -1332,7 +1350,14 @@ impl App {
                     let thrid = entry.thrid;
                     let count = entry.count;
                     let unread = entry.unread > 0;
-                    ui.horizontal(|ui| {
+                    // The highlight is painted behind the row, so it covers the whole row.
+                    let row_band = if self.open_thread == Some(thrid) {
+                        ui.visuals().selection.bg_fill
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    };
+                    let highlight = ui.painter().add(egui::Shape::Noop);
+                    let row = ui.horizontal(|ui| {
                         // The gap between items is set here, and the widths below assume it.
                         ui.spacing_mut().item_spacing.x = ROW_GAP;
                         // Leave room for the scrollbar, which can sit over the right edge.
@@ -1353,7 +1378,6 @@ impl App {
                             let shift = ui.input(|input| input.modifiers.shift);
                             box_clicks.push((i, checked, shift));
                         }
-                        let open = self.open_thread == Some(thrid);
                         // Every item has a fixed width, so the row can't grow frame to frame.
                         // The date is the fixed column on the right. The subject takes the rest.
                         let title_text = row_title(m, count, unread);
@@ -1386,13 +1410,8 @@ impl App {
                             - gaps)
                             .max(40.0);
 
-                        let band = if open {
-                            ui.visuals().selection.bg_fill
-                        } else {
-                            egui::Color32::TRANSPARENT
-                        };
                         let title = egui::Frame::new()
-                            .fill(band)
+                            .fill(egui::Color32::TRANSPARENT)
                             .corner_radius(4)
                             .show(ui, |ui| {
                                 ui.set_min_size(egui::vec2(title_w, row_height));
@@ -1453,6 +1472,10 @@ impl App {
                         let date = egui::RichText::new(&m.date).weak();
                         ui.add_sized([DATE_WIDTH, row_height], egui::Label::new(date).truncate());
                     });
+                    ui.painter().set(
+                        highlight,
+                        egui::Shape::rect_filled(row.response.rect, 4.0, row_band),
+                    );
                 }
             });
         self.window_rows = rows;
