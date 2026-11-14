@@ -15,7 +15,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 
 use crate::uidset::UidSet;
 
@@ -133,14 +133,20 @@ pub struct Store {
     body_cap: u64,
     /// Whether the last session closed the cache cleanly. `false` after a crash or kill.
     opened_cleanly: bool,
+    /// A second connection that only reads, for the GUI's queries. It never writes, and it
+    /// doesn't mark the cache as closed cleanly when it closes.
+    read_only: bool,
 }
 
 impl Drop for Store {
     fn drop(&mut self) {
-        // Marks the cache as closed cleanly, so the next start can skip the checks.
-        let _ = self
-            .conn
-            .execute("UPDATE cache_state SET clean = 1 WHERE id = 1", []);
+        // Marks the cache as closed cleanly, so the next start can skip the checks. Only the
+        // writing connection does: a reader closing says nothing about the writer.
+        if !self.read_only {
+            let _ = self
+                .conn
+                .execute("UPDATE cache_state SET clean = 1 WHERE id = 1", []);
+        }
     }
 }
 
@@ -469,6 +475,23 @@ impl Store {
         Self::init(conn, DEFAULT_BODY_CAP)
     }
 
+    /// Opens a second, read-only connection to a cache the writer has already opened. In WAL
+    /// mode it reads alongside the writer, so queries don't wait for writes. It runs no
+    /// migrations and writes nothing.
+    pub fn open_reader(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(Self {
+            conn,
+            body_cap: DEFAULT_BODY_CAP,
+            opened_cleanly: true,
+            read_only: true,
+        })
+    }
+
     /// Opens the cache, checking it first if the last session didn't close it cleanly.
     /// Damage is repaired where it can be, and a cache that can't be read is set aside
     /// (renamed, not deleted) and a new one started. Returns what was done, for the user.
@@ -631,6 +654,7 @@ impl Store {
             conn,
             body_cap,
             opened_cleanly: false,
+            read_only: false,
         };
         store.migrate()?;
         store.opened_cleanly = store.mark_open()?;

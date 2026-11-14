@@ -526,7 +526,13 @@ impl App {
 
     fn send(&self, cmd: Command) {
         if let Some(link) = &self.link {
-            let _ = link.commands.send(cmd);
+            // Cache reads go to the reader thread when there is one, so they don't wait
+            // behind the worker's network calls.
+            let to = match &link.reads {
+                Some(reads) if worker::is_cache_read(&cmd) => reads,
+                _ => &link.commands,
+            };
+            let _ = to.send(cmd);
         }
     }
 

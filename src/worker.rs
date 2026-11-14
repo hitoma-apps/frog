@@ -150,6 +150,8 @@ pub enum Event {
 pub struct Link {
     pub commands: Sender<Command>,
     pub events: Receiver<Event>,
+    /// Cache reads go here when there's a reader thread, so they don't wait on the worker.
+    pub reads: Option<Sender<Command>>,
 }
 
 /// Opens a new connection. Called once at start, and again on each reconnect.
@@ -169,11 +171,20 @@ pub fn open_cache(email: &str) -> Result<(Store, Vec<String>), String> {
 
 /// The account's cache, plus any startup errors to send once connected. If the cache
 /// file can't be used, a cache in memory keeps the list working for this session.
-fn cache_for(email: &str) -> (Option<Store>, Vec<Event>) {
+fn cache_for(email: &str) -> (Option<Store>, Option<Store>, Vec<Event>) {
     match open_cache(email) {
-        Ok((store, notes)) => (Some(store), notes.into_iter().map(Event::Error).collect()),
+        Ok((store, notes)) => {
+            // The reader opens after the writer, which has run any migrations by now.
+            let reader = account_cache_path(email).and_then(|p| Store::open_reader(&p).ok());
+            (
+                Some(store),
+                reader,
+                notes.into_iter().map(Event::Error).collect(),
+            )
+        }
         Err(e) => (
             Store::open_in_memory(DEFAULT_BODY_CAP).ok(),
+            None,
             vec![Event::Error(e)],
         ),
     }
@@ -181,17 +192,19 @@ fn cache_for(email: &str) -> (Option<Store>, Vec<Event>) {
 
 /// Starts a worker that signs in to Gmail and uses that account's cache.
 pub fn spawn_gmail(user: String, password: String, ctx: egui::Context) -> Link {
-    let (store, startup) = cache_for(&user);
-    spawn(
+    let (store, reader, startup) = cache_for(&user);
+    spawn_with_reader(
         ctx,
         Box::new(move || live::connect_gmail(&user, &password)),
         KEEPALIVE,
         RETRY_BASE,
         store,
+        reader,
         startup,
     )
 }
 
+#[cfg(test)]
 fn spawn(
     ctx: egui::Context,
     connect: Connector,
@@ -200,9 +213,28 @@ fn spawn(
     store: Option<Store>,
     startup: Vec<Event>,
 ) -> Link {
+    spawn_with_reader(ctx, connect, keepalive, retry_base, store, None, startup)
+}
+
+/// Starts the worker and, given a reader connection, a reader thread for cache reads.
+fn spawn_with_reader(
+    ctx: egui::Context,
+    connect: Connector,
+    keepalive: Duration,
+    retry_base: Duration,
+    store: Option<Store>,
+    reader: Option<Store>,
+    startup: Vec<Event>,
+) -> Link {
     let (cmd_tx, cmd_rx) = channel();
     let (ev_tx, ev_rx) = channel();
     let emit = Emitter { tx: ev_tx, ctx };
+    let reads = reader.map(|reader| {
+        let (read_tx, read_rx) = channel();
+        let emit = emit.clone();
+        thread::spawn(move || read_loop(reader, read_rx, emit));
+        read_tx
+    });
     thread::spawn(move || {
         let mut connect = connect;
         match connect() {
@@ -228,10 +260,12 @@ fn spawn(
     Link {
         commands: cmd_tx,
         events: ev_rx,
+        reads,
     }
 }
 
 /// Sends events and wakes the GUI.
+#[derive(Clone)]
 struct Emitter {
     tx: Sender<Event>,
     ctx: egui::Context,
@@ -409,30 +443,11 @@ impl Worker {
 
     /// Runs one command. A dropped connection gets one reconnect and one retry.
     fn dispatch(&mut self, cmd: Command) {
-        // Reads from the cache need no connection, so they never wait on a reconnect.
-        match &cmd {
-            Command::Window {
-                filter,
-                start,
-                count,
-            } => {
-                self.op_window(filter, *start, *count);
-                return;
-            }
-            Command::Thread { thrid } => {
-                self.op_thread(*thrid);
-                return;
-            }
-            Command::ThreadRange {
-                filter,
-                start,
-                count,
-                checked,
-            } => {
-                self.op_thread_range(filter, *start, *count, *checked);
-                return;
-            }
-            _ => {}
+        // Reads from the cache need no connection, so they never wait on a reconnect. They
+        // come here only when there's no separate reader thread.
+        if is_cache_read(&cmd) {
+            answer_read(self.store.as_ref(), &self.emit, &cmd);
+            return;
         }
         let mut retried = false;
         loop {
@@ -1079,6 +1094,9 @@ impl Worker {
                 .send(Event::Error(format!("cache write failed: {e}")));
             return Ok(());
         }
+        // The cache has the change now. The list re-reads on this, which matters when a
+        // separate reader thread may have read before the write.
+        self.emit_progress();
         self.flush_seen(src)
     }
 
@@ -1153,85 +1171,130 @@ impl Worker {
         self.emit.send(Event::Labels { updates, command });
         Ok(())
     }
+}
 
-    /// Sends the thread IDs of a range of the list, read from the cache.
-    fn op_thread_range(&self, filter: &ThreadFilter, start: usize, count: usize, checked: bool) {
-        let thrids: Vec<u64> = match self.store.as_ref() {
-            Some(store) => match store.thread_page(filter, start, count) {
-                Ok(page) => page.into_iter().map(|t| t.thrid).collect(),
-                Err(e) => {
-                    self.emit
-                        .send(Event::Error(format!("cache read failed: {e}")));
-                    return;
-                }
-            },
-            None => Vec::new(),
-        };
-        self.emit.send(Event::ThreadRange {
+/// Sends one window of the thread list, read from the cache.
+fn read_window(
+    store: Option<&Store>,
+    emit: &Emitter,
+    filter: &ThreadFilter,
+    start: usize,
+    count: usize,
+) {
+    let Some(store) = store else {
+        emit.send(Event::Window {
             filter: filter.clone(),
-            thrids,
-            checked,
+            start,
+            threads: Vec::new(),
+            total: 0,
         });
-    }
-
-    /// Sends one window of the thread list, read from the cache.
-    fn op_window(&self, filter: &ThreadFilter, start: usize, count: usize) {
-        let Some(store) = self.store.as_ref() else {
-            self.emit.send(Event::Window {
+        return;
+    };
+    let result = store.thread_count(filter).and_then(|total| {
+        store
+            .thread_page(filter, start, count)
+            .map(|page| (total, page))
+    });
+    match result {
+        Ok((total, page)) => {
+            let threads: Vec<ThreadEntry> = page
+                .into_iter()
+                .filter_map(|t| {
+                    let head = Message::from_cached(t.head)?;
+                    Some(ThreadEntry {
+                        thrid: t.thrid,
+                        count: t.count,
+                        unread: t.unread,
+                        attachments: t.attachments,
+                        head,
+                    })
+                })
+                .collect();
+            emit.send(Event::Window {
                 filter: filter.clone(),
                 start,
-                threads: Vec::new(),
-                total: 0,
+                threads,
+                total,
             });
-            return;
-        };
-        let result = store.thread_count(filter).and_then(|total| {
-            store
-                .thread_page(filter, start, count)
-                .map(|page| (total, page))
-        });
-        match result {
-            Ok((total, page)) => {
-                let threads: Vec<ThreadEntry> = page
-                    .into_iter()
-                    .filter_map(|t| {
-                        let head = Message::from_cached(t.head)?;
-                        Some(ThreadEntry {
-                            thrid: t.thrid,
-                            count: t.count,
-                            unread: t.unread,
-                            attachments: t.attachments,
-                            head,
-                        })
-                    })
-                    .collect();
-                self.emit.send(Event::Window {
-                    filter: filter.clone(),
-                    start,
-                    threads,
-                    total,
-                });
-            }
-            Err(e) => self
-                .emit
-                .send(Event::Error(format!("cache read failed: {e}"))),
         }
+        Err(e) => emit.send(Event::Error(format!("cache read failed: {e}"))),
     }
+}
 
-    /// Sends every cached message of one thread.
-    fn op_thread(&self, thrid: u64) {
-        let messages: Vec<Message> = match self.store.as_ref() {
-            Some(store) => match store.thread_messages(thrid) {
-                Ok(list) => list.into_iter().filter_map(Message::from_cached).collect(),
-                Err(e) => {
-                    self.emit
-                        .send(Event::Error(format!("cache read failed: {e}")));
-                    return;
-                }
-            },
-            None => Vec::new(),
-        };
-        self.emit.send(Event::Thread { thrid, messages });
+/// Sends every cached message of one thread.
+fn read_thread(store: Option<&Store>, emit: &Emitter, thrid: u64) {
+    let messages: Vec<Message> = match store {
+        Some(store) => match store.thread_messages(thrid) {
+            Ok(list) => list.into_iter().filter_map(Message::from_cached).collect(),
+            Err(e) => {
+                emit.send(Event::Error(format!("cache read failed: {e}")));
+                return;
+            }
+        },
+        None => Vec::new(),
+    };
+    emit.send(Event::Thread { thrid, messages });
+}
+
+/// Sends the thread IDs of a range of the list, read from the cache.
+fn read_thread_range(
+    store: Option<&Store>,
+    emit: &Emitter,
+    filter: &ThreadFilter,
+    start: usize,
+    count: usize,
+    checked: bool,
+) {
+    let thrids: Vec<u64> = match store {
+        Some(store) => match store.thread_page(filter, start, count) {
+            Ok(page) => page.into_iter().map(|t| t.thrid).collect(),
+            Err(e) => {
+                emit.send(Event::Error(format!("cache read failed: {e}")));
+                return;
+            }
+        },
+        None => Vec::new(),
+    };
+    emit.send(Event::ThreadRange {
+        filter: filter.clone(),
+        thrids,
+        checked,
+    });
+}
+
+/// Answers a cache read: a window of the list, a conversation's messages, or the threads in a
+/// range. The reader thread answers these, or the worker when there's no separate reader.
+fn answer_read(store: Option<&Store>, emit: &Emitter, cmd: &Command) {
+    match cmd {
+        Command::Window {
+            filter,
+            start,
+            count,
+        } => read_window(store, emit, filter, *start, *count),
+        Command::Thread { thrid } => read_thread(store, emit, *thrid),
+        Command::ThreadRange {
+            filter,
+            start,
+            count,
+            checked,
+        } => read_thread_range(store, emit, filter, *start, *count, *checked),
+        _ => {}
+    }
+}
+
+/// Whether a command only reads the cache.
+pub fn is_cache_read(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Window { .. } | Command::Thread { .. } | Command::ThreadRange { .. }
+    )
+}
+
+/// The reader thread: answers cache reads from its own connection, so they never wait for
+/// the worker's network calls, reconnects or IDLE.
+fn read_loop(store: Store, requests: Receiver<Command>, emit: Emitter) {
+    for cmd in requests {
+        answer_read(Some(&store), &emit, &cmd);
     }
 }
 
@@ -1750,6 +1813,70 @@ mod tests {
         let (list, _) = threads(&second);
         assert_eq!(cached_messages(&list), 6, "all six come from the cache");
         drop(second);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_reads_do_not_wait_for_the_worker() {
+        let dir = std::env::temp_dir().join(format!("gmail-reader-test-{}", std::process::id()));
+        let path = dir.join("cache.sqlite");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // First session: cache the mailbox.
+        let first = spawn(
+            egui::Context::default(),
+            Box::new(|| Ok(Box::new(MockSource::demo()) as Box<dyn MailSource>)),
+            KEEPALIVE,
+            FAST,
+            Some(Store::open(&path).unwrap()),
+            Vec::new(),
+        );
+        assert!(matches!(next_significant(&first), Event::Connected));
+        first.commands.send(Command::Load { limit: 500 }).unwrap();
+        while !matches!(
+            next(&first),
+            Event::Progress {
+                cached: 6,
+                total: 6
+            }
+        ) {}
+        drop(first);
+
+        // Second session: the worker takes three seconds to connect, so it's busy. The
+        // reader answers from its own connection meanwhile.
+        let writer = Store::open(&path).unwrap();
+        let reader = Store::open_reader(&path).unwrap();
+        let link = spawn_with_reader(
+            egui::Context::default(),
+            Box::new(|| {
+                thread::sleep(Duration::from_secs(3));
+                Ok(Box::new(MockSource::demo()) as Box<dyn MailSource>)
+            }),
+            KEEPALIVE,
+            FAST,
+            Some(writer),
+            Some(reader),
+            Vec::new(),
+        );
+        let started = std::time::Instant::now();
+        link.reads
+            .as_ref()
+            .expect("a file cache has a reader")
+            .send(Command::Window {
+                filter: ThreadFilter::All,
+                start: 0,
+                count: 500,
+            })
+            .unwrap();
+        match link.events.recv_timeout(Duration::from_secs(2)) {
+            Ok(Event::Window { threads, .. }) => {
+                assert_eq!(cached_messages(&threads), 6);
+                assert!(started.elapsed() < Duration::from_secs(2));
+            }
+            Ok(_) => panic!("the list read wasn't the first answer"),
+            Err(_) => panic!("the list read waited for the worker"),
+        }
+        drop(link);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
