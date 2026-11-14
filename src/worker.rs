@@ -610,13 +610,24 @@ impl Worker {
         }
 
         if let Some(store) = self.store.as_mut() {
-            let stored = store.mailbox_state();
-            let same = matches!(&stored, Ok(Some(st)) if st.uidvalidity == info.uidvalidity);
-            if same {
+            let stored = match store.mailbox_state() {
+                Ok(stored) => stored,
+                // Not knowing the stored state is not the same as a different mailbox.
+                // Keep the cache as it is: invalidating it would mean re-fetching every
+                // header. Without a modseq, changes made elsewhere wait for a later sync.
+                Err(e) => {
+                    self.emit.send(Event::Error(format!(
+                        "Could not read the cache's sync state ({e}). The cache is kept as it is."
+                    )));
+                    self.state.uidvalidity = Some(info.uidvalidity);
+                    return changed;
+                }
+            };
+            if let Some(st) = stored.filter(|st| st.uidvalidity == info.uidvalidity) {
                 // A restart with a valid cache: resume from the last synced modseq,
                 // so changes made while the app was closed get picked up.
                 if self.state.modseq.is_none() {
-                    self.state.modseq = stored.ok().flatten().and_then(|st| st.highest_modseq);
+                    self.state.modseq = st.highest_modseq;
                 }
             } else {
                 self.state.modseq = None;
