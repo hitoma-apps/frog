@@ -103,21 +103,24 @@ impl<S: Read + Write + Send + SetReadTimeout> MailSource for LiveSession<S> {
         self.ensure_selected()?;
         let mut out = Vec::with_capacity(uids.len());
         for chunk in uids.chunks(FETCH_CHUNK) {
-            let items = "UID X-GM-MSGID X-GM-THRID X-GM-LABELS FLAGS BODY.PEEK[HEADER]";
+            let items =
+                "UID X-GM-MSGID X-GM-THRID X-GM-LABELS FLAGS BODY.PEEK[HEADER] BODYSTRUCTURE";
             for raw in self.conn.uid_fetch(chunk, items).map_err(to_source_error)? {
                 let f = parse_gmail_fetch(&raw).map_err(|e| SourceError::Failed(e.to_string()))?;
                 let (Some(uid), Some(msgid)) = (f.uid, f.msgid) else {
                     continue;
                 };
                 let headers = f.header.unwrap_or(&[]).to_vec();
-                out.push(Message::from_headers(
+                let mut m = Message::from_headers(
                     msgid,
                     f.thrid.unwrap_or(0),
                     uid,
                     f.labels.clone(),
                     f.seen().unwrap_or(false),
                     headers,
-                ));
+                );
+                m.attachment = f.has_attachment();
+                out.push(m);
             }
         }
         Ok(out)
@@ -171,6 +174,22 @@ impl<S: Read + Write + Send + SetReadTimeout> MailSource for LiveSession<S> {
         // Re-read labels and read state so the view matches the server, not our guess.
         let updates = self.fetch_states(uids)?;
         Ok((command, updates))
+    }
+
+    fn fetch_structures(&mut self, uids: &[u32]) -> Result<Vec<(u32, bool)>, SourceError> {
+        self.ensure_selected()?;
+        let mut out = Vec::with_capacity(uids.len());
+        for raw in self
+            .conn
+            .uid_fetch(uids, "UID BODYSTRUCTURE")
+            .map_err(to_source_error)?
+        {
+            let f = parse_gmail_fetch(&raw).map_err(|e| SourceError::Failed(e.to_string()))?;
+            if let (Some(uid), Some(has)) = (f.uid, f.has_attachment()) {
+                out.push((uid, has));
+            }
+        }
+        Ok(out)
     }
 
     fn set_seen(

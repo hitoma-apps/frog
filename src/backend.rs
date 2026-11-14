@@ -93,6 +93,8 @@ pub struct Message {
     pub headers: Vec<u8>,
     /// The SPF, DKIM and DMARC checks the server recorded in the headers.
     pub auth: Vec<AuthCheck>,
+    /// Whether the message has an attachment, from its structure. `None` if not known.
+    pub attachment: Option<bool>,
     /// The full RFC 5322 message, once fetched.
     pub body: Option<Vec<u8>>,
 }
@@ -144,6 +146,7 @@ impl Message {
             seen,
             from,
             from_email,
+            attachment: None,
             subject,
             date,
             sent,
@@ -162,6 +165,7 @@ impl Message {
             labels: self.labels.clone(),
             from: self.from.clone(),
             from_email: self.from_email.clone(),
+            attachment: self.attachment,
             subject: self.subject.clone(),
             date: self.date.clone(),
             sent: self.sent,
@@ -176,6 +180,7 @@ impl Message {
     /// left empty, since listings don't use it.
     pub fn from_cached(c: CachedMessage) -> Option<Self> {
         Some(Self {
+            attachment: None,
             msgid: c.msgid,
             thrid: c.thrid,
             uid: c.uid?,
@@ -227,6 +232,13 @@ pub trait MailSource: Send {
         action: LabelAction,
         labels: &[String],
     ) -> Result<(String, Vec<MessageUpdate>), SourceError>;
+
+    /// Whether each message has an attachment, from its structure. Messages the server doesn't
+    /// return are left out.
+    fn fetch_structures(&mut self, uids: &[u32]) -> Result<Vec<(u32, bool)>, SourceError> {
+        let _ = uids;
+        Err("this source can't read attachment information".into())
+    }
 
     /// Marks messages read or unread on the server. Returns the command for the log and the
     /// new state of each message.
@@ -594,6 +606,16 @@ impl MailSource for MockSource {
             }
         }
         Ok((command, updates))
+    }
+
+    fn fetch_structures(&mut self, uids: &[u32]) -> Result<Vec<(u32, bool)>, SourceError> {
+        let st = self.state.lock().unwrap();
+        Ok(uids
+            .iter()
+            .copied()
+            .filter(|u| st.entries.iter().any(|e| e.uid == *u))
+            .map(|u| (u, false))
+            .collect())
     }
 
     fn set_seen(

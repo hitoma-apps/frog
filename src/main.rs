@@ -115,6 +115,8 @@ const MAX_CHIPS: usize = 3;
 const CHIP_TEXT_MAX: f32 = 80.0;
 /// Width of the date column, on the right of every row.
 const DATE_WIDTH: f32 = 210.0;
+/// Width of the attachment column, between the subject and the labels.
+const ATTACH_WIDTH: f32 = 16.0;
 
 /// The chips for a message row, in display order. Leaves out the label the view is
 /// filtered by. In a mailbox view (All Mail or a system folder) it also leaves out
@@ -227,6 +229,18 @@ fn fit_text(ui: &egui::Ui, text: &str, font: &egui::FontId, max_w: f32) -> Strin
         }
     }
     "…".to_owned()
+}
+
+/// Paints a paperclip-like mark into `rect`: a tall rounded loop.
+fn paint_paperclip(ui: &egui::Ui, rect: egui::Rect) {
+    let color = ui.visuals().text_color();
+    let clip = egui::Rect::from_center_size(rect.center(), egui::vec2(7.0, 12.0));
+    ui.painter().rect_stroke(
+        clip,
+        3.5,
+        egui::Stroke::new(1.3, color),
+        egui::StrokeKind::Middle,
+    );
 }
 
 /// Paints one label chip into `rect`.
@@ -1361,12 +1375,16 @@ impl App {
                             .map(|(_, t, _)| chip_width(ui, t, &font))
                             .collect();
                         // Gaps: subject to first chip, between chips, last chip to date.
-                        // Items in order: checkbox, subject, chips, date. That's one gap
-                        // between each pair.
-                        let gaps = (tags.len() as f32 + 2.0) * ROW_GAP;
-                        let title_w =
-                            (pane_w - CHECK_WIDTH - DATE_WIDTH - widths.iter().sum::<f32>() - gaps)
-                                .max(40.0);
+                        // Items in order: checkbox, subject, attachment, chips, date. That's
+                        // one gap between each pair.
+                        let gaps = (tags.len() as f32 + 3.0) * ROW_GAP;
+                        let title_w = (pane_w
+                            - CHECK_WIDTH
+                            - DATE_WIDTH
+                            - ATTACH_WIDTH
+                            - widths.iter().sum::<f32>()
+                            - gaps)
+                            .max(40.0);
 
                         let band = if open {
                             ui.visuals().selection.bg_fill
@@ -1407,6 +1425,16 @@ impl App {
                             .clicked()
                         {
                             opened = Some(thrid);
+                        }
+
+                        // The attachment column: a paperclip for a thread with an attachment.
+                        let (clip_rect, clip) = ui.allocate_exact_size(
+                            egui::vec2(ATTACH_WIDTH, row_height),
+                            egui::Sense::hover(),
+                        );
+                        if entry.attachments {
+                            paint_paperclip(ui, clip_rect);
+                            clip.on_hover_text("Has attachments");
                         }
 
                         for ((raw, text, tip), w) in tags.iter().zip(&widths) {

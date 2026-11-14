@@ -77,6 +77,8 @@ pub struct ThreadEntry {
     pub count: usize,
     /// How many of them are unread.
     pub unread: usize,
+    /// Whether any of them has an attachment.
+    pub attachments: bool,
     pub head: Message,
 }
 
@@ -265,6 +267,8 @@ struct State {
     pending_headers: VecDeque<u32>,
     /// UIDs whose bodies to prefetch when idle, next first.
     prefetch: VecDeque<u32>,
+    /// UIDs of cached messages whose attachment information is still unknown, next first.
+    pending_structure: VecDeque<u32>,
 }
 
 struct Worker {
@@ -362,8 +366,21 @@ impl Worker {
 
     fn idle_work_pending(&self) -> bool {
         !self.state.pending_headers.is_empty()
+            || !self.state.pending_structure.is_empty()
             || !self.state.prefetch.is_empty()
             || self.store_has_pending_seen()
+    }
+
+    /// The cached messages whose attachment information is unknown, from the cache.
+    fn missing_attachment_info(&self) -> VecDeque<u32> {
+        match self
+            .store
+            .as_ref()
+            .map(|s| s.uids_missing_attachment_info())
+        {
+            Some(Ok(uids)) => uids.into_iter().collect(),
+            _ => VecDeque::new(),
+        }
     }
 
     /// Whether read-state changes are waiting to reach the server.
@@ -481,10 +498,12 @@ impl Worker {
             return;
         }
         let result = self.with_source(|w, src| {
-            if w.state.pending_headers.is_empty() {
-                w.op_prefetch_batch(src)
-            } else {
+            if !w.state.pending_headers.is_empty() {
                 w.op_fill_headers(src)
+            } else if !w.state.pending_structure.is_empty() {
+                w.op_fill_structure(src)
+            } else {
+                w.op_prefetch_batch(src)
             }
         });
         match result {
@@ -799,6 +818,7 @@ impl Worker {
             self.emit_progress();
         }
         self.state.pending_headers = missing;
+        self.state.pending_structure = self.missing_attachment_info();
         self.state.prefetch = all.iter().rev().take(limit).copied().collect();
         self.state.modseq = info.highest_modseq;
 
@@ -932,6 +952,33 @@ impl Worker {
         }
         self.emit_progress();
         Ok(())
+    }
+
+    /// Fetches the attachment information for the next batch of cached messages that lack it.
+    fn op_fill_structure(&mut self, src: &mut dyn MailSource) -> Result<(), SourceError> {
+        let n = BATCH.min(self.state.pending_structure.len());
+        let batch: Vec<u32> = self.state.pending_structure.drain(..n).collect();
+        match src.fetch_structures(&batch) {
+            Ok(flags) => {
+                if let Some(store) = self.store.as_mut()
+                    && let Err(e) = store.set_attachments(&flags)
+                {
+                    self.emit
+                        .send(Event::Error(format!("cache write failed: {e}")));
+                }
+                self.emit_progress();
+                Ok(())
+            }
+            Err(e @ SourceError::Disconnected(_)) => {
+                for uid in batch.iter().rev() {
+                    self.state.pending_structure.push_front(*uid);
+                }
+                Err(e)
+            }
+            // This source can't read attachment information, or the server refused the
+            // batch. The messages stay unknown, and the next load tries them again.
+            Err(_) => Ok(()),
+        }
     }
 
     /// Fetches the next batch of pending headers. On failure the batch goes back
@@ -1142,6 +1189,7 @@ impl Worker {
                             thrid: t.thrid,
                             count: t.count,
                             unread: t.unread,
+                            attachments: t.attachments,
                             head,
                         })
                     })
@@ -1363,6 +1411,7 @@ mod tests {
                     ..(first + 200).min(N + 1))
                     .map(|uid| gmail_imap_proto::store::CachedMessage {
                         msgid: 1_000_000_000_000 + u64::from(uid),
+                        attachment: None,
                         thrid: 9_000_000_000 + u64::from(uid / 3),
                         uid: Some(uid),
                         labels: labels.clone(),

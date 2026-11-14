@@ -268,9 +268,16 @@ pub struct GmailFetch<'a> {
     pub flags: Option<Vec<String>>,
     /// `MODSEQ` (CONDSTORE change counter), if the server sent one.
     pub modseq: Option<u64>,
+    /// `BODYSTRUCTURE`: the message's part tree, if requested.
+    pub structure: Option<Value<'a>>,
 }
 
 impl GmailFetch<'_> {
+    /// Whether the message has an attachment, from its structure, if that was requested.
+    pub fn has_attachment(&self) -> Option<bool> {
+        self.structure.as_ref().map(structure_has_attachment)
+    }
+
     /// Whether the message has been read (`\Seen`), if the flags were requested.
     pub fn seen(&self) -> Option<bool> {
         self.flags
@@ -294,6 +301,7 @@ pub fn parse_gmail_fetch(buf: &[u8]) -> Result<GmailFetch<'_>, ParseError> {
             "X-GM-LABELS" => out.labels = labels_from(&value),
             "FLAGS" => out.flags = Some(labels_from(&value)),
             "MODSEQ" => out.modseq = modseq_from(&value),
+            "BODYSTRUCTURE" => out.structure = Some(value),
             "BODY[]" => {
                 if let Value::Bytes(b) = value {
                     out.body = Some(b);
@@ -308,6 +316,27 @@ pub fn parse_gmail_fetch(buf: &[u8]) -> Result<GmailFetch<'_>, ParseError> {
         }
     }
     Ok(out)
+}
+
+/// Whether a `BODYSTRUCTURE` tree has an attachment: a single part (a leaf) whose
+/// disposition is `ATTACHMENT`. Multipart containers are searched through.
+pub fn structure_has_attachment(v: &Value<'_>) -> bool {
+    let Value::List(items) = v else {
+        return false;
+    };
+    match items.first() {
+        // A multipart container: its first item is the first child, a list.
+        Some(Value::List(_)) => items.iter().any(structure_has_attachment),
+        // A single part. The disposition is after the type, subtype, parameters, id,
+        // description, encoding, size, and (for text) line count, md5 included.
+        _ => items.iter().skip(7).any(|item| match item {
+            Value::List(fields) => fields
+                .first()
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.eq_ignore_ascii_case("ATTACHMENT")),
+            _ => false,
+        }),
+    }
 }
 
 /// `MODSEQ (n)`: the number is inside a one-item list.
@@ -364,6 +393,28 @@ mod label_tests {
 #[cfg(test)]
 mod flags_tests {
     use super::*;
+
+    fn structure_of(line: &str) -> bool {
+        let g = parse_gmail_fetch(line.as_bytes()).unwrap();
+        g.has_attachment().unwrap()
+    }
+
+    #[test]
+    fn a_mixed_message_with_a_pdf_has_an_attachment() {
+        assert!(structure_of(
+            "* 1 FETCH (UID 7 BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 20 1 NIL NIL NIL NIL)(\"APPLICATION\" \"PDF\" (\"NAME\" \"a.pdf\") NIL NIL \"BASE64\" 100 NIL (\"ATTACHMENT\" (\"FILENAME\" \"a.pdf\")) NIL NIL) \"MIXED\" (\"BOUNDARY\" \"b\") NIL NIL NIL))\r\n"
+        ));
+    }
+
+    #[test]
+    fn inline_images_and_plain_text_have_no_attachment() {
+        assert!(!structure_of(
+            "* 1 FETCH (UID 8 BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 20 1 NIL NIL NIL NIL)(\"IMAGE\" \"PNG\" (\"NAME\" \"x.png\") \"<id>\" NIL \"BASE64\" 100 NIL (\"INLINE\" (\"FILENAME\" \"x.png\")) NIL NIL) \"RELATED\" (\"BOUNDARY\" \"b\") NIL NIL NIL))\r\n"
+        ));
+        assert!(!structure_of(
+            "* 1 FETCH (UID 9 BODYSTRUCTURE (\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 20 1 NIL NIL NIL NIL))\r\n"
+        ));
+    }
 
     #[test]
     fn flags_and_modseq_are_read() {

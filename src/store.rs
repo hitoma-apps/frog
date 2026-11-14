@@ -25,7 +25,7 @@ pub const DEFAULT_BODY_CAP: u64 = 1 << 30;
 /// zstd level. Mail is text, so a low level compresses well and stays fast.
 const ZSTD_LEVEL: i32 = 3;
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -62,6 +62,11 @@ impl From<std::io::Error> for StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
+/// A thread's list row, as the query returns it: thread, count, unread, attachment, head.
+type ThreadListRow = (u64, usize, usize, bool, CachedMessage);
+/// A thread's counts and attachment flag, without its head message.
+type ThreadMeta = (u64, usize, usize, bool);
+
 /// Which threads a list shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThreadFilter {
@@ -81,6 +86,8 @@ pub struct ThreadSummary {
     pub count: usize,
     /// How many of them are unread.
     pub unread: usize,
+    /// Whether any of them has an attachment.
+    pub attachments: bool,
     /// The newest message, with its labels.
     pub head: CachedMessage,
 }
@@ -98,6 +105,9 @@ pub struct CachedMessage {
     pub from: String,
     /// The sender's address, as the message gives it. Empty if there isn't one.
     pub from_email: String,
+    /// Whether the message has an attachment, from its structure. `None` if not known yet.
+    /// Listings leave it `None`, and a write with `None` keeps what the cache already has.
+    pub attachment: Option<bool>,
     pub subject: String,
     pub date: String,
     /// The sent time (Unix seconds) from the Date header, or 0 if there isn't one.
@@ -172,6 +182,24 @@ pub struct CheckReport {
     pub logical: Vec<String>,
 }
 
+/// Adds the attachment columns (schema v11) if they're missing, so a rebuild can use them on
+/// every path. Does nothing if they're already there.
+fn upgrade_attachments(tx: &Transaction) -> Result<()> {
+    let has: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('threads') WHERE name = 'attachments'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has > 0 {
+        return Ok(());
+    }
+    tx.execute_batch(
+        "ALTER TABLE messages ADD COLUMN attachment INTEGER;
+         ALTER TABLE threads ADD COLUMN attachments INTEGER NOT NULL DEFAULT 0;",
+    )?;
+    Ok(())
+}
+
 /// Gives the thread summaries a head message and a date to sort by (schema v10), in place of
 /// the UID they had. Does nothing if that's already done, so it's safe on every path.
 fn upgrade_threads(tx: &Transaction) -> Result<()> {
@@ -199,11 +227,12 @@ fn rebuild_derived(tx: &Transaction) -> Result<()> {
         "DELETE FROM threads;
          DELETE FROM thread_labels;
          DELETE FROM label_threads;
-         INSERT INTO threads (thrid, count, unread, head_msgid, newest_sent)
+         INSERT INTO threads (thrid, count, unread, head_msgid, newest_sent, attachments)
              SELECT m.thrid, COUNT(*), SUM(m.seen = 0),
                  (SELECT m2.msgid FROM messages m2 WHERE m2.thrid = m.thrid AND m2.uid IS NOT NULL
                   ORDER BY m2.sent DESC, m2.uid DESC LIMIT 1),
-                 MAX(m.sent)
+                 MAX(m.sent),
+                 COUNT(CASE WHEN m.attachment = 1 THEN 1 END)
              FROM messages m WHERE m.uid IS NOT NULL GROUP BY m.thrid;
          INSERT INTO thread_labels (label, thrid)
              SELECT DISTINCT l.label, m.thrid FROM messages m
@@ -336,16 +365,22 @@ fn refresh_threads(tx: &Transaction, thrids: &BTreeSet<u64>) -> Result<()> {
         let thrid = to_i64(thrid)?;
         let before = thread_contribution(tx, thrid)?;
         // The head is the newest message by date, as the thread list shows it.
-        let (count, unread, head, newest_sent): (i64, i64, Option<i64>, Option<i64>) = tx
-            .query_row(
-                "SELECT COUNT(*), COALESCE(SUM(seen = 0), 0),
-                     (SELECT msgid FROM messages WHERE thrid = ?1 AND uid IS NOT NULL
-                      ORDER BY sent DESC, uid DESC LIMIT 1),
-                     MAX(sent)
-                 FROM messages WHERE thrid = ?1 AND uid IS NOT NULL",
-                params![thrid],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )?;
+        let (count, unread, head, newest_sent, attachments): (
+            i64,
+            i64,
+            Option<i64>,
+            Option<i64>,
+            i64,
+        ) = tx.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(seen = 0), 0),
+                 (SELECT msgid FROM messages WHERE thrid = ?1 AND uid IS NOT NULL
+                  ORDER BY sent DESC, uid DESC LIMIT 1),
+                 MAX(sent),
+                 COUNT(CASE WHEN attachment = 1 THEN 1 END)
+             FROM messages WHERE thrid = ?1 AND uid IS NOT NULL",
+            params![thrid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )?;
         tx.execute("DELETE FROM thread_labels WHERE thrid = ?1", params![thrid])?;
         if count == 0 {
             tx.execute("DELETE FROM threads WHERE thrid = ?1", params![thrid])?;
@@ -354,9 +389,10 @@ fn refresh_threads(tx: &Transaction, thrids: &BTreeSet<u64>) -> Result<()> {
             continue;
         }
         tx.execute(
-            "INSERT OR REPLACE INTO threads (thrid, count, unread, head_msgid, newest_sent)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![thrid, count, unread, head, newest_sent],
+            "INSERT OR REPLACE INTO threads
+                 (thrid, count, unread, head_msgid, newest_sent, attachments)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![thrid, count, unread, head, newest_sent, attachments],
         )?;
         tx.execute(
             "INSERT INTO thread_labels (label, thrid)
@@ -391,6 +427,7 @@ fn cached_from_row(r: &rusqlite::Row) -> rusqlite::Result<CachedMessage> {
         labels: BTreeSet::new(),
         from: r.get(3)?,
         from_email: r.get(8)?,
+        attachment: None,
         subject: r.get(4)?,
         date: r.get(5)?,
         headers: Vec::new(),
@@ -522,9 +559,10 @@ impl Store {
                 "SELECT m.thrid, COUNT(*), SUM(m.seen = 0),
                      (SELECT m2.msgid FROM messages m2 WHERE m2.thrid = m.thrid AND m2.uid IS NOT NULL
                       ORDER BY m2.sent DESC, m2.uid DESC LIMIT 1),
-                     MAX(m.sent)
+                     MAX(m.sent),
+                     COUNT(CASE WHEN m.attachment = 1 THEN 1 END)
                  FROM messages m WHERE m.uid IS NOT NULL GROUP BY m.thrid",
-                "SELECT thrid, count, unread, head_msgid, newest_sent FROM threads",
+                "SELECT thrid, count, unread, head_msgid, newest_sent, attachments FROM threads",
             ),
             (
                 "thread labels",
@@ -802,6 +840,7 @@ impl Store {
                  ALTER TABLE cache_totals ADD COLUMN unread_threads INTEGER NOT NULL DEFAULT 0;",
             )?;
             upgrade_threads(&tx)?;
+            upgrade_attachments(&tx)?;
             // The UID fix above can change the summaries, so they're rebuilt.
             rebuild_derived(&tx)?;
         }
@@ -821,6 +860,10 @@ impl Store {
                  DROP TRIGGER IF EXISTS message_labels_removed;
                  DROP TABLE IF EXISTS label_stats;",
             )?;
+        }
+        if version < 11 {
+            upgrade_attachments(&tx)?;
+            rebuild_derived(&tx)?;
         }
         if version < 10 {
             // Threads sort by their newest message's date, not by UID (see upgrade_threads).
@@ -877,14 +920,15 @@ impl Store {
             }
             affected.insert(m.thrid);
             tx.execute(
-                "INSERT INTO messages (msgid, thrid, uid, from_addr, subject, date, headers, seen, sent, from_email)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                "INSERT INTO messages (msgid, thrid, uid, from_addr, subject, date, headers, seen, sent, from_email, attachment)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT(msgid) DO UPDATE SET
                      thrid = excluded.thrid, uid = excluded.uid,
                      from_addr = excluded.from_addr, subject = excluded.subject,
                      date = excluded.date, headers = excluded.headers,
                      seen = excluded.seen, sent = excluded.sent,
-                     from_email = excluded.from_email",
+                     from_email = excluded.from_email,
+                     attachment = COALESCE(excluded.attachment, messages.attachment)",
                 params![
                     msgid,
                     to_i64(m.thrid)?,
@@ -895,7 +939,8 @@ impl Store {
                     m.headers,
                     m.seen,
                     m.sent,
-                    m.from_email
+                    m.from_email,
+                    m.attachment
                 ],
             )?;
             tx.execute(
@@ -1016,9 +1061,10 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<ThreadSummary>> {
         const COLUMNS: &str = "t.thrid, t.count, t.unread, m.msgid, m.thrid, m.uid,
-                               m.from_addr, m.subject, m.date, m.seen, m.sent, m.from_email";
+                               m.from_addr, m.subject, m.date, m.seen, m.sent, m.from_email,
+                               t.attachments";
         let (limit, offset) = (limit as i64, offset as i64);
-        let rows: Vec<(u64, usize, usize, CachedMessage)> = match filter {
+        let rows: Vec<ThreadListRow> = match filter {
             ThreadFilter::All => {
                 let sql = format!(
                     "SELECT {COLUMNS} FROM threads t
@@ -1056,27 +1102,28 @@ impl Store {
                 }
             },
         };
-        let (meta, mut heads): (Vec<(u64, usize, usize)>, Vec<CachedMessage>) =
-            rows.into_iter().map(|(t, c, u, m)| ((t, c, u), m)).unzip();
+        let (meta, mut heads): (Vec<ThreadMeta>, Vec<CachedMessage>) = rows
+            .into_iter()
+            .map(|(t, c, u, a, m)| ((t, c, u, a), m))
+            .unzip();
         self.attach_labels(&mut heads)?;
         Ok(meta
             .into_iter()
             .zip(heads)
-            .map(|((thrid, count, unread), head)| ThreadSummary {
-                thrid,
-                count,
-                unread,
-                head,
-            })
+            .map(
+                |((thrid, count, unread, attachments), head)| ThreadSummary {
+                    thrid,
+                    count,
+                    unread,
+                    attachments,
+                    head,
+                },
+            )
             .collect())
     }
 
     /// Runs a thread-list query. Each row is the thread's summary and its newest message.
-    fn thread_rows(
-        &self,
-        sql: &str,
-        params: impl rusqlite::Params,
-    ) -> Result<Vec<(u64, usize, usize, CachedMessage)>> {
+    fn thread_rows(&self, sql: &str, params: impl rusqlite::Params) -> Result<Vec<ThreadListRow>> {
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt
             .query_map(params, |r| {
@@ -1087,6 +1134,7 @@ impl Store {
                     labels: BTreeSet::new(),
                     from: r.get(6)?,
                     from_email: r.get(11)?,
+                    attachment: None,
                     subject: r.get(7)?,
                     date: r.get(8)?,
                     headers: Vec::new(),
@@ -1097,6 +1145,7 @@ impl Store {
                     r.get::<_, i64>(0)? as u64,
                     r.get::<_, i64>(1)? as usize,
                     r.get::<_, i64>(2)? as usize,
+                    r.get::<_, i64>(12)? > 0,
                     head,
                 ))
             })?
@@ -1227,6 +1276,7 @@ impl Store {
                 labels: BTreeSet::new(),
                 from: r.get(3)?,
                 from_email: r.get(8)?,
+                attachment: None,
                 subject: r.get(4)?,
                 date: r.get(5)?,
                 headers: Vec::new(),
@@ -1244,6 +1294,40 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare("SELECT uid FROM messages WHERE uid IS NOT NULL ORDER BY uid DESC")?;
+        let uids = stmt
+            .query_map([], |r| r.get::<_, u32>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(uids)
+    }
+
+    /// Records whether messages have attachments, by UID, and refreshes their threads.
+    pub fn set_attachments(&mut self, flags: &[(u32, bool)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        let mut affected: BTreeSet<u64> = BTreeSet::new();
+        for &(uid, has) in flags {
+            let thread: Option<i64> = tx
+                .query_row(
+                    "SELECT thrid FROM messages WHERE uid = ?1",
+                    params![uid],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            affected.extend(thread.map(|t| t as u64));
+            tx.execute(
+                "UPDATE messages SET attachment = ?2 WHERE uid = ?1",
+                params![uid, has],
+            )?;
+        }
+        refresh_threads(&tx, &affected)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// UIDs of cached messages whose attachments haven't been looked at yet.
+    pub fn uids_missing_attachment_info(&self) -> Result<Vec<u32>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT uid FROM messages WHERE uid IS NOT NULL AND attachment IS NULL",
+        )?;
         let uids = stmt
             .query_map([], |r| r.get::<_, u32>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1338,6 +1422,7 @@ impl Store {
                 labels: BTreeSet::new(),
                 from: r.get(3)?,
                 from_email: r.get(8)?,
+                attachment: None,
                 subject: r.get(4)?,
                 date: r.get(5)?,
                 headers: Vec::new(),
@@ -1482,6 +1567,7 @@ mod tests {
             date: "Tue, 10 Nov 2026 09:30:00 +0000".into(),
             sent: 1_794_303_000 + i64::from(uid),
             from_email: format!("sender{uid}@example.com"),
+            attachment: None,
             headers: format!("Subject: Hello {uid}\r\n\r\n").into_bytes(),
             seen: false,
         }
@@ -1765,6 +1851,32 @@ mod tests {
     }
 
     #[test]
+    fn attachment_flags_reach_the_thread_list_and_survive_relistings() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        let mut a = msg(1, 1, &[]);
+        a.thrid = 100;
+        let mut b = msg(2, 2, &[]);
+        b.thrid = 100;
+        s.upsert_messages(&[a, b]).unwrap();
+        let mut missing = s.uids_missing_attachment_info().unwrap();
+        missing.sort();
+        assert_eq!(missing, vec![1, 2]);
+
+        s.set_attachments(&[(2, true), (1, false)]).unwrap();
+        assert!(s.uids_missing_attachment_info().unwrap().is_empty());
+        assert!(s.thread_page(&ThreadFilter::All, 0, 5).unwrap()[0].attachments);
+        assert!(s.check().unwrap().logical.is_empty());
+
+        // A write that doesn't know about attachments keeps the cached answer.
+        let mut again = msg(2, 2, &[]);
+        again.thrid = 100;
+        assert_eq!(again.attachment, None);
+        s.upsert_messages(&[again]).unwrap();
+        assert!(s.thread_page(&ThreadFilter::All, 0, 5).unwrap()[0].attachments);
+        assert!(s.check().unwrap().logical.is_empty());
+    }
+
+    #[test]
     fn search_matches_sender_and_subject_words() {
         let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
         let mut a = msg(1, 1, &[]);
@@ -1833,6 +1945,7 @@ mod tests {
                  DROP TABLE cache_state;
                  DROP TABLE pending_seen;
                  DROP TABLE label_threads;
+                 ALTER TABLE messages DROP COLUMN attachment;
                  ALTER TABLE messages DROP COLUMN sent;
                  ALTER TABLE messages DROP COLUMN from_email;
                  PRAGMA user_version = 3;",
@@ -2106,6 +2219,7 @@ mod bulk_timing {
                     labels: labels.clone(),
                     from: "a@example.com".into(),
                     from_email: "a@example.com".into(),
+                    attachment: None,
                     subject: "Something".into(),
                     date: "Tue, 10 Nov 2026 09:30:00 +0000".into(),
                     headers: headers.clone(),
