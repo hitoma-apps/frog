@@ -1193,15 +1193,21 @@ impl App {
                     self.label_row(ui, Some(raw.as_str()), segment, count);
                 }
             } else {
-                egui::CollapsingHeader::new(segment.as_str())
-                    .id_salt(&child_path)
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        if let Some(raw) = &child.label {
-                            self.label_row(ui, Some(raw.as_str()), segment, count);
-                        }
-                        self.label_tree(ui, child, counts, &child_path);
-                    });
+                // The header is the parent's own row (when it is a label), so the parent
+                // appears once. Its arrow opens the children.
+                let id = ui.scope_id().with(("label_tree", child_path.as_str()));
+                let state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ui.ctx(),
+                    id,
+                    false,
+                );
+                let header = state.show_header(ui, |ui| match &child.label {
+                    Some(raw) => self.label_row(ui, Some(raw.as_str()), segment, count),
+                    None => {
+                        ui.weak(segment.as_str());
+                    }
+                });
+                header.body(|ui| self.label_tree(ui, child, counts, &child_path));
             }
         }
     }
