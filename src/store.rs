@@ -25,7 +25,7 @@ pub const DEFAULT_BODY_CAP: u64 = 1 << 30;
 /// zstd level. Mail is text, so a low level compresses well and stays fast.
 const ZSTD_LEVEL: i32 = 3;
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -172,15 +172,39 @@ pub struct CheckReport {
     pub logical: Vec<String>,
 }
 
+/// Gives the thread summaries a head message and a date to sort by (schema v10), in place of
+/// the UID they had. Does nothing if that's already done, so it's safe on every path.
+fn upgrade_threads(tx: &Transaction) -> Result<()> {
+    let has_head: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('threads') WHERE name = 'head_msgid'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_head > 0 {
+        return Ok(());
+    }
+    tx.execute_batch(
+        "DROP INDEX IF EXISTS threads_newest;
+         ALTER TABLE threads DROP COLUMN newest_uid;
+         ALTER TABLE threads ADD COLUMN head_msgid INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE threads ADD COLUMN newest_sent INTEGER NOT NULL DEFAULT 0;
+         CREATE INDEX threads_newest ON threads(newest_sent, thrid);",
+    )?;
+    Ok(())
+}
+
 /// Recomputes every summary table from the messages. The search index is not included.
 fn rebuild_derived(tx: &Transaction) -> Result<()> {
     tx.execute_batch(
         "DELETE FROM threads;
          DELETE FROM thread_labels;
          DELETE FROM label_threads;
-         INSERT INTO threads (thrid, count, unread, newest_uid)
-             SELECT thrid, COUNT(*), SUM(seen = 0), MAX(uid) FROM messages
-             WHERE uid IS NOT NULL GROUP BY thrid;
+         INSERT INTO threads (thrid, count, unread, head_msgid, newest_sent)
+             SELECT m.thrid, COUNT(*), SUM(m.seen = 0),
+                 (SELECT m2.msgid FROM messages m2 WHERE m2.thrid = m.thrid AND m2.uid IS NOT NULL
+                  ORDER BY m2.sent DESC, m2.uid DESC LIMIT 1),
+                 MAX(m.sent)
+             FROM messages m WHERE m.uid IS NOT NULL GROUP BY m.thrid;
          INSERT INTO thread_labels (label, thrid)
              SELECT DISTINCT l.label, m.thrid FROM messages m
              JOIN message_labels l ON l.msgid = m.msgid WHERE m.uid IS NOT NULL;
@@ -311,12 +335,17 @@ fn refresh_threads(tx: &Transaction, thrids: &BTreeSet<u64>) -> Result<()> {
     for &thrid in thrids {
         let thrid = to_i64(thrid)?;
         let before = thread_contribution(tx, thrid)?;
-        let (count, unread, newest): (i64, i64, Option<i64>) = tx.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(seen = 0), 0), MAX(uid) FROM messages
-             WHERE thrid = ?1 AND uid IS NOT NULL",
-            params![thrid],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )?;
+        // The head is the newest message by date, as the thread list shows it.
+        let (count, unread, head, newest_sent): (i64, i64, Option<i64>, Option<i64>) = tx
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(seen = 0), 0),
+                     (SELECT msgid FROM messages WHERE thrid = ?1 AND uid IS NOT NULL
+                      ORDER BY sent DESC, uid DESC LIMIT 1),
+                     MAX(sent)
+                 FROM messages WHERE thrid = ?1 AND uid IS NOT NULL",
+                params![thrid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
         tx.execute("DELETE FROM thread_labels WHERE thrid = ?1", params![thrid])?;
         if count == 0 {
             tx.execute("DELETE FROM threads WHERE thrid = ?1", params![thrid])?;
@@ -325,9 +354,9 @@ fn refresh_threads(tx: &Transaction, thrids: &BTreeSet<u64>) -> Result<()> {
             continue;
         }
         tx.execute(
-            "INSERT OR REPLACE INTO threads (thrid, count, unread, newest_uid)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![thrid, count, unread, newest],
+            "INSERT OR REPLACE INTO threads (thrid, count, unread, head_msgid, newest_sent)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![thrid, count, unread, head, newest_sent],
         )?;
         tx.execute(
             "INSERT INTO thread_labels (label, thrid)
@@ -490,9 +519,12 @@ impl Store {
         const CHECKS: [(&str, &str, &str); 3] = [
             (
                 "thread summaries",
-                "SELECT thrid, COUNT(*), SUM(seen = 0), MAX(uid) FROM messages
-                 WHERE uid IS NOT NULL GROUP BY thrid",
-                "SELECT thrid, count, unread, newest_uid FROM threads",
+                "SELECT m.thrid, COUNT(*), SUM(m.seen = 0),
+                     (SELECT m2.msgid FROM messages m2 WHERE m2.thrid = m.thrid AND m2.uid IS NOT NULL
+                      ORDER BY m2.sent DESC, m2.uid DESC LIMIT 1),
+                     MAX(m.sent)
+                 FROM messages m WHERE m.uid IS NOT NULL GROUP BY m.thrid",
+                "SELECT thrid, count, unread, head_msgid, newest_sent FROM threads",
             ),
             (
                 "thread labels",
@@ -769,6 +801,7 @@ impl Store {
                  ALTER TABLE cache_totals ADD COLUMN threads INTEGER NOT NULL DEFAULT 0;
                  ALTER TABLE cache_totals ADD COLUMN unread_threads INTEGER NOT NULL DEFAULT 0;",
             )?;
+            upgrade_threads(&tx)?;
             // The UID fix above can change the summaries, so they're rebuilt.
             rebuild_derived(&tx)?;
         }
@@ -788,6 +821,11 @@ impl Store {
                  DROP TRIGGER IF EXISTS message_labels_removed;
                  DROP TABLE IF EXISTS label_stats;",
             )?;
+        }
+        if version < 10 {
+            // Threads sort by their newest message's date, not by UID (see upgrade_threads).
+            upgrade_threads(&tx)?;
+            rebuild_derived(&tx)?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -984,8 +1022,8 @@ impl Store {
             ThreadFilter::All => {
                 let sql = format!(
                     "SELECT {COLUMNS} FROM threads t
-                     JOIN messages m ON m.thrid = t.thrid AND m.uid = t.newest_uid
-                     ORDER BY t.newest_uid DESC LIMIT ?1 OFFSET ?2"
+                     JOIN messages m ON m.msgid = t.head_msgid
+                     ORDER BY t.newest_sent DESC, t.thrid DESC LIMIT ?1 OFFSET ?2"
                 );
                 self.thread_rows(&sql, params![limit, offset])?
             }
@@ -994,10 +1032,10 @@ impl Store {
                 // label that most threads carry fills its window at once.
                 let sql = format!(
                     "SELECT {COLUMNS} FROM threads t
-                     JOIN messages m ON m.thrid = t.thrid AND m.uid = t.newest_uid
+                     JOIN messages m ON m.msgid = t.head_msgid
                      WHERE EXISTS (SELECT 1 FROM thread_labels tl
                                    WHERE tl.label = ?1 AND tl.thrid = t.thrid)
-                     ORDER BY t.newest_uid DESC LIMIT ?2 OFFSET ?3"
+                     ORDER BY t.newest_sent DESC, t.thrid DESC LIMIT ?2 OFFSET ?3"
                 );
                 self.thread_rows(&sql, params![label, limit, offset])?
             }
@@ -1011,8 +1049,8 @@ impl Store {
                              WHERE messages_fts MATCH ?1 AND m.uid IS NOT NULL)
                          SELECT {COLUMNS} FROM hits h
                          JOIN threads t ON t.thrid = h.thrid
-                         JOIN messages m ON m.thrid = t.thrid AND m.uid = t.newest_uid
-                         ORDER BY t.newest_uid DESC LIMIT ?2 OFFSET ?3"
+                         JOIN messages m ON m.msgid = t.head_msgid
+                         ORDER BY t.newest_sent DESC, t.thrid DESC LIMIT ?2 OFFSET ?3"
                     );
                     self.thread_rows(&sql, params![query, limit, offset])?
                 }
@@ -1694,6 +1732,36 @@ mod tests {
         s.invalidate_uids().unwrap();
         assert_eq!(s.thread_count(&ThreadFilter::All).unwrap(), 0);
         assert_eq!(s.message_total().unwrap(), 0);
+    }
+
+    #[test]
+    fn threads_are_listed_by_newest_date_not_arrival() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        // Arrived last (highest UID), but sent long ago.
+        let mut old = msg(9, 9, &[]);
+        old.thrid = 500;
+        old.sent = 1_000;
+        // Arrived first, but sent most recently.
+        let mut recent = msg(1, 1, &[]);
+        recent.thrid = 100;
+        recent.sent = 2_000_000_000;
+        // One thread whose head is the newest by date, not the highest UID.
+        let mut later_arrival = msg(7, 7, &[]);
+        later_arrival.thrid = 900;
+        later_arrival.sent = 10;
+        let mut newer_date = msg(3, 3, &[]);
+        newer_date.thrid = 900;
+        newer_date.sent = 5_000;
+        s.upsert_messages(&[old, recent, later_arrival, newer_date])
+            .unwrap();
+
+        let page = s.thread_page(&ThreadFilter::All, 0, 10).unwrap();
+        assert_eq!(
+            page.iter().map(|t| t.thrid).collect::<Vec<_>>(),
+            vec![100, 900, 500]
+        );
+        assert_eq!(page[1].head.uid, Some(3), "the head is the newest by date");
+        assert!(s.check().unwrap().logical.is_empty());
     }
 
     #[test]

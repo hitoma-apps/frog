@@ -59,6 +59,43 @@ fn display_label(raw: &str) -> String {
     }
 }
 
+/// One level of the label tree: sub-labels by name, and the label that is exactly this path.
+#[derive(Default)]
+struct LabelNode {
+    label: Option<String>,
+    children: BTreeMap<String, LabelNode>,
+}
+
+/// The labels as a tree, split at "/". Gmail's IMAP server uses "/" to nest labels.
+fn label_tree<'a>(labels: impl Iterator<Item = &'a String>) -> LabelNode {
+    let mut root = LabelNode::default();
+    for raw in labels {
+        let mut node = &mut root;
+        for segment in raw.split('/') {
+            node = node.children.entry(segment.to_string()).or_default();
+        }
+        node.label = Some(raw.clone());
+    }
+    root
+}
+
+/// A subject without its reply and forward prefixes, lowercased, so that a thread's
+/// messages compare as one subject.
+fn base_subject(subject: &str) -> String {
+    let mut s = subject.trim().to_lowercase();
+    loop {
+        let before = s.len();
+        for prefix in ["re:", "fwd:", "fw:"] {
+            if let Some(rest) = s.strip_prefix(prefix) {
+                s = rest.trim_start().to_string();
+            }
+        }
+        if s.len() == before {
+            return s;
+        }
+    }
+}
+
 /// Mailboxes always shown in the sidebar, even when the cache has none of their
 /// messages. `None` is All Mail, which is every message.
 const MAILBOXES: [(&str, Option<&str>); 8] = [
@@ -1055,12 +1092,27 @@ impl App {
             let (threads, unread) = count;
             let text = format!("{name} ({unread}/{threads})");
             let hover = format!("{name}: {unread} unread of {threads} threads");
-            let row = egui::Button::selectable(selected, text).truncate();
-            if ui
-                .add_sized([width, height], row)
-                .on_hover_text(hover)
-                .clicked()
-            {
+            let band = if selected {
+                ui.visuals().selection.bg_fill
+            } else {
+                egui::Color32::TRANSPARENT
+            };
+            let frame = egui::Frame::new()
+                .fill(band)
+                .corner_radius(4)
+                .show(ui, |ui| {
+                    ui.set_min_size(egui::vec2(width, height));
+                    ui.set_max_width(width);
+                    ui.add(egui::Label::new(text).truncate());
+                });
+            let response = ui
+                .interact(
+                    frame.response.rect,
+                    ui.scope_id().with(("label", key.unwrap_or(name))),
+                    egui::Sense::click(),
+                )
+                .on_hover_text(hover);
+            if response.clicked() {
                 self.set_label_filter(key.map(str::to_owned));
             }
         });
@@ -1110,11 +1162,48 @@ impl App {
                 if !user.is_empty() {
                     ui.separator();
                     ui.weak("Labels");
-                    for (k, count) in &user {
-                        self.label_row(ui, Some(k), k, *count);
-                    }
+                    let tree = label_tree(user.keys());
+                    self.label_tree(ui, &tree, &user, "");
                 }
             });
+    }
+
+    /// The label tree: a label with sub-labels opens to show them, and its own row comes first.
+    fn label_tree(
+        &mut self,
+        ui: &mut egui::Ui,
+        node: &LabelNode,
+        counts: &BTreeMap<String, (usize, usize)>,
+        path: &str,
+    ) {
+        for (segment, child) in &node.children {
+            let child_path = if path.is_empty() {
+                segment.clone()
+            } else {
+                format!("{path}/{segment}")
+            };
+            let count = child
+                .label
+                .as_ref()
+                .and_then(|l| counts.get(l))
+                .copied()
+                .unwrap_or((0, 0));
+            if child.children.is_empty() {
+                if let Some(raw) = &child.label {
+                    self.label_row(ui, Some(raw.as_str()), segment, count);
+                }
+            } else {
+                egui::CollapsingHeader::new(segment.as_str())
+                    .id_salt(&child_path)
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        if let Some(raw) = &child.label {
+                            self.label_row(ui, Some(raw.as_str()), segment, count);
+                        }
+                        self.label_tree(ui, child, counts, &child_path);
+                    });
+            }
+        }
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
@@ -1184,6 +1273,8 @@ impl App {
     /// the rows on screen are drawn. Every row is exactly one widget tall, so the
     /// virtual list can place rows without measuring them.
     fn message_list(&mut self, ui: &mut egui::Ui) {
+        // The list keeps the height the user set, even while its content is short.
+        ui.set_min_height(ui.available_height());
         let filter = self.thread_filter();
         if self.window_filter.as_ref() != Some(&filter) {
             // A new list, or one that was reset: read its first rows.
@@ -1292,11 +1383,27 @@ impl App {
                             .show(ui, |ui| {
                                 ui.set_min_size(egui::vec2(title_w, row_height));
                                 ui.set_max_width(title_w);
-                                ui.add(
-                                    egui::Label::new(title_text)
-                                        .truncate()
-                                        .sense(egui::Sense::click()),
-                                )
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    if unread {
+                                        // Bold isn't available in this font, so unread gets a dot.
+                                        let (dot, _) = ui.allocate_exact_size(
+                                            egui::vec2(8.0, row_height),
+                                            egui::Sense::hover(),
+                                        );
+                                        ui.painter().circle_filled(
+                                            dot.center(),
+                                            3.5,
+                                            ui.visuals().strong_text_color(),
+                                        );
+                                    }
+                                    ui.add(
+                                        egui::Label::new(title_text)
+                                            .truncate()
+                                            .sense(egui::Sense::click()),
+                                    )
+                                })
+                                .inner
                             })
                             .inner;
                         if title
@@ -1445,6 +1552,25 @@ impl App {
             return;
         }
 
+        // When every message has the same subject, it's shown once, and each message keeps
+        // only its sender and time.
+        let bases: BTreeSet<String> = thread
+            .iter()
+            .filter_map(|u| self.thread_msgs.get(u))
+            .map(|m| base_subject(&m.subject))
+            .collect();
+        let shared_subject: Option<String> = if bases.len() == 1 {
+            thread
+                .first()
+                .and_then(|u| self.thread_msgs.get(u))
+                .map(|m| m.subject.clone())
+        } else {
+            None
+        };
+        if let Some(subject) = &shared_subject {
+            ui.heading(subject);
+        }
+
         let newest = thread.first().copied();
         let session_key = self.settings.gmail_session_key.clone();
         let mut pending: Option<LinkInfo> = None;
@@ -1456,7 +1582,11 @@ impl App {
                     let Some(m) = self.thread_msgs.get(&uid) else {
                         continue;
                     };
-                    let title = format!("{} — {}   {}", sender_line(m), m.subject, m.date);
+                    let title = if shared_subject.is_some() {
+                        format!("{}   {}", sender_line(m), m.date)
+                    } else {
+                        format!("{} — {}   {}", sender_line(m), m.subject, m.date)
+                    };
                     // The accent colours each message's header line and its bar. Bodies keep the
                     // normal text colour, so header and body read as separate.
                     let accent = ui.visuals().hyperlink_color;
@@ -1758,6 +1888,36 @@ mod tests {
         let used: std::collections::BTreeSet<usize> =
             names.iter().map(|n| sender_slot(n)).collect();
         assert!(used.len() >= 4, "{used:?}");
+    }
+
+    #[test]
+    fn reply_and_forward_prefixes_do_not_change_a_subject() {
+        assert_eq!(base_subject("Re: Re: Fwd: Hello"), "hello");
+        assert_eq!(base_subject("  RE:hello "), "hello");
+        assert_eq!(base_subject("Hello"), base_subject("re: hello"));
+        assert_ne!(base_subject("Hello"), base_subject("Hello again"));
+    }
+
+    #[test]
+    fn labels_nest_under_their_parents() {
+        let names = [
+            "2011/Moving".to_string(),
+            "2011".to_string(),
+            "Work".to_string(),
+        ];
+        let tree = label_tree(names.iter());
+        assert_eq!(tree.children.len(), 2);
+        let parent = &tree.children["2011"];
+        assert_eq!(
+            parent.label.as_deref(),
+            Some("2011"),
+            "a label can be its own parent"
+        );
+        assert_eq!(
+            parent.children["Moving"].label.as_deref(),
+            Some("2011/Moving")
+        );
+        assert!(tree.children["Work"].children.is_empty());
     }
 
     #[test]
