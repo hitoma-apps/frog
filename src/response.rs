@@ -270,6 +270,8 @@ pub struct GmailFetch<'a> {
     pub modseq: Option<u64>,
     /// `BODYSTRUCTURE`: the message's part tree, if requested.
     pub structure: Option<Value<'a>>,
+    /// `INTERNALDATE`: when the server received the message, as a Unix time, if requested.
+    pub internal_date: Option<i64>,
 }
 
 impl GmailFetch<'_> {
@@ -302,6 +304,7 @@ pub fn parse_gmail_fetch(buf: &[u8]) -> Result<GmailFetch<'_>, ParseError> {
             "FLAGS" => out.flags = Some(labels_from(&value)),
             "MODSEQ" => out.modseq = modseq_from(&value),
             "BODYSTRUCTURE" => out.structure = Some(value),
+            "INTERNALDATE" => out.internal_date = internal_date_from(&value),
             "BODY[]" => {
                 if let Value::Bytes(b) = value {
                     out.body = Some(b);
@@ -316,6 +319,15 @@ pub fn parse_gmail_fetch(buf: &[u8]) -> Result<GmailFetch<'_>, ParseError> {
         }
     }
     Ok(out)
+}
+
+/// `INTERNALDATE`, such as `10-Nov-2026 09:30:00 +0000`, as a Unix time. The day may be
+/// padded with a space. Anything else gives `None`.
+fn internal_date_from(v: &Value<'_>) -> Option<i64> {
+    let text = v.as_str()?.trim();
+    chrono::DateTime::parse_from_str(text, "%d-%b-%Y %H:%M:%S %z")
+        .ok()
+        .map(|d| d.timestamp())
 }
 
 /// Whether a `BODYSTRUCTURE` tree has an attachment: a single part (a leaf) whose
@@ -414,6 +426,29 @@ mod flags_tests {
         assert!(!structure_of(
             "* 1 FETCH (UID 9 BODYSTRUCTURE (\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 20 1 NIL NIL NIL NIL))\r\n"
         ));
+    }
+
+    #[test]
+    fn internal_date_is_read_as_a_unix_time() {
+        let g =
+            parse_gmail_fetch(b"* 1 FETCH (UID 3 INTERNALDATE \"10-Nov-2026 09:30:00 +0000\")\r\n")
+                .unwrap();
+        assert_eq!(g.internal_date, Some(1_794_303_000));
+    }
+
+    #[test]
+    fn a_single_digit_day_and_other_zones_are_read() {
+        let g =
+            parse_gmail_fetch(b"* 1 FETCH (UID 3 INTERNALDATE \"1-Nov-2026 10:30:00 +0100\")\r\n")
+                .unwrap();
+        // 09:30 UTC on 1 November 2026.
+        assert_eq!(g.internal_date, Some(1_793_525_400));
+    }
+
+    #[test]
+    fn a_malformed_internal_date_is_left_out() {
+        let g = parse_gmail_fetch(b"* 1 FETCH (UID 3 INTERNALDATE \"yesterday\")\r\n").unwrap();
+        assert_eq!(g.internal_date, None);
     }
 
     #[test]

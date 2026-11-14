@@ -25,7 +25,7 @@ pub const DEFAULT_BODY_CAP: u64 = 1 << 30;
 /// zstd level. Mail is text, so a low level compresses well and stays fast.
 const ZSTD_LEVEL: i32 = 3;
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -108,6 +108,9 @@ pub struct CachedMessage {
     /// Whether the message has an attachment, from its structure. `None` if not known yet.
     /// Listings leave it `None`, and a write with `None` keeps what the cache already has.
     pub attachment: Option<bool>,
+    /// When the server received the message, as a Unix time (INTERNALDATE). `None` if not known
+    /// yet. Listings leave it `None`, and a write with `None` keeps what the cache has.
+    pub received: Option<i64>,
     pub subject: String,
     pub date: String,
     /// The sent time (Unix seconds) from the Date header, or 0 if there isn't one.
@@ -190,6 +193,43 @@ pub struct CheckReport {
     pub logical: Vec<String>,
 }
 
+/// Adds the received-time column (schema v12), and renames the thread sort key from the sent
+/// time to a time that's received when known. Does nothing if that's already done.
+fn upgrade_received(tx: &Transaction) -> Result<()> {
+    let has_received: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'received'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_received == 0 {
+        tx.execute_batch("ALTER TABLE messages ADD COLUMN received INTEGER;")?;
+    }
+    let has_time: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('threads') WHERE name = 'newest_time'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_time == 0 {
+        // The sort key was called newest_sent before this version. The index follows the
+        // rename, so it's recreated only if the column had to be added instead.
+        let has_sent: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('threads') WHERE name = 'newest_sent'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_sent > 0 {
+            tx.execute_batch("ALTER TABLE threads RENAME COLUMN newest_sent TO newest_time;")?;
+        } else {
+            tx.execute_batch(
+                "ALTER TABLE threads ADD COLUMN newest_time INTEGER NOT NULL DEFAULT 0;
+                 DROP INDEX IF EXISTS threads_newest;
+                 CREATE INDEX threads_newest ON threads(newest_time, thrid);",
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Adds the attachment columns (schema v11) if they're missing, so a rebuild can use them on
 /// every path. Does nothing if they're already there.
 fn upgrade_attachments(tx: &Transaction) -> Result<()> {
@@ -223,23 +263,27 @@ fn upgrade_threads(tx: &Transaction) -> Result<()> {
         "DROP INDEX IF EXISTS threads_newest;
          ALTER TABLE threads DROP COLUMN newest_uid;
          ALTER TABLE threads ADD COLUMN head_msgid INTEGER NOT NULL DEFAULT 0;
-         ALTER TABLE threads ADD COLUMN newest_sent INTEGER NOT NULL DEFAULT 0;
-         CREATE INDEX threads_newest ON threads(newest_sent, thrid);",
+         ALTER TABLE threads ADD COLUMN newest_time INTEGER NOT NULL DEFAULT 0;
+         CREATE INDEX threads_newest ON threads(newest_time, thrid);",
     )?;
     Ok(())
 }
 
 /// Recomputes every summary table from the messages. The search index is not included.
 fn rebuild_derived(tx: &Transaction) -> Result<()> {
+    // The columns the rebuild uses must exist on every path, including old caches.
+    upgrade_threads(tx)?;
+    upgrade_attachments(tx)?;
+    upgrade_received(tx)?;
     tx.execute_batch(
         "DELETE FROM threads;
          DELETE FROM thread_labels;
          DELETE FROM label_threads;
-         INSERT INTO threads (thrid, count, unread, head_msgid, newest_sent, attachments)
+         INSERT INTO threads (thrid, count, unread, head_msgid, newest_time, attachments)
              SELECT m.thrid, COUNT(*), SUM(m.seen = 0),
                  (SELECT m2.msgid FROM messages m2 WHERE m2.thrid = m.thrid AND m2.uid IS NOT NULL
-                  ORDER BY m2.sent DESC, m2.uid DESC LIMIT 1),
-                 MAX(m.sent),
+                  ORDER BY COALESCE(m2.received, m2.sent) DESC, m2.uid DESC LIMIT 1),
+                 MAX(COALESCE(m.received, m.sent)),
                  COUNT(CASE WHEN m.attachment = 1 THEN 1 END)
              FROM messages m WHERE m.uid IS NOT NULL GROUP BY m.thrid;
          INSERT INTO thread_labels (label, thrid)
@@ -373,7 +417,7 @@ fn refresh_threads(tx: &Transaction, thrids: &BTreeSet<u64>) -> Result<()> {
         let thrid = to_i64(thrid)?;
         let before = thread_contribution(tx, thrid)?;
         // The head is the newest message by date, as the thread list shows it.
-        let (count, unread, head, newest_sent, attachments): (
+        let (count, unread, head, newest_time, attachments): (
             i64,
             i64,
             Option<i64>,
@@ -382,8 +426,8 @@ fn refresh_threads(tx: &Transaction, thrids: &BTreeSet<u64>) -> Result<()> {
         ) = tx.query_row(
             "SELECT COUNT(*), COALESCE(SUM(seen = 0), 0),
                  (SELECT msgid FROM messages WHERE thrid = ?1 AND uid IS NOT NULL
-                  ORDER BY sent DESC, uid DESC LIMIT 1),
-                 MAX(sent),
+                  ORDER BY COALESCE(received, sent) DESC, uid DESC LIMIT 1),
+                 MAX(COALESCE(received, sent)),
                  COUNT(CASE WHEN attachment = 1 THEN 1 END)
              FROM messages WHERE thrid = ?1 AND uid IS NOT NULL",
             params![thrid],
@@ -398,9 +442,9 @@ fn refresh_threads(tx: &Transaction, thrids: &BTreeSet<u64>) -> Result<()> {
         }
         tx.execute(
             "INSERT OR REPLACE INTO threads
-                 (thrid, count, unread, head_msgid, newest_sent, attachments)
+                 (thrid, count, unread, head_msgid, newest_time, attachments)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![thrid, count, unread, head, newest_sent, attachments],
+            params![thrid, count, unread, head, newest_time, attachments],
         )?;
         tx.execute(
             "INSERT INTO thread_labels (label, thrid)
@@ -436,6 +480,7 @@ fn cached_from_row(r: &rusqlite::Row) -> rusqlite::Result<CachedMessage> {
         from: r.get(3)?,
         from_email: r.get(8)?,
         attachment: None,
+        received: None,
         subject: r.get(4)?,
         date: r.get(5)?,
         headers: Vec::new(),
@@ -583,11 +628,11 @@ impl Store {
                 "thread summaries",
                 "SELECT m.thrid, COUNT(*), SUM(m.seen = 0),
                      (SELECT m2.msgid FROM messages m2 WHERE m2.thrid = m.thrid AND m2.uid IS NOT NULL
-                      ORDER BY m2.sent DESC, m2.uid DESC LIMIT 1),
-                     MAX(m.sent),
+                      ORDER BY COALESCE(m2.received, m2.sent) DESC, m2.uid DESC LIMIT 1),
+                     MAX(COALESCE(m.received, m.sent)),
                      COUNT(CASE WHEN m.attachment = 1 THEN 1 END)
                  FROM messages m WHERE m.uid IS NOT NULL GROUP BY m.thrid",
-                "SELECT thrid, count, unread, head_msgid, newest_sent, attachments FROM threads",
+                "SELECT thrid, count, unread, head_msgid, newest_time, attachments FROM threads",
             ),
             (
                 "thread labels",
@@ -894,6 +939,10 @@ impl Store {
                  DROP TABLE IF EXISTS label_stats;",
             )?;
         }
+        if version < 12 {
+            // The thread sort key changes from the sent time to the received time.
+            rebuild_derived(&tx)?;
+        }
         if version < 11 {
             upgrade_attachments(&tx)?;
             rebuild_derived(&tx)?;
@@ -953,15 +1002,16 @@ impl Store {
             }
             affected.insert(m.thrid);
             tx.execute(
-                "INSERT INTO messages (msgid, thrid, uid, from_addr, subject, date, headers, seen, sent, from_email, attachment)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                "INSERT INTO messages (msgid, thrid, uid, from_addr, subject, date, headers, seen, sent, from_email, attachment, received)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                  ON CONFLICT(msgid) DO UPDATE SET
                      thrid = excluded.thrid, uid = excluded.uid,
                      from_addr = excluded.from_addr, subject = excluded.subject,
                      date = excluded.date, headers = excluded.headers,
                      seen = excluded.seen, sent = excluded.sent,
                      from_email = excluded.from_email,
-                     attachment = COALESCE(excluded.attachment, messages.attachment)",
+                     attachment = COALESCE(excluded.attachment, messages.attachment),
+                     received = COALESCE(excluded.received, messages.received)",
                 params![
                     msgid,
                     to_i64(m.thrid)?,
@@ -973,7 +1023,8 @@ impl Store {
                     m.seen,
                     m.sent,
                     m.from_email,
-                    m.attachment
+                    m.attachment,
+                    m.received
                 ],
             )?;
             tx.execute(
@@ -1130,14 +1181,14 @@ impl Store {
     ) -> Result<Vec<ThreadSummary>> {
         const COLUMNS: &str = "t.thrid, t.count, t.unread, m.msgid, m.thrid, m.uid,
                                m.from_addr, m.subject, m.date, m.seen, m.sent, m.from_email,
-                               t.attachments";
+                               t.attachments, m.received";
         let (limit, offset) = (limit as i64, offset as i64);
         let rows: Vec<ThreadListRow> = match filter {
             ThreadFilter::All => {
                 let sql = format!(
                     "SELECT {COLUMNS} FROM threads t
                      JOIN messages m ON m.msgid = t.head_msgid
-                     ORDER BY t.newest_sent DESC, t.thrid DESC LIMIT ?1 OFFSET ?2"
+                     ORDER BY t.newest_time DESC, t.thrid DESC LIMIT ?1 OFFSET ?2"
                 );
                 self.thread_rows(&sql, params![limit, offset])?
             }
@@ -1149,7 +1200,7 @@ impl Store {
                      JOIN messages m ON m.msgid = t.head_msgid
                      WHERE EXISTS (SELECT 1 FROM thread_labels tl
                                    WHERE tl.label = ?1 AND tl.thrid = t.thrid)
-                     ORDER BY t.newest_sent DESC, t.thrid DESC LIMIT ?2 OFFSET ?3"
+                     ORDER BY t.newest_time DESC, t.thrid DESC LIMIT ?2 OFFSET ?3"
                 );
                 self.thread_rows(&sql, params![label, limit, offset])?
             }
@@ -1164,7 +1215,7 @@ impl Store {
                          SELECT {COLUMNS} FROM hits h
                          JOIN threads t ON t.thrid = h.thrid
                          JOIN messages m ON m.msgid = t.head_msgid
-                         ORDER BY t.newest_sent DESC, t.thrid DESC LIMIT ?2 OFFSET ?3"
+                         ORDER BY t.newest_time DESC, t.thrid DESC LIMIT ?2 OFFSET ?3"
                     );
                     self.thread_rows(&sql, params![query, limit, offset])?
                 }
@@ -1203,6 +1254,7 @@ impl Store {
                     from: r.get(6)?,
                     from_email: r.get(11)?,
                     attachment: None,
+                    received: r.get(13)?,
                     subject: r.get(7)?,
                     date: r.get(8)?,
                     headers: Vec::new(),
@@ -1226,13 +1278,14 @@ impl Store {
         // The header blocks are read too: a conversation is read in full, and they carry
         // the authentication results.
         let mut stmt = self.conn.prepare_cached(
-            "SELECT msgid, thrid, uid, from_addr, subject, date, seen, sent, from_email, headers FROM messages
+            "SELECT msgid, thrid, uid, from_addr, subject, date, seen, sent, from_email, headers, received FROM messages
              WHERE thrid = ?1 AND uid IS NOT NULL ORDER BY uid DESC",
         )?;
         let mut out = stmt
             .query_map(params![to_i64(thrid)?], |r| {
                 let mut m = cached_from_row(r)?;
                 m.headers = r.get(9)?;
+                m.received = r.get(10)?;
                 Ok(m)
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1345,6 +1398,7 @@ impl Store {
                 from: r.get(3)?,
                 from_email: r.get(8)?,
                 attachment: None,
+                received: None,
                 subject: r.get(4)?,
                 date: r.get(5)?,
                 headers: Vec::new(),
@@ -1368,11 +1422,12 @@ impl Store {
         Ok(uids)
     }
 
-    /// Records whether messages have attachments, by UID, and refreshes their threads.
-    pub fn set_attachments(&mut self, flags: &[(u32, bool)]) -> Result<()> {
+    /// Records each message's attachment flag and received time, by UID, and refreshes their
+    /// threads. A `None` time keeps the one the cache has.
+    pub fn set_structures(&mut self, rows: &[(u32, bool, Option<i64>)]) -> Result<()> {
         let tx = self.conn.transaction()?;
         let mut affected: BTreeSet<u64> = BTreeSet::new();
-        for &(uid, has) in flags {
+        for &(uid, has, received) in rows {
             let thread: Option<i64> = tx
                 .query_row(
                     "SELECT thrid FROM messages WHERE uid = ?1",
@@ -1382,8 +1437,8 @@ impl Store {
                 .optional()?;
             affected.extend(thread.map(|t| t as u64));
             tx.execute(
-                "UPDATE messages SET attachment = ?2 WHERE uid = ?1",
-                params![uid, has],
+                "UPDATE messages SET attachment = ?2, received = COALESCE(?3, received) WHERE uid = ?1",
+                params![uid, has, received],
             )?;
         }
         refresh_threads(&tx, &affected)?;
@@ -1394,7 +1449,7 @@ impl Store {
     /// UIDs of cached messages whose attachments haven't been looked at yet.
     pub fn uids_missing_attachment_info(&self) -> Result<Vec<u32>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT uid FROM messages WHERE uid IS NOT NULL AND attachment IS NULL",
+            "SELECT uid FROM messages WHERE uid IS NOT NULL AND (attachment IS NULL OR received IS NULL)",
         )?;
         let uids = stmt
             .query_map([], |r| r.get::<_, u32>(0))?
@@ -1491,6 +1546,7 @@ impl Store {
                 from: r.get(3)?,
                 from_email: r.get(8)?,
                 attachment: None,
+                received: None,
                 subject: r.get(4)?,
                 date: r.get(5)?,
                 headers: Vec::new(),
@@ -1639,6 +1695,7 @@ mod tests {
             sent: 1_794_303_000 + i64::from(uid),
             from_email: format!("sender{uid}@example.com"),
             attachment: None,
+            received: None,
             headers: format!("Subject: Hello {uid}\r\n\r\n").into_bytes(),
             seen: false,
         }
@@ -1933,7 +1990,8 @@ mod tests {
         missing.sort();
         assert_eq!(missing, vec![1, 2]);
 
-        s.set_attachments(&[(2, true), (1, false)]).unwrap();
+        s.set_structures(&[(2, true, Some(1_000)), (1, false, Some(2_000))])
+            .unwrap();
         assert!(s.uids_missing_attachment_info().unwrap().is_empty());
         assert!(s.thread_page(&ThreadFilter::All, 0, 5).unwrap()[0].attachments);
         assert!(s.check().unwrap().logical.is_empty());
@@ -1944,6 +2002,30 @@ mod tests {
         assert_eq!(again.attachment, None);
         s.upsert_messages(&[again]).unwrap();
         assert!(s.thread_page(&ThreadFilter::All, 0, 5).unwrap()[0].attachments);
+        assert!(s.check().unwrap().logical.is_empty());
+    }
+
+    #[test]
+    fn threads_are_listed_by_received_time_when_known() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        // Dated later by its sender, but received first.
+        let mut early = msg(1, 1, &[]);
+        early.thrid = 500;
+        early.sent = 2_000_000_000;
+        early.received = Some(1_000);
+        // Dated earlier by its sender, but received last.
+        let mut late = msg(2, 2, &[]);
+        late.thrid = 100;
+        late.sent = 1_000;
+        late.received = Some(3_000_000_000);
+        s.upsert_messages(&[early, late]).unwrap();
+        let order: Vec<u64> = s
+            .thread_page(&ThreadFilter::All, 0, 10)
+            .unwrap()
+            .iter()
+            .map(|t| t.thrid)
+            .collect();
+        assert_eq!(order, vec![100, 500]);
         assert!(s.check().unwrap().logical.is_empty());
     }
 
@@ -2371,6 +2453,7 @@ mod bulk_timing {
                     from: "a@example.com".into(),
                     from_email: "a@example.com".into(),
                     attachment: None,
+                    received: None,
                     subject: "Something".into(),
                     date: "Tue, 10 Nov 2026 09:30:00 +0000".into(),
                     headers: headers.clone(),

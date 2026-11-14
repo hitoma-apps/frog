@@ -57,6 +57,14 @@ pub struct MessageUpdate {
     pub seen: bool,
 }
 
+/// What the backfill learns about a cached message from its structure and internal date.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructureInfo {
+    pub uid: u32,
+    pub attachment: bool,
+    pub received: Option<i64>,
+}
+
 /// Something the server told us while idle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdleNotice {
@@ -89,6 +97,8 @@ pub struct Message {
     pub date: String,
     /// When the message was sent, as a Unix timestamp. 0 if the Date header is missing.
     pub sent: i64,
+    /// When the server received the message, as a Unix time (INTERNALDATE). `None` if not known.
+    pub received: Option<i64>,
     /// The header block, as sent by the server. Empty for list rows, which don't need it.
     pub headers: Vec<u8>,
     /// The SPF, DKIM and DMARC checks the server recorded in the headers.
@@ -100,6 +110,12 @@ pub struct Message {
 }
 
 impl Message {
+    /// When the message arrived at Gmail, as a Unix time. The sender's Date header is used
+    /// when the server didn't say, and 0 if there's neither.
+    pub fn when(&self) -> i64 {
+        self.received.unwrap_or(self.sent)
+    }
+
     /// Builds a listing entry from a header block. Parsing is best effort.
     pub fn from_headers(
         msgid: u64,
@@ -147,6 +163,7 @@ impl Message {
             from,
             from_email,
             attachment: None,
+            received: None,
             subject,
             date,
             sent,
@@ -166,6 +183,7 @@ impl Message {
             from: self.from.clone(),
             from_email: self.from_email.clone(),
             attachment: self.attachment,
+            received: self.received,
             subject: self.subject.clone(),
             date: self.date.clone(),
             sent: self.sent,
@@ -181,6 +199,7 @@ impl Message {
     pub fn from_cached(c: CachedMessage) -> Option<Self> {
         Some(Self {
             attachment: None,
+            received: c.received,
             msgid: c.msgid,
             thrid: c.thrid,
             uid: c.uid?,
@@ -233,9 +252,9 @@ pub trait MailSource: Send {
         labels: &[String],
     ) -> Result<(String, Vec<MessageUpdate>), SourceError>;
 
-    /// Whether each message has an attachment, from its structure. Messages the server doesn't
-    /// return are left out.
-    fn fetch_structures(&mut self, uids: &[u32]) -> Result<Vec<(u32, bool)>, SourceError> {
+    /// Each message's attachment flag and received time. Messages the server doesn't return
+    /// are left out.
+    fn fetch_structures(&mut self, uids: &[u32]) -> Result<Vec<StructureInfo>, SourceError> {
         let _ = uids;
         Err("this source can't read attachment information".into())
     }
@@ -608,13 +627,17 @@ impl MailSource for MockSource {
         Ok((command, updates))
     }
 
-    fn fetch_structures(&mut self, uids: &[u32]) -> Result<Vec<(u32, bool)>, SourceError> {
+    fn fetch_structures(&mut self, uids: &[u32]) -> Result<Vec<StructureInfo>, SourceError> {
         let st = self.state.lock().unwrap();
         Ok(uids
             .iter()
             .copied()
             .filter(|u| st.entries.iter().any(|e| e.uid == *u))
-            .map(|u| (u, false))
+            .map(|uid| StructureInfo {
+                uid,
+                attachment: false,
+                received: None,
+            })
             .collect())
     }
 

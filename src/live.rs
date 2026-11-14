@@ -8,7 +8,8 @@ use gmail_imap_proto::labels::LabelAction;
 use gmail_imap_proto::parse_gmail_fetch;
 
 use crate::backend::{
-    IdleNotice, MailSource, MailboxInfo, Message, MessageUpdate, SourceError, label_refs,
+    IdleNotice, MailSource, MailboxInfo, Message, MessageUpdate, SourceError, StructureInfo,
+    label_refs,
 };
 
 /// Gmail's All Mail folder holds every message, whatever its labels.
@@ -103,8 +104,7 @@ impl<S: Read + Write + Send + SetReadTimeout> MailSource for LiveSession<S> {
         self.ensure_selected()?;
         let mut out = Vec::with_capacity(uids.len());
         for chunk in uids.chunks(FETCH_CHUNK) {
-            let items =
-                "UID X-GM-MSGID X-GM-THRID X-GM-LABELS FLAGS BODY.PEEK[HEADER] BODYSTRUCTURE";
+            let items = "UID X-GM-MSGID X-GM-THRID X-GM-LABELS FLAGS BODY.PEEK[HEADER] BODYSTRUCTURE INTERNALDATE";
             for raw in self.conn.uid_fetch(chunk, items).map_err(to_source_error)? {
                 let f = parse_gmail_fetch(&raw).map_err(|e| SourceError::Failed(e.to_string()))?;
                 let (Some(uid), Some(msgid)) = (f.uid, f.msgid) else {
@@ -120,6 +120,7 @@ impl<S: Read + Write + Send + SetReadTimeout> MailSource for LiveSession<S> {
                     headers,
                 );
                 m.attachment = f.has_attachment();
+                m.received = f.internal_date;
                 out.push(m);
             }
         }
@@ -176,17 +177,21 @@ impl<S: Read + Write + Send + SetReadTimeout> MailSource for LiveSession<S> {
         Ok((command, updates))
     }
 
-    fn fetch_structures(&mut self, uids: &[u32]) -> Result<Vec<(u32, bool)>, SourceError> {
+    fn fetch_structures(&mut self, uids: &[u32]) -> Result<Vec<StructureInfo>, SourceError> {
         self.ensure_selected()?;
         let mut out = Vec::with_capacity(uids.len());
         for raw in self
             .conn
-            .uid_fetch(uids, "UID BODYSTRUCTURE")
+            .uid_fetch(uids, "UID BODYSTRUCTURE INTERNALDATE")
             .map_err(to_source_error)?
         {
             let f = parse_gmail_fetch(&raw).map_err(|e| SourceError::Failed(e.to_string()))?;
-            if let (Some(uid), Some(has)) = (f.uid, f.has_attachment()) {
-                out.push((uid, has));
+            if let (Some(uid), Some(attachment)) = (f.uid, f.has_attachment()) {
+                out.push(StructureInfo {
+                    uid,
+                    attachment,
+                    received: f.internal_date,
+                });
             }
         }
         Ok(out)

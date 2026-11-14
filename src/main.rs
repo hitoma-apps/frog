@@ -79,6 +79,20 @@ fn label_tree<'a>(labels: impl Iterator<Item = &'a String>) -> LabelNode {
     root
 }
 
+/// A time for people: the local time, without the time zone. Empty if unknown.
+fn format_time(ts: i64) -> String {
+    if ts <= 0 {
+        return String::new();
+    }
+    chrono::DateTime::from_timestamp(ts, 0)
+        .map(|utc| {
+            utc.with_timezone(&chrono::Local)
+                .format("%a, %d %b %Y %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
 /// A subject without its reply and forward prefixes, lowercased, so that a thread's
 /// messages compare as one subject.
 fn base_subject(subject: &str) -> String {
@@ -1523,7 +1537,7 @@ impl App {
                             }
                         }
 
-                        let date = egui::RichText::new(&m.date).weak();
+                        let date = egui::RichText::new(format_time(m.when())).weak();
                         ui.add_sized([DATE_WIDTH, row_height], egui::Label::new(date).truncate());
                     });
                     ui.painter().set(
@@ -1575,7 +1589,7 @@ impl App {
             std::cmp::Reverse(
                 self.thread_msgs
                     .get(uid)
-                    .map_or((0i64, 0u32), |m| (m.sent, m.uid)),
+                    .map_or((0i64, 0u32), |m| (m.when(), m.uid)),
             )
         });
 
@@ -1684,9 +1698,14 @@ impl App {
                         continue;
                     };
                     let title = if shared_subject.is_some() {
-                        format!("{}   {}", sender_line(m), m.date)
+                        format!("{}   {}", sender_line(m), format_time(m.when()))
                     } else {
-                        format!("{} — {}   {}", sender_line(m), m.subject, m.date)
+                        format!(
+                            "{} — {}   {}",
+                            sender_line(m),
+                            m.subject,
+                            format_time(m.when())
+                        )
                     };
                     // The accent colours each message's header line and its bar. Bodies keep the
                     // normal text colour, so header and body read as separate.
@@ -2092,6 +2111,14 @@ mod tests {
             Some("2011/Moving")
         );
         assert!(tree.children["Work"].children.is_empty());
+    }
+
+    #[test]
+    fn times_show_local_time_without_a_zone() {
+        assert_eq!(format_time(0), "");
+        let shown = format_time(1_794_303_000);
+        assert!(shown.contains("2026"), "{shown}");
+        assert!(!shown.contains("+") && !shown.contains("UTC"), "{shown}");
     }
 
     #[test]

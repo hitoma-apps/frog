@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 directories = "6.0.0"
 eframe = "0.37.0"
 keyring = { version = "4.2.0", features = ["apple-native-keyring-store"] }

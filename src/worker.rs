@@ -1025,9 +1025,13 @@ impl Worker {
         let n = BATCH.min(self.state.pending_structure.len());
         let batch: Vec<u32> = self.state.pending_structure.drain(..n).collect();
         match src.fetch_structures(&batch) {
-            Ok(flags) => {
+            Ok(infos) => {
+                let rows: Vec<(u32, bool, Option<i64>)> = infos
+                    .iter()
+                    .map(|i| (i.uid, i.attachment, i.received))
+                    .collect();
                 if let Some(store) = self.store.as_mut()
-                    && let Err(e) = store.set_attachments(&flags)
+                    && let Err(e) = store.set_structures(&rows)
                 {
                     self.emit
                         .send(Event::Error(format!("cache write failed: {e}")));
@@ -1523,6 +1527,7 @@ mod tests {
                     .map(|uid| gmail_imap_proto::store::CachedMessage {
                         msgid: 1_000_000_000_000 + u64::from(uid),
                         attachment: None,
+                        received: None,
                         thrid: 9_000_000_000 + u64::from(uid / 3),
                         uid: Some(uid),
                         labels: labels.clone(),
