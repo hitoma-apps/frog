@@ -370,6 +370,9 @@ struct App {
     open_thread: Option<u64>,
     /// The messages of the open conversation, by UID. Bodies arrive separately.
     thread_msgs: BTreeMap<u32, Message>,
+    /// The conversation was just opened, so its first load marks it read. Later loads don't,
+    /// so a manual "Mark unread" sticks.
+    mark_read_on_open: bool,
     label_input: String,
     /// IMAP commands issued this session, newest last.
     log: Vec<String>,
@@ -435,6 +438,7 @@ impl App {
             checked: BTreeSet::new(),
             open_thread: None,
             thread_msgs: BTreeMap::new(),
+            mark_read_on_open: false,
             label_input: String::new(),
             log: Vec::new(),
             status: None,
@@ -595,6 +599,11 @@ impl App {
                     }
                     let present = &self.thread_msgs;
                     self.rendered.retain(|uid, _| present.contains_key(uid));
+                    if std::mem::take(&mut self.mark_read_on_open)
+                        && self.thread_msgs.values().any(|m| !m.seen)
+                    {
+                        self.set_read_state(vec![thrid], true);
+                    }
                 }
             }
             Event::Error(e) => {
@@ -632,6 +641,30 @@ impl App {
         self.change_list();
     }
 
+    /// Marks conversations read or unread. The open conversation shows the change at once.
+    /// The worker writes the cache before it talks to the server, and it handles requests
+    /// in order, so the list refreshed after this reads the new state.
+    fn set_read_state(&mut self, thrids: Vec<u64>, seen: bool) {
+        if self.open_thread.is_some_and(|t| thrids.contains(&t)) {
+            for m in self.thread_msgs.values_mut() {
+                m.seen = seen;
+            }
+        }
+        self.view_stale = true;
+        self.send(Command::SetSeen { thrids, seen });
+    }
+
+    /// Marks the checked conversations, or else the open one, read or unread.
+    fn apply_read_state(&mut self, seen: bool) {
+        let thrids = self.target_thrids();
+        if thrids.is_empty() {
+            self.status = Some("Select a message or check some boxes first.".into());
+            return;
+        }
+        self.status = None;
+        self.set_read_state(thrids, seen);
+    }
+
     /// Asks the worker for rows of the thread list, unless that exact range was just asked for.
     fn request_window(&mut self, start: usize, count: usize) {
         let filter = self.thread_filter();
@@ -650,6 +683,7 @@ impl App {
     /// Opens a conversation. Its messages are read from the cache, and their bodies follow.
     fn open_conversation(&mut self, thrid: u64) {
         self.open_thread = Some(thrid);
+        self.mark_read_on_open = true;
         self.thread_msgs.clear();
         self.rendered.clear();
         self.requested_bodies.clear();
@@ -1051,6 +1085,13 @@ impl App {
                     LabelAction::Add,
                     vec![SystemLabel::Starred.as_wire().into()],
                 );
+            }
+            ui.separator();
+            if ui.button("Mark read").clicked() {
+                self.apply_read_state(true);
+            }
+            if ui.button("Mark unread").clicked() {
+                self.apply_read_state(false);
             }
             ui.separator();
             let search = ui.add(

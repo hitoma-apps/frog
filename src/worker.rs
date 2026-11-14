@@ -50,6 +50,9 @@ pub enum Command {
         action: LabelAction,
         labels: Vec<String>,
     },
+    /// Marks every message in the given threads read or unread. The cache changes at once,
+    /// and the server is told next, retrying until it confirms.
+    SetSeen { thrids: Vec<u64>, seen: bool },
     /// Reads one window of the thread list from the cache.
     Window {
         filter: ThreadFilter,
@@ -344,7 +347,16 @@ impl Worker {
     }
 
     fn idle_work_pending(&self) -> bool {
-        !self.state.pending_headers.is_empty() || !self.state.prefetch.is_empty()
+        !self.state.pending_headers.is_empty()
+            || !self.state.prefetch.is_empty()
+            || self.store_has_pending_seen()
+    }
+
+    /// Whether read-state changes are waiting to reach the server.
+    fn store_has_pending_seen(&self) -> bool {
+        self.store
+            .as_ref()
+            .is_some_and(|s| s.has_pending_seen().unwrap_or(false))
     }
 
     /// Runs `f` with the source taken out of the worker. A dropped connection is
@@ -422,6 +434,7 @@ impl Worker {
                     }
                 }
             }
+            Command::SetSeen { thrids, seen } => self.op_set_seen(src, thrids, *seen),
             // Cache reads are answered in `dispatch`, before a connection is needed.
             Command::Window { .. } | Command::Thread { .. } => Ok(()),
         }
@@ -430,6 +443,20 @@ impl Worker {
     /// One unit of background work: a batch of headers if any are pending,
     /// otherwise one body.
     fn idle_step(&mut self) {
+        // Read-state changes come first: they're what the user has asked for.
+        if self.store_has_pending_seen() {
+            match self.with_source(|w, src| w.flush_seen(src)) {
+                Ok(()) => {}
+                // The changes stay queued, and the next step tries again after a reconnect.
+                Err(SourceError::Disconnected(_)) => {
+                    self.reconnect();
+                }
+                Err(e) => self
+                    .emit
+                    .send(Event::Error(format!("Read state not sent: {e}"))),
+            }
+            return;
+        }
         let result = self.with_source(|w, src| {
             if w.state.pending_headers.is_empty() {
                 w.op_prefetch_batch(src)
@@ -953,6 +980,79 @@ impl Worker {
         Ok(())
     }
 
+    /// Queues a read-state change in the cache, then sends it.
+    fn op_set_seen(
+        &mut self,
+        src: &mut dyn MailSource,
+        thrids: &[u64],
+        seen: bool,
+    ) -> Result<(), SourceError> {
+        if let Some(store) = self.store.as_mut()
+            && let Err(e) = store.set_seen_for_threads(thrids, seen)
+        {
+            self.emit
+                .send(Event::Error(format!("cache write failed: {e}")));
+            return Ok(());
+        }
+        self.flush_seen(src)
+    }
+
+    /// Sends queued read-state changes to the server. A change leaves the queue only once
+    /// the server confirms it, or refuses it outright, so a dropped connection loses nothing.
+    fn flush_seen(&mut self, src: &mut dyn MailSource) -> Result<(), SourceError> {
+        let Some(store) = self.store.as_ref() else {
+            return Ok(());
+        };
+        let pending = match store.pending_seen() {
+            Ok(pending) => pending,
+            Err(e) => {
+                self.emit
+                    .send(Event::Error(format!("cache read failed: {e}")));
+                return Ok(());
+            }
+        };
+        for seen in [true, false] {
+            let group: Vec<(u64, u32)> = pending
+                .iter()
+                .filter(|p| p.2 == seen)
+                .map(|p| (p.0, p.1))
+                .collect();
+            if group.is_empty() {
+                continue;
+            }
+            let msgids: Vec<u64> = group.iter().map(|g| g.0).collect();
+            let uids: Vec<u32> = group.iter().map(|g| g.1).collect();
+            match src.set_seen(&uids, seen) {
+                Ok((command, updates)) => {
+                    self.clear_pending(&msgids);
+                    for u in &updates {
+                        self.cache_update(u);
+                    }
+                    self.emit.send(Event::Labels { updates, command });
+                }
+                Err(e @ SourceError::Disconnected(_)) => return Err(e),
+                // The server refuses this change, for example because the message is gone.
+                // Drop it, and say so.
+                Err(e) => {
+                    self.clear_pending(&msgids);
+                    self.emit
+                        .send(Event::Error(format!("Could not update read state: {e}")));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn clear_pending(&mut self, msgids: &[u64]) {
+        let Some(store) = self.store.as_mut() else {
+            return;
+        };
+        if let Err(e) = store.clear_pending_seen(msgids) {
+            self.emit
+                .send(Event::Error(format!("cache write failed: {e}")));
+        }
+    }
+
     fn op_modify(
         &mut self,
         src: &mut dyn MailSource,
@@ -1414,6 +1514,43 @@ mod tests {
                 _ => panic!("unexpected event"),
             }
         }
+    }
+
+    #[test]
+    fn read_state_reaches_the_server_and_the_cache() {
+        let link = mock_link();
+        assert!(matches!(next_significant(&link), Event::Connected));
+        link.commands.send(Command::Load { limit: 500 }).unwrap();
+        while !matches!(next_significant(&link), Event::LoadFinished) {}
+
+        let thrid = thread_of(&link, 2);
+        link.commands
+            .send(Command::SetSeen {
+                thrids: vec![thrid],
+                seen: true,
+            })
+            .unwrap();
+        loop {
+            match next_significant(&link) {
+                Event::Labels { updates, command } => {
+                    assert!(command.contains("\\Seen"), "{command}");
+                    assert!(
+                        updates.iter().all(|u| u.seen),
+                        "every message in the thread is read"
+                    );
+                    break;
+                }
+                Event::Body { .. } => continue,
+                _ => panic!("unexpected event"),
+            }
+        }
+        // The cache agrees with the server: nothing in the thread is unread.
+        let (list, _) = threads(&link);
+        assert!(
+            list.iter()
+                .filter(|t| t.thrid == thrid)
+                .all(|t| t.unread == 0)
+        );
     }
 
     #[test]

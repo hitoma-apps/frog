@@ -25,7 +25,7 @@ pub const DEFAULT_BODY_CAP: u64 = 1 << 30;
 /// zstd level. Mail is text, so a low level compresses well and stays fast.
 const ZSTD_LEVEL: i32 = 3;
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -686,6 +686,15 @@ impl Store {
             // The UID fix above can change the summaries, so they're rebuilt.
             rebuild_derived(&tx)?;
         }
+        if version < 8 {
+            // Read-state changes made here that the server hasn't confirmed yet.
+            tx.execute_batch(
+                "CREATE TABLE pending_seen (
+                     msgid INTEGER PRIMARY KEY REFERENCES messages(msgid) ON DELETE CASCADE,
+                     seen INTEGER NOT NULL
+                 );",
+            )?;
+        }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
@@ -800,8 +809,10 @@ impl Store {
         let msgid = to_i64(msgid)?;
         let tx = self.conn.transaction()?;
         let thread = thread_of(&tx, msgid)?;
+        // A change queued for the server stays as the user made it, until it's confirmed.
         tx.execute(
-            "UPDATE messages SET seen = ?2 WHERE msgid = ?1",
+            "UPDATE messages SET seen = ?2 WHERE msgid = ?1
+               AND msgid NOT IN (SELECT msgid FROM pending_seen)",
             params![msgid, seen],
         )?;
         if let Some(t) = thread {
@@ -979,6 +990,70 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// Marks every cached message in the threads read or unread, and queues the change for
+    /// the server. The change is kept until the server confirms it.
+    pub fn set_seen_for_threads(&mut self, thrids: &[u64], seen: bool) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for &thrid in thrids {
+            let thrid = to_i64(thrid)?;
+            tx.execute(
+                "UPDATE messages SET seen = ?2 WHERE thrid = ?1 AND uid IS NOT NULL",
+                params![thrid, seen],
+            )?;
+            tx.execute(
+                "INSERT OR REPLACE INTO pending_seen (msgid, seen)
+                 SELECT msgid, ?2 FROM messages WHERE thrid = ?1 AND uid IS NOT NULL",
+                params![thrid, seen],
+            )?;
+            refresh_threads(&tx, &BTreeSet::from([thrid as u64]))?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Queued read-state changes that can be sent now: (msgid, UID, seen). A change for a
+    /// message with no UID waits until the next sync gives it one.
+    pub fn pending_seen(&self) -> Result<Vec<(u64, u32, bool)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT p.msgid, m.uid, p.seen FROM pending_seen p
+             JOIN messages m ON m.msgid = p.msgid WHERE m.uid IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)? as u64,
+                    r.get::<_, u32>(1)?,
+                    r.get::<_, bool>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Whether any queued read-state change can be sent now.
+    pub fn has_pending_seen(&self) -> Result<bool> {
+        let any: bool = self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM pending_seen p
+                            JOIN messages m ON m.msgid = p.msgid WHERE m.uid IS NOT NULL)",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(any)
+    }
+
+    /// Removes confirmed (or refused) changes from the queue.
+    pub fn clear_pending_seen(&mut self, msgids: &[u64]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for &msgid in msgids {
+            tx.execute(
+                "DELETE FROM pending_seen WHERE msgid = ?1",
+                params![to_i64(msgid)?],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// How many messages are cached with a UID. Kept as a running total.
@@ -1558,6 +1633,7 @@ mod tests {
                  DROP INDEX messages_uid_unique;
                  CREATE INDEX messages_uid ON messages(uid);
                  DROP TABLE cache_state;
+                 DROP TABLE pending_seen;
                  ALTER TABLE messages DROP COLUMN sent;
                  ALTER TABLE messages DROP COLUMN from_email;
                  PRAGMA user_version = 3;",
@@ -1679,6 +1755,36 @@ mod tests {
         // The upsert resolves a conflict by msgid, so a second msgid with the same UID
         // is the case the unique index must refuse.
         assert!(err.is_err(), "a second message can't take UID 1");
+    }
+
+    #[test]
+    fn read_state_stays_queued_until_the_server_confirms() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        let mut a = msg(1, 1, &[]);
+        a.thrid = 100;
+        a.seen = false;
+        let mut b = msg(2, 2, &[]);
+        b.thrid = 100;
+        b.seen = false;
+        s.upsert_messages(&[a, b]).unwrap();
+
+        s.set_seen_for_threads(&[100], true).unwrap();
+        let unread = |s: &Store| s.thread_page(&ThreadFilter::All, 0, 5).unwrap()[0].unread;
+        assert_eq!(unread(&s), 0);
+        let mut queued = s.pending_seen().unwrap();
+        queued.sort();
+        assert_eq!(queued, vec![(1, 1, true), (2, 2, true)]);
+        assert!(s.has_pending_seen().unwrap());
+
+        // A sync that reports the old state doesn't undo a change that's still queued.
+        s.set_seen(1, false).unwrap();
+        assert_eq!(unread(&s), 0);
+
+        // Once the server has confirmed, the cache follows the server again.
+        s.clear_pending_seen(&[1, 2]).unwrap();
+        assert!(!s.has_pending_seen().unwrap());
+        s.set_seen(1, false).unwrap();
+        assert_eq!(unread(&s), 1);
     }
 
     #[test]

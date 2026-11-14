@@ -448,6 +448,18 @@ impl<S: Read + Write> ImapConn<S> {
         Ok(cmd)
     }
 
+    /// Marks messages read or unread (`\Seen`). Returns the command for the log.
+    pub fn uid_store_seen(&mut self, uids: &[u32], seen: bool) -> Result<String> {
+        let mut set = String::new();
+        crate::labels::push_uid_set(&mut set, uids);
+        let cmd = format!(
+            "UID STORE {set} {}FLAGS.SILENT (\\Seen)",
+            if seen { "+" } else { "-" }
+        );
+        self.command(&cmd)?;
+        Ok(cmd)
+    }
+
     /// Does nothing on the server, but keeps the connection from going idle.
     pub fn noop(&mut self) -> Result<()> {
         self.command("NOOP")?;

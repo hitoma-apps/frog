@@ -173,6 +173,21 @@ impl<S: Read + Write + Send + SetReadTimeout> MailSource for LiveSession<S> {
         Ok((command, updates))
     }
 
+    fn set_seen(
+        &mut self,
+        uids: &[u32],
+        seen: bool,
+    ) -> Result<(String, Vec<MessageUpdate>), SourceError> {
+        self.ensure_selected()?;
+        let command = self
+            .conn
+            .uid_store_seen(uids, seen)
+            .map_err(to_source_error)?;
+        // Re-read the state, so the view matches the server rather than our guess.
+        let updates = self.fetch_states(uids)?;
+        Ok((command, updates))
+    }
+
     fn list_labels(&mut self) -> Result<Vec<String>, SourceError> {
         self.conn.list_labels().map_err(to_source_error)
     }

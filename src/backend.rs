@@ -228,6 +228,17 @@ pub trait MailSource: Send {
         labels: &[String],
     ) -> Result<(String, Vec<MessageUpdate>), SourceError>;
 
+    /// Marks messages read or unread on the server. Returns the command for the log and the
+    /// new state of each message.
+    fn set_seen(
+        &mut self,
+        uids: &[u32],
+        seen: bool,
+    ) -> Result<(String, Vec<MessageUpdate>), SourceError> {
+        let _ = (uids, seen);
+        Err("this source can't change read state".into())
+    }
+
     /// Every label on the account, including ones with no messages yet.
     fn list_labels(&mut self) -> Result<Vec<String>, SourceError> {
         Ok(Vec::new())
@@ -578,6 +589,39 @@ impl MailSource for MockSource {
                     }
                     LabelAction::Replace => e.labels = labels.iter().cloned().collect(),
                 }
+                e.modseq = modseq;
+                updates.push(Self::update_of(e));
+            }
+        }
+        Ok((command, updates))
+    }
+
+    fn set_seen(
+        &mut self,
+        uids: &[u32],
+        seen: bool,
+    ) -> Result<(String, Vec<MessageUpdate>), SourceError> {
+        let mut st = self.state.lock().unwrap();
+        let found: Vec<u32> = uids
+            .iter()
+            .copied()
+            .filter(|u| st.entries.iter().any(|e| e.uid == *u))
+            .collect();
+        if found.is_empty() {
+            return Err("no messages selected".into());
+        }
+        let mut set = String::new();
+        gmail_imap_proto::labels::push_uid_set(&mut set, &found);
+        let command = format!(
+            "UID STORE {set} {}FLAGS.SILENT (\\Seen)",
+            if seen { "+" } else { "-" }
+        );
+        st.highest_modseq += 1;
+        let modseq = st.highest_modseq;
+        let mut updates = Vec::new();
+        for &uid in &found {
+            if let Some(e) = st.entries.iter_mut().find(|e| e.uid == uid) {
+                e.seen = seen;
                 e.modseq = modseq;
                 updates.push(Self::update_of(e));
             }
