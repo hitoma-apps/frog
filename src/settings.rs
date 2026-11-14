@@ -15,7 +15,7 @@ pub const CHECK_INTERVAL_RANGE: RangeInclusive<u64> = 30..=3600;
 /// Messages loaded per page.
 pub const PAGE_SIZE_RANGE: RangeInclusive<usize> = 50..=5000;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// The last address signed in with, pre-filled on the sign-in form.
@@ -33,6 +33,31 @@ pub struct Settings {
     /// Searches saved in the sidebar, in the order they were saved.
     #[serde(default)]
     pub saved_searches: Vec<String>,
+    /// The main window's size and position, and the sidebar and list sizes, from last time.
+    #[serde(default)]
+    pub window: WindowLayout,
+}
+
+/// Where the main window was and how its panels were sized. Pixels, in logical units.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WindowLayout {
+    pub size: [f32; 2],
+    /// `None` until the window has been placed. The system then chooses.
+    pub position: Option<[f32; 2]>,
+    pub sidebar_width: f32,
+    /// Height of the thread list, above the reader.
+    pub list_height: f32,
+}
+
+impl Default for WindowLayout {
+    fn default() -> Self {
+        Self {
+            size: [1280.0, 800.0],
+            position: None,
+            sidebar_width: 200.0,
+            list_height: 260.0,
+        }
+    }
 }
 
 /// Most searches kept in the sidebar.
@@ -48,6 +73,7 @@ impl Default for Settings {
             notifications: true,
             favorite_labels: Vec::new(),
             saved_searches: Vec::new(),
+            window: WindowLayout::default(),
         }
     }
 }
@@ -70,6 +96,12 @@ impl Settings {
         }
         kept.truncate(MAX_SAVED_SEARCHES);
         self.saved_searches = kept;
+        self.window.size = [
+            self.window.size[0].max(480.0),
+            self.window.size[1].max(320.0),
+        ];
+        self.window.sidebar_width = self.window.sidebar_width.clamp(120.0, 600.0);
+        self.window.list_height = self.window.list_height.clamp(80.0, 2000.0);
         self
     }
 
@@ -134,6 +166,7 @@ mod tests {
     fn round_trips() {
         let path = temp_file("roundtrip.json");
         let s = Settings {
+            window: WindowLayout::default(),
             email: Some("me@example.com".into()),
             remember_password: true,
             check_interval_secs: 120,
@@ -200,5 +233,46 @@ mod tests {
         assert_eq!(s.saved_searches.len(), MAX_SAVED_SEARCHES);
         let unique: std::collections::BTreeSet<_> = s.saved_searches.iter().collect();
         assert_eq!(unique.len(), s.saved_searches.len());
+    }
+}
+
+#[cfg(test)]
+mod window_layout_tests {
+    use super::*;
+
+    #[test]
+    fn layout_round_trips_through_the_settings_file() {
+        let dir = std::env::temp_dir().join(format!("layout-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let s = Settings {
+            window: WindowLayout {
+                size: [1500.0, 900.0],
+                position: Some([40.0, 60.0]),
+                sidebar_width: 240.0,
+                list_height: 300.0,
+            },
+            ..Settings::default()
+        };
+        s.save_to(&path).unwrap();
+        assert_eq!(Settings::load_from(&path).window, s.window);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_file_without_a_layout_gets_the_default_and_bad_sizes_are_clamped() {
+        let dir = std::env::temp_dir().join(format!("layout-old-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{"email":"a@example.com"}"#).unwrap();
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.window, WindowLayout::default());
+        let mut s = loaded;
+        s.window.size = [10.0, 10.0];
+        s.window.sidebar_width = 9000.0;
+        let s = s.clamped();
+        assert_eq!(s.window.size, [480.0, 320.0]);
+        assert_eq!(s.window.sidebar_width, 600.0);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

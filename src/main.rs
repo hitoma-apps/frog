@@ -43,7 +43,22 @@ fn main() -> eframe::Result {
         _ => None,
     };
 
-    let options = eframe::NativeOptions::default();
+    // The window opens where it was last time. Settings are read here, before the app exists.
+    let settings = settings::default_path()
+        .as_deref()
+        .map(settings::Settings::load_from)
+        .unwrap_or_default()
+        .clamped();
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Gmail Labels Prototype")
+        .with_inner_size(settings.window.size);
+    if let Some(position) = settings.window.position {
+        viewport = viewport.with_position(position);
+    }
+    let options = eframe::NativeOptions {
+        viewport,
+        ..Default::default()
+    };
     eframe::run_native(
         "Gmail Labels Prototype",
         options,
@@ -374,6 +389,10 @@ struct App {
     settings_open: bool,
     /// The IMAP command log is open in its own window.
     log_open: bool,
+    /// Whether the window layout has changed since it was last saved.
+    layout_dirty: bool,
+    /// When the layout was last saved.
+    layout_saved: Instant,
     /// The sign-in, kept in memory for the session so a crashed worker can be restarted.
     credentials: Option<(String, String)>,
     /// Why the background work stopped, if a thread crashed. The status bar offers a restart.
@@ -485,6 +504,8 @@ impl App {
             log_open: false,
             account: None,
             credentials: None,
+            layout_dirty: false,
+            layout_saved: Instant::now(),
             crashed: None,
             title_for: None,
             cache_bytes: 0,
@@ -1960,6 +1981,58 @@ impl App {
         }
     }
 
+    /// The sign-in form, in its own window. It closes with the app if the user closes it, since
+    /// nothing else is shown until a sign-in succeeds.
+    fn login_window(&mut self, ctx: &egui::Context) {
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Sign in")
+            .with_inner_size([440.0, 330.0]);
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("sign-in"),
+            builder,
+            |ctx, _class| {
+                egui::CentralPanel::default().show(ctx, |ui| self.login_dialog(ui));
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+                }
+            },
+        );
+    }
+
+    /// Records a change to the window's layout, and saves it soon after it stops changing.
+    fn remember(&mut self, change: impl FnOnce(&mut settings::WindowLayout)) {
+        let before = self.settings.window;
+        change(&mut self.settings.window);
+        if self.settings.window != before {
+            self.layout_dirty = true;
+        }
+        if self.layout_dirty && self.layout_saved.elapsed() >= Duration::from_secs(1) {
+            self.save_layout();
+        }
+    }
+
+    fn save_layout(&mut self) {
+        self.save_settings();
+        self.layout_dirty = false;
+        self.layout_saved = Instant::now();
+    }
+
+    /// Notes the window's size and position, which the system knows and the app doesn't.
+    fn remember_window_position(&mut self, ctx: &egui::Context) {
+        let (inner, outer) = ctx.input(|i| {
+            let v = i.viewport();
+            (v.inner_rect, v.outer_rect)
+        });
+        if let Some(rect) = inner {
+            let size = [rect.width().round(), rect.height().round()];
+            self.remember(|w| w.size = size);
+        }
+        if let Some(rect) = outer {
+            let position = [rect.min.x.round(), rect.min.y.round()];
+            self.remember(|w| w.position = Some(position));
+        }
+    }
+
     /// The confirmation shown before opening a link that looks disguised.
     fn link_confirmation(&mut self, ctx: &egui::Context) {
         let Some(info) = self.pending_link.clone() else {
@@ -2051,12 +2124,27 @@ fn cache_file_bytes(path: &Path) -> u64 {
         .sum()
 }
 
+/// Saves the window layout if it changed since it was last saved. A change made just before
+/// closing may not be followed by another frame, so this catches it.
+impl Drop for App {
+    fn drop(&mut self) {
+        if self.layout_dirty {
+            self.save_layout();
+        }
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_events();
+        self.remember_window_position(ui.ctx());
 
         if !self.connected {
-            egui::CentralPanel::default().show(ui, |ui| self.login_dialog(ui));
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.weak("Sign in to load your mail.");
+            });
+            let ctx = ui.ctx().clone();
+            self.login_window(&ctx);
             return;
         }
         self.refresh_views();
@@ -2099,19 +2187,23 @@ impl eframe::App for App {
 
         egui::Panel::top("status").show(ui, |ui| self.status_bar(ui));
 
-        egui::Panel::left("sidebar")
+        let sidebar = egui::Panel::left("sidebar")
             .resizable(true)
-            .default_size(200.0)
+            .default_size(self.settings.window.sidebar_width)
             .min_size(120.0)
             .show(ui, |ui| self.sidebar(ui));
+        let width = sidebar.response.rect.width().round();
+        self.remember(|w| w.sidebar_width = width);
 
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
 
         egui::CentralPanel::default().show(ui, |ui| {
-            egui::Panel::top("list")
+            let list = egui::Panel::top("list")
                 .resizable(true)
-                .default_size(260.0)
+                .default_size(self.settings.window.list_height)
                 .show(ui, |ui| self.message_list(ui));
+            let height = list.response.rect.height().round();
+            self.remember(|w| w.list_height = height);
             egui::CentralPanel::default().show(ui, |ui| self.reader(ui));
         });
         let ctx = ui.ctx().clone();
