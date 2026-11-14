@@ -326,9 +326,10 @@ struct App {
     login: LoginForm,
 
     /// Cached messages per label, from the cache. Shared, so the sidebar can hold it each frame.
-    counts: Arc<BTreeMap<String, usize>>,
+    counts: Arc<BTreeMap<String, (usize, usize)>>,
     /// Cached messages overall, for All Mail.
-    messages_total: usize,
+    /// Threads in all, and how many of them are unread.
+    totals: (usize, usize),
     /// Every label on the account, from the server. Includes labels with no cached messages.
     known_labels: Arc<BTreeSet<String>>,
 
@@ -416,7 +417,7 @@ impl App {
             cached_count: 0,
             login,
             counts: Arc::default(),
-            messages_total: 0,
+            totals: (0, 0),
             known_labels: Arc::default(),
             window_rows: Vec::new(),
             window_start: 0,
@@ -494,7 +495,7 @@ impl App {
             }
             Event::Reset => {
                 self.counts = Arc::default();
-                self.messages_total = 0;
+                self.totals = (0, 0);
                 self.cached_count = 0;
                 self.change_list();
                 self.thread_msgs.clear();
@@ -569,9 +570,18 @@ impl App {
             }
             Event::IdleState(on) => self.idle_on = on,
             Event::LabelList(labels) => self.known_labels = Arc::new(labels.into_iter().collect()),
-            Event::LabelCounts { labels, messages } => {
-                self.counts = Arc::new(labels.into_iter().collect());
-                self.messages_total = messages;
+            Event::LabelCounts {
+                labels,
+                threads,
+                unread,
+            } => {
+                self.counts = Arc::new(
+                    labels
+                        .into_iter()
+                        .map(|(label, t, u)| (label, (t, u)))
+                        .collect(),
+                );
+                self.totals = (threads, unread);
             }
             Event::Window {
                 filter,
@@ -983,7 +993,14 @@ impl App {
 
     /// One sidebar row: a favorite toggle, then the label, which filters the list.
     /// `key` is `None` for All Mail, which can't be favorited.
-    fn label_row(&mut self, ui: &mut egui::Ui, key: Option<&str>, name: &str, count: usize) {
+    /// `count` is (threads with the label, of those unread).
+    fn label_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        key: Option<&str>,
+        name: &str,
+        count: (usize, usize),
+    ) {
         let is_fav = key.is_some_and(|k| self.settings.favorite_labels.iter().any(|f| f == k));
         let selected = self.filter.as_deref() == key;
         let mut toggle = false;
@@ -1002,11 +1019,13 @@ impl App {
             // Truncate to the space the sidebar has, so a long name can't stop it shrinking.
             let width = ui.available_width().max(40.0);
             let height = ui.spacing().interact_size.y;
-            let text = format!("{name} ({count})");
-            let row = egui::Button::selectable(selected, text.clone()).truncate();
+            let (threads, unread) = count;
+            let text = format!("{name} ({unread}/{threads})");
+            let hover = format!("{name}: {unread} unread of {threads} threads");
+            let row = egui::Button::selectable(selected, text).truncate();
             if ui
                 .add_sized([width, height], row)
-                .on_hover_text(text)
+                .on_hover_text(hover)
                 .clicked()
             {
                 self.set_label_filter(key.map(str::to_owned));
@@ -1031,7 +1050,7 @@ impl App {
                 if !favorites.is_empty() {
                     ui.weak("Favorites");
                     for key in &favorites {
-                        let count = counts.get(key).copied().unwrap_or(0);
+                        let count = counts.get(key).copied().unwrap_or((0, 0));
                         self.label_row(ui, Some(key), &display_label(key), count);
                     }
                     ui.separator();
@@ -1040,20 +1059,20 @@ impl App {
                 ui.weak("Mailboxes");
                 for (name, key) in MAILBOXES {
                     let count = match key {
-                        None => self.messages_total,
-                        Some(k) => counts.get(k).copied().unwrap_or(0),
+                        None => self.totals,
+                        Some(k) => counts.get(k).copied().unwrap_or((0, 0)),
                     };
                     self.label_row(ui, key, name, count);
                 }
 
                 // Labels from the server, plus any seen in the cache, with counts.
-                let mut user: BTreeMap<String, usize> = counts
+                let mut user: BTreeMap<String, (usize, usize)> = counts
                     .iter()
                     .filter(|(k, _)| !k.starts_with('\\'))
                     .map(|(k, c)| (k.clone(), *c))
                     .collect();
                 for label in known.iter() {
-                    user.entry(label.clone()).or_insert(0);
+                    user.entry(label.clone()).or_insert((0, 0));
                 }
                 if !user.is_empty() {
                     ui.separator();

@@ -106,10 +106,11 @@ pub enum Event {
         updates: Vec<MessageUpdate>,
         command: String,
     },
-    /// The cache's totals: cached messages per label, and cached messages overall.
+    /// Per label: threads with it, and how many of those are unread. Then the totals.
     LabelCounts {
-        labels: Vec<(String, usize)>,
-        messages: usize,
+        labels: Vec<(String, usize, usize)>,
+        threads: usize,
+        unread: usize,
     },
     /// One window of the thread list, starting at `start`, out of `total` threads.
     Window {
@@ -536,11 +537,15 @@ impl Worker {
         let Some(store) = self.store.as_ref() else {
             return;
         };
-        let totals = store
-            .label_counts()
-            .and_then(|labels| store.message_total().map(|messages| (labels, messages)));
-        match totals {
-            Ok((labels, messages)) => self.emit.send(Event::LabelCounts { labels, messages }),
+        let counts = store
+            .label_thread_counts()
+            .and_then(|labels| store.thread_totals().map(|totals| (labels, totals)));
+        match counts {
+            Ok((labels, (threads, unread))) => self.emit.send(Event::LabelCounts {
+                labels,
+                threads,
+                unread,
+            }),
             Err(e) => self
                 .emit
                 .send(Event::Error(format!("cache read failed: {e}"))),

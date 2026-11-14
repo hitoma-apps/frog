@@ -25,7 +25,7 @@ pub const DEFAULT_BODY_CAP: u64 = 1 << 30;
 /// zstd level. Mail is text, so a low level compresses well and stays fast.
 const ZSTD_LEVEL: i32 = 3;
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -177,16 +177,20 @@ fn rebuild_derived(tx: &Transaction) -> Result<()> {
     tx.execute_batch(
         "DELETE FROM threads;
          DELETE FROM thread_labels;
-         DELETE FROM label_stats;
+         DELETE FROM label_threads;
          INSERT INTO threads (thrid, count, unread, newest_uid)
              SELECT thrid, COUNT(*), SUM(seen = 0), MAX(uid) FROM messages
              WHERE uid IS NOT NULL GROUP BY thrid;
          INSERT INTO thread_labels (label, thrid)
              SELECT DISTINCT l.label, m.thrid FROM messages m
              JOIN message_labels l ON l.msgid = m.msgid WHERE m.uid IS NOT NULL;
-         INSERT INTO label_stats (label, count)
-             SELECT label, COUNT(*) FROM message_labels GROUP BY label;
-         UPDATE cache_totals SET messages = (SELECT COUNT(*) FROM messages WHERE uid IS NOT NULL);",
+         INSERT INTO label_threads (label, threads, unread)
+             SELECT tl.label, COUNT(*), SUM(t.unread > 0) FROM thread_labels tl
+             JOIN threads t ON t.thrid = tl.thrid GROUP BY tl.label;
+         UPDATE cache_totals SET
+             messages = (SELECT COUNT(*) FROM messages WHERE uid IS NOT NULL),
+             threads = (SELECT COUNT(*) FROM threads),
+             unread_threads = (SELECT COUNT(*) FROM threads WHERE unread > 0);",
     )?;
     Ok(())
 }
@@ -241,9 +245,72 @@ fn thread_of(conn: &Connection, msgid: i64) -> Result<Option<u64>> {
 
 /// Recomputes the summaries of the given threads from their cached messages.
 /// A thread with no cached UIDs left drops out of the summaries.
+/// A thread's share of the label and total counts: its labels, and whether it's unread.
+#[derive(Default)]
+struct Contribution {
+    exists: bool,
+    unread: bool,
+    labels: Vec<String>,
+}
+
+fn thread_contribution(tx: &Transaction, thrid: i64) -> Result<Contribution> {
+    let unread: Option<i64> = tx
+        .query_row(
+            "SELECT unread FROM threads WHERE thrid = ?1",
+            params![thrid],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let mut stmt = tx.prepare("SELECT label FROM thread_labels WHERE thrid = ?1")?;
+    let labels = stmt
+        .query_map(params![thrid], |r| r.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(Contribution {
+        exists: unread.is_some(),
+        unread: unread.is_some_and(|u| u > 0),
+        labels,
+    })
+}
+
+/// Moves the label and total counts from a thread's old contribution to its new one.
+fn apply_contribution_delta(
+    tx: &Transaction,
+    before: &Contribution,
+    after: &Contribution,
+) -> Result<()> {
+    for label in &before.labels {
+        adjust_label_threads(tx, label, -1, -i64::from(before.unread))?;
+    }
+    for label in &after.labels {
+        adjust_label_threads(tx, label, 1, i64::from(after.unread))?;
+    }
+    let threads = i64::from(after.exists) - i64::from(before.exists);
+    let unread = i64::from(after.unread) - i64::from(before.unread);
+    if threads != 0 || unread != 0 {
+        tx.execute(
+            "UPDATE cache_totals SET threads = threads + ?1, unread_threads = unread_threads + ?2
+             WHERE id = 1",
+            params![threads, unread],
+        )?;
+    }
+    Ok(())
+}
+
+fn adjust_label_threads(tx: &Transaction, label: &str, threads: i64, unread: i64) -> Result<()> {
+    tx.execute(
+        "INSERT INTO label_threads (label, threads, unread) VALUES (?1, ?2, ?3)
+         ON CONFLICT(label) DO UPDATE SET
+             threads = threads + excluded.threads, unread = unread + excluded.unread",
+        params![label, threads, unread],
+    )?;
+    tx.execute("DELETE FROM label_threads WHERE threads <= 0", [])?;
+    Ok(())
+}
+
 fn refresh_threads(tx: &Transaction, thrids: &BTreeSet<u64>) -> Result<()> {
     for &thrid in thrids {
         let thrid = to_i64(thrid)?;
+        let before = thread_contribution(tx, thrid)?;
         let (count, unread, newest): (i64, i64, Option<i64>) = tx.query_row(
             "SELECT COUNT(*), COALESCE(SUM(seen = 0), 0), MAX(uid) FROM messages
              WHERE thrid = ?1 AND uid IS NOT NULL",
@@ -253,6 +320,8 @@ fn refresh_threads(tx: &Transaction, thrids: &BTreeSet<u64>) -> Result<()> {
         tx.execute("DELETE FROM thread_labels WHERE thrid = ?1", params![thrid])?;
         if count == 0 {
             tx.execute("DELETE FROM threads WHERE thrid = ?1", params![thrid])?;
+            let after = thread_contribution(tx, thrid)?;
+            apply_contribution_delta(tx, &before, &after)?;
             continue;
         }
         tx.execute(
@@ -267,6 +336,8 @@ fn refresh_threads(tx: &Transaction, thrids: &BTreeSet<u64>) -> Result<()> {
              WHERE m.thrid = ?1 AND m.uid IS NOT NULL",
             params![thrid],
         )?;
+        let after = thread_contribution(tx, thrid)?;
+        apply_contribution_delta(tx, &before, &after)?;
     }
     Ok(())
 }
@@ -430,9 +501,10 @@ impl Store {
                 "SELECT label, thrid FROM thread_labels",
             ),
             (
-                "label totals",
-                "SELECT label, COUNT(*) FROM message_labels GROUP BY label",
-                "SELECT label, count FROM label_stats",
+                "label counts",
+                "SELECT tl.label, COUNT(*), SUM(t.unread > 0) FROM thread_labels tl
+                 JOIN threads t ON t.thrid = tl.thrid GROUP BY tl.label",
+                "SELECT label, threads, unread FROM label_threads",
             ),
         ];
         let mut problems = Vec::new();
@@ -449,14 +521,18 @@ impl Store {
                 problems.push(format!("{name}: {differing} rows differ"));
             }
         }
-        let total: i64 = self.conn.query_row(
+        let totals: i64 = self.conn.query_row(
             "SELECT (SELECT messages FROM cache_totals WHERE id = 1)
-                  != (SELECT COUNT(*) FROM messages WHERE uid IS NOT NULL)",
+                  != (SELECT COUNT(*) FROM messages WHERE uid IS NOT NULL)
+              OR (SELECT threads FROM cache_totals WHERE id = 1)
+                  != (SELECT COUNT(*) FROM threads)
+              OR (SELECT unread_threads FROM cache_totals WHERE id = 1)
+                  != (SELECT COUNT(*) FROM threads WHERE unread > 0)",
             [],
             |r| r.get(0),
         )?;
-        if total != 0 {
-            problems.push("message total is wrong".into());
+        if totals != 0 {
+            problems.push("message or thread totals are wrong".into());
         }
         Ok(problems)
     }
@@ -683,6 +759,16 @@ impl Store {
                  );
                  INSERT INTO cache_state (id, clean) VALUES (1, 0);",
             )?;
+            // Counts per label are threads, and unread threads (see v9).
+            tx.execute_batch(
+                "CREATE TABLE label_threads (
+                     label TEXT PRIMARY KEY,
+                     threads INTEGER NOT NULL,
+                     unread INTEGER NOT NULL
+                 );
+                 ALTER TABLE cache_totals ADD COLUMN threads INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE cache_totals ADD COLUMN unread_threads INTEGER NOT NULL DEFAULT 0;",
+            )?;
             // The UID fix above can change the summaries, so they're rebuilt.
             rebuild_derived(&tx)?;
         }
@@ -693,6 +779,14 @@ impl Store {
                      msgid INTEGER PRIMARY KEY REFERENCES messages(msgid) ON DELETE CASCADE,
                      seen INTEGER NOT NULL
                  );",
+            )?;
+        }
+        if version < 9 {
+            // Label counts are threads now (label_threads), so the per-message counts go.
+            tx.execute_batch(
+                "DROP TRIGGER IF EXISTS message_labels_added;
+                 DROP TRIGGER IF EXISTS message_labels_removed;
+                 DROP TABLE IF EXISTS label_stats;",
             )?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -822,18 +916,31 @@ impl Store {
         Ok(())
     }
 
-    /// How many cached messages carry each label, by label name. Read from the
-    /// stored totals, so it doesn't scan the messages.
-    pub fn label_counts(&self) -> Result<Vec<(String, usize)>> {
+    /// For each label: how many threads have it, and how many of those are unread.
+    pub fn label_thread_counts(&self) -> Result<Vec<(String, usize, usize)>> {
         let mut stmt = self
             .conn
-            .prepare_cached("SELECT label, count FROM label_stats ORDER BY label")?;
+            .prepare_cached("SELECT label, threads, unread FROM label_threads ORDER BY label")?;
         let rows = stmt
             .query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as usize,
+                    r.get::<_, i64>(2)? as usize,
+                ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Threads in the cache, and how many of them are unread.
+    pub fn thread_totals(&self) -> Result<(usize, usize)> {
+        let (threads, unread): (i64, i64) = self.conn.query_row(
+            "SELECT threads, unread_threads FROM cache_totals WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok((threads as usize, unread as usize))
     }
 
     /// Which threads a list shows.
@@ -1159,6 +1266,11 @@ impl Store {
         tx.execute("DELETE FROM sync", [])?;
         tx.execute("DELETE FROM threads", [])?;
         tx.execute("DELETE FROM thread_labels", [])?;
+        tx.execute("DELETE FROM label_threads", [])?;
+        tx.execute(
+            "UPDATE cache_totals SET threads = 0, unread_threads = 0 WHERE id = 1",
+            [],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -1479,26 +1591,44 @@ mod tests {
     }
 
     #[test]
-    fn label_counts_follow_every_write() {
+    fn label_counts_are_threads_and_unread_threads() {
         let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        // msg(1) is in thread 101, msg(2) in thread 102. Both are unread.
         s.upsert_messages(&[msg(1, 1, &["Work", "\\Inbox"]), msg(2, 2, &["Work"])])
             .unwrap();
         assert_eq!(
-            s.label_counts().unwrap(),
-            vec![("Work".to_string(), 2), ("\\Inbox".to_string(), 1)]
+            s.label_thread_counts().unwrap(),
+            vec![("Work".into(), 2, 2), ("\\Inbox".into(), 1, 1)]
         );
+        assert_eq!(s.thread_totals().unwrap(), (2, 2));
+        assert!(s.check().unwrap().logical.is_empty());
 
-        // Replacing labels adjusts both the old and the new label.
-        let home: BTreeSet<String> = ["Home".to_string()].into();
-        s.set_labels(1, &home).unwrap();
+        // Relabelling message 1 moves thread 101 out of Work, and into Home.
+        s.set_labels(1, &BTreeSet::from(["Home".to_string()]))
+            .unwrap();
         assert_eq!(
-            s.label_counts().unwrap(),
-            vec![("Home".to_string(), 1), ("Work".to_string(), 1)]
+            s.label_thread_counts().unwrap(),
+            vec![("Home".into(), 1, 1), ("Work".into(), 1, 1)]
         );
+        assert!(s.check().unwrap().logical.is_empty());
 
-        // Removing a message (the labels cascade) drops its labels from the totals.
+        // Reading message 1 makes its thread read. Thread 102 is still unread.
+        s.set_seen(1, true).unwrap();
+        assert_eq!(
+            s.label_thread_counts().unwrap(),
+            vec![("Home".into(), 1, 0), ("Work".into(), 1, 1)]
+        );
+        assert_eq!(s.thread_totals().unwrap(), (2, 1));
+        assert!(s.check().unwrap().logical.is_empty());
+
+        // Removing the only message of thread 102 takes its labels out of the counts.
         s.remove_uids(&[2]).unwrap();
-        assert_eq!(s.label_counts().unwrap(), vec![("Home".to_string(), 1)]);
+        assert_eq!(
+            s.label_thread_counts().unwrap(),
+            vec![("Home".into(), 1, 0)]
+        );
+        assert_eq!(s.thread_totals().unwrap(), (1, 0));
+        assert!(s.check().unwrap().logical.is_empty());
     }
 
     #[test]
@@ -1634,6 +1764,7 @@ mod tests {
                  CREATE INDEX messages_uid ON messages(uid);
                  DROP TABLE cache_state;
                  DROP TABLE pending_seen;
+                 DROP TABLE label_threads;
                  ALTER TABLE messages DROP COLUMN sent;
                  ALTER TABLE messages DROP COLUMN from_email;
                  PRAGMA user_version = 3;",
