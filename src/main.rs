@@ -488,11 +488,15 @@ impl App {
             remember: settings.remember_password,
             ..Default::default()
         };
+        let mut auto_login = None;
         if let Some(email) = &settings.email {
             login.email = email.clone();
             if settings.remember_password
                 && let Some(password) = credentials::load_password(email)
             {
+                if settings.auto_login {
+                    auto_login = Some((email.clone(), password.clone()));
+                }
                 login.password = password;
             }
         }
@@ -548,7 +552,8 @@ impl App {
             log: Vec::new(),
             status: None,
         };
-        if let Some((user, password)) = creds {
+        // Environment variables take precedence over a remembered password.
+        if let Some((user, password)) = creds.or(auto_login) {
             app.start_gmail(user, password);
         }
         app
@@ -968,6 +973,13 @@ impl App {
                 ui.checkbox(
                     &mut self.settings.remember_password,
                     "Remember password on this computer",
+                );
+                ui.add_enabled(
+                    self.settings.remember_password,
+                    egui::Checkbox::new(
+                        &mut self.settings.auto_login,
+                        "Sign in automatically when the app starts",
+                    ),
                 );
                 ui.checkbox(
                     &mut self.settings.notifications,

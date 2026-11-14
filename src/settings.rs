@@ -22,6 +22,8 @@ pub struct Settings {
     pub email: Option<String>,
     /// Whether the password is kept in the OS credential store.
     pub remember_password: bool,
+    /// Sign in at startup with the remembered password, without pressing Sign in.
+    pub auto_login: bool,
     /// Seconds between automatic checks, when live updates aren't running.
     pub check_interval_secs: u64,
     /// Messages to load on each page.
@@ -68,6 +70,7 @@ impl Default for Settings {
         Self {
             email: None,
             remember_password: false,
+            auto_login: true,
             check_interval_secs: 60,
             page_size: 500,
             notifications: true,
@@ -169,6 +172,7 @@ mod tests {
             window: WindowLayout::default(),
             email: Some("me@example.com".into()),
             remember_password: true,
+            auto_login: false,
             check_interval_secs: 120,
             page_size: 200,
             notifications: false,
