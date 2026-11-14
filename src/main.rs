@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use gmail_imap_proto::auth::AuthCheck;
+use gmail_imap_proto::export;
 use gmail_imap_proto::labels::{LabelAction, SystemLabel};
 use gmail_imap_proto::linkcheck::{self, LinkInfo};
 use gmail_imap_proto::links::gmail_thread_url;
@@ -1797,6 +1798,41 @@ impl App {
         }
     }
 
+    /// Saves the given messages to the Downloads folder: one `.eml` per message, or one text
+    /// file. The messages are written oldest first, and the status bar shows where they went.
+    fn export_thread(&mut self, uids: &[u32], eml: bool) {
+        let mut messages: Vec<&Message> = uids
+            .iter()
+            .filter_map(|u| self.thread_msgs.get(u))
+            .collect();
+        messages.sort_by_key(|m| (m.when(), m.uid));
+        let items: Vec<export::Item> = messages
+            .iter()
+            .filter_map(|m| {
+                Some(export::Item {
+                    from: &m.from,
+                    subject: &m.subject,
+                    date: &m.date,
+                    raw: m.body.as_deref()?,
+                })
+            })
+            .collect();
+        let Some(dir) = export::downloads_dir() else {
+            self.status = Some("No Downloads folder was found to save into.".into());
+            return;
+        };
+        let subject = items.first().map_or("", |i| i.subject);
+        let result = if eml {
+            export::write_eml(&dir, subject, &items)
+        } else {
+            export::write_text(&dir, subject, &items)
+        };
+        self.status = Some(match result {
+            Ok(path) => format!("Saved to {}", path.display()),
+            Err(e) => format!("Could not save: {e}"),
+        });
+    }
+
     /// The reader: every message of the open conversation, newest first.
     fn reader(&mut self, ui: &mut egui::Ui) {
         let Some(thrid) = self.open_thread else {
@@ -1846,6 +1882,13 @@ impl App {
         }
 
         let open_url = (thrid != 0).then(|| gmail_thread_url(thrid));
+        // Saving needs every body, so it waits until the background fetches finish.
+        let exportable = !thread.is_empty()
+            && thread
+                .iter()
+                .all(|uid| self.thread_msgs.get(uid).is_some_and(|m| m.body.is_some()));
+        // Some(true) saves .eml files, Some(false) the text.
+        let mut export: Option<bool> = None;
         ui.horizontal(|ui| {
             let button = ui.add_enabled(open_url.is_some(), egui::Button::new("Open in Gmail"));
             if button
@@ -1855,11 +1898,26 @@ impl App {
             {
                 ui.ctx().open_url(egui::OpenUrl::new_tab(url));
             }
+            let eml = ui
+                .add_enabled(exportable, egui::Button::new("Save .eml"))
+                .on_disabled_hover_text("Waiting for the message bodies to load.");
+            if eml.clicked() {
+                export = Some(true);
+            }
+            let text = ui
+                .add_enabled(exportable, egui::Button::new("Save text"))
+                .on_disabled_hover_text("Waiting for the message bodies to load.");
+            if text.clicked() {
+                export = Some(false);
+            }
             ui.weak(format!(
                 "thread {thrid} (0x{thrid:x}) · {} messages in this conversation",
                 thread.len()
             ));
         });
+        if let Some(eml) = export {
+            self.export_thread(&thread, eml);
+        }
 
         // The conversation's labels, as chips. A chip that's cut short has the full name on hover.
         let font = egui::TextStyle::Small.resolve(ui.style());

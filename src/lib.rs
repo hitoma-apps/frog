@@ -2,6 +2,7 @@
 //! parsing, label operations, and plaintext message rendering.
 
 pub mod auth;
+pub mod export;
 pub mod imap;
 pub mod labels;
 pub mod linkcheck;
