@@ -1821,6 +1821,11 @@ impl App {
                     .num_columns(2)
                     .striped(true)
                     .show(ui, |ui| {
+                        if let Some(ts) = m.received {
+                            ui.strong("Received");
+                            ui.label(format_time(ts));
+                            ui.end_row();
+                        }
                         for (name, value) in gmail_imap_proto::original::summary(&m.headers) {
                             ui.strong(name);
                             ui.label(value);
