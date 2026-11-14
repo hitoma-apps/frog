@@ -7,7 +7,7 @@
 //! It also keeps the connection alive. It sends NOOP after a quiet period, and
 //! reconnects when the connection drops, retrying the failed command once.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::thread;
 use std::time::Duration;
@@ -764,18 +764,14 @@ impl Worker {
         }
     }
 
-    /// Writes a message's labels and read state to the cache.
-    fn cache_update(&mut self, u: &MessageUpdate) {
+    /// Writes labels and read state from the server to the cache, in one transaction.
+    fn cache_updates(&mut self, updates: &[MessageUpdate]) {
         let Some(store) = self.store.as_mut() else {
             return;
         };
-        let result = store.msgid_for_uid(u.uid).and_then(|msgid| match msgid {
-            Some(msgid) => store
-                .set_labels(msgid, &u.labels)
-                .and_then(|()| store.set_seen(msgid, u.seen)),
-            None => Ok(()),
-        });
-        if let Err(e) = result {
+        let batch: Vec<(u32, &BTreeSet<String>, bool)> =
+            updates.iter().map(|u| (u.uid, &u.labels, u.seen)).collect();
+        if let Err(e) = store.apply_updates(&batch) {
             self.emit
                 .send(Event::Error(format!("cache write failed: {e}")));
         }
@@ -948,9 +944,7 @@ impl Worker {
             // Those messages are no longer waiting for a background header fetch.
             self.state.pending_headers.retain(|u| !uids.contains(u));
         }
-        for c in &known {
-            self.cache_update(c);
-        }
+        self.cache_updates(&known);
         if !known.is_empty() {
             self.emit.send(Event::Labels {
                 updates: known,
@@ -1128,9 +1122,7 @@ impl Worker {
             match src.set_seen(&uids, seen) {
                 Ok((command, updates)) => {
                     self.clear_pending(&msgids);
-                    for u in &updates {
-                        self.cache_update(u);
-                    }
+                    self.cache_updates(&updates);
                     self.emit.send(Event::Labels { updates, command });
                 }
                 Err(e @ SourceError::Disconnected(_)) => return Err(e),
@@ -1164,9 +1156,7 @@ impl Worker {
         labels: &[String],
     ) -> Result<(), SourceError> {
         let (command, updates) = src.modify_labels(uids, action, labels)?;
-        for u in &updates {
-            self.cache_update(u);
-        }
+        self.cache_updates(&updates);
         self.emit_label_counts();
         self.emit.send(Event::Labels { updates, command });
         Ok(())
@@ -1476,6 +1466,7 @@ mod tests {
 
         let start = rss_mb();
         let sent = gmail_imap_proto::store::sent_timestamp(&headers);
+        let write_started = std::time::Instant::now();
         {
             let mut store = Store::open(&path).unwrap();
             let labels: std::collections::BTreeSet<String> =
@@ -1502,6 +1493,7 @@ mod tests {
             }
         }
         let after_fill = rss_mb();
+        let write_time = write_started.elapsed();
         let file_mb = std::fs::metadata(&path).map_or(0.0, |m| m.len() as f64 / 1_048_576.0);
 
         // The worker on that cache. A mock source: this test never loads, so nothing is removed.
@@ -1554,6 +1546,7 @@ mod tests {
         let uids: UidSet = (1..=N).collect();
 
         println!("\n== memory breakdown, {N} cached messages in {file_mb:.0} MB on disk ==");
+        println!("writing {N} messages to the file took {write_time:.1?}");
         println!("process before the test        {start:>8.1} MB");
         println!(
             "after writing the cache        {after_fill:>8.1} MB  (includes the writer's transient batches)"

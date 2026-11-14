@@ -650,6 +650,10 @@ impl Store {
     fn init(conn: Connection, body_cap: u64) -> Result<Self> {
         conn.pragma_update(None, "foreign_keys", true)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // In WAL mode, NORMAL doesn't sync the disk on every commit. A power cut can lose the
+        // last few commits, but never leaves a half-written one, and the next sync re-fetches
+        // what was lost. The clean-shutdown checks cover the rest.
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         let mut store = Self {
             conn,
             body_cap,
@@ -1001,6 +1005,41 @@ impl Store {
         if let Some(t) = thread {
             refresh_threads(&tx, &BTreeSet::from([t]))?;
         }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Applies labels and read state reported by the server, by UID, in one transaction, and
+    /// refreshes each affected thread once. A read-state change still waiting to reach the
+    /// server is kept, as in `set_seen`. UIDs that aren't cached are skipped.
+    pub fn apply_updates(&mut self, updates: &[(u32, &BTreeSet<String>, bool)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        let mut affected: BTreeSet<u64> = BTreeSet::new();
+        {
+            let mut find = tx.prepare_cached("SELECT msgid, thrid FROM messages WHERE uid = ?1")?;
+            let mut clear = tx.prepare_cached("DELETE FROM message_labels WHERE msgid = ?1")?;
+            let mut add =
+                tx.prepare_cached("INSERT INTO message_labels (msgid, label) VALUES (?1, ?2)")?;
+            let mut seen_stmt = tx.prepare_cached(
+                "UPDATE messages SET seen = ?2 WHERE msgid = ?1
+                   AND msgid NOT IN (SELECT msgid FROM pending_seen)",
+            )?;
+            for &(uid, labels, seen) in updates {
+                let row: Option<(i64, i64)> = find
+                    .query_row(params![uid], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .optional()?;
+                let Some((msgid, thrid)) = row else {
+                    continue;
+                };
+                affected.insert(thrid as u64);
+                clear.execute(params![msgid])?;
+                for label in labels {
+                    add.execute(params![msgid, label])?;
+                }
+                seen_stmt.execute(params![msgid, seen])?;
+            }
+        }
+        refresh_threads(&tx, &affected)?;
         tx.commit()?;
         Ok(())
     }
@@ -1537,23 +1576,26 @@ impl Store {
                 params![msgid, data, raw_size, data.len() as i64],
             )?;
         }
-        loop {
-            let total: i64 = tx.query_row(
-                "SELECT COALESCE(SUM(stored_size), 0) FROM bodies",
-                [],
-                |r| r.get(0),
-            )?;
-            if total as u64 <= self.body_cap {
+        // Over the cap, the least recently used bodies go. The total is read once, and each
+        // eviction takes its own size off it, rather than summing the table again.
+        let mut total: i64 = tx.query_row(
+            "SELECT COALESCE(SUM(stored_size), 0) FROM bodies",
+            [],
+            |r| r.get(0),
+        )?;
+        while total.max(0) as u64 > self.body_cap {
+            let oldest: Option<(i64, i64)> = tx
+                .query_row(
+                    "SELECT msgid, stored_size FROM bodies ORDER BY last_access ASC LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let Some((msgid, size)) = oldest else {
                 break;
-            }
-            let evicted = tx.execute(
-                "DELETE FROM bodies WHERE msgid = (
-                     SELECT msgid FROM bodies ORDER BY last_access ASC LIMIT 1)",
-                [],
-            )?;
-            if evicted == 0 {
-                break;
-            }
+            };
+            tx.execute("DELETE FROM bodies WHERE msgid = ?1", params![msgid])?;
+            total -= size;
         }
         tx.commit()?;
         Ok(())
@@ -2121,6 +2163,65 @@ mod tests {
         assert!(!s.has_pending_seen().unwrap());
         s.set_seen(1, false).unwrap();
         assert_eq!(unread(&s), 1);
+    }
+
+    #[test]
+    #[ignore]
+    fn small_commit_timing() {
+        let dir = std::env::temp_dir().join(format!("gmail-sync-timing-{}", std::process::id()));
+        let path = dir.join("cache.sqlite");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = Store::open(&path).unwrap();
+        let msgs: Vec<CachedMessage> = (1..=2000)
+            .map(|u| msg(u64::from(u), u, &["Work"]))
+            .collect();
+        s.upsert_messages(&msgs).unwrap();
+        for mode in ["FULL", "NORMAL"] {
+            s.conn.pragma_update(None, "synchronous", mode).unwrap();
+            let t = std::time::Instant::now();
+            for u in 1..=2000u64 {
+                s.set_seen(u, u % 2 == 0).unwrap();
+            }
+            println!(
+                "2000 single-message commits, synchronous={mode}: {:?}",
+                t.elapsed()
+            );
+        }
+        let work = BTreeSet::from(["Work".to_string()]);
+        let updates: Vec<(u32, &BTreeSet<String>, bool)> =
+            (1..=2000u32).map(|u| (u, &work, u % 3 == 0)).collect();
+        let t = std::time::Instant::now();
+        s.apply_updates(&updates).unwrap();
+        println!("the same 2000 changes in one batch: {:?}", t.elapsed());
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_batch_of_updates_matches_one_at_a_time() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        let mut a = msg(1, 1, &["Work"]);
+        a.thrid = 100;
+        let mut b = msg(2, 2, &["Work"]);
+        b.thrid = 100;
+        s.upsert_messages(&[a, b, msg(3, 3, &["Home"])]).unwrap();
+
+        let home = BTreeSet::from(["Home".to_string()]);
+        let none = BTreeSet::new();
+        // UID 99 isn't cached: it's skipped.
+        s.apply_updates(&[(1, &home, true), (2, &none, true), (99, &home, false)])
+            .unwrap();
+        assert_eq!(
+            s.label_thread_counts().unwrap(),
+            vec![("Home".into(), 2, 1)],
+            "thread 100 is now Home and read; message 3's thread is Home and unread"
+        );
+        assert!(s.check().unwrap().logical.is_empty());
+
+        // A read-state change still queued for the server isn't overwritten.
+        s.set_seen_for_threads(&[103], true).unwrap();
+        s.apply_updates(&[(3, &home, false)]).unwrap();
+        assert_eq!(s.thread_totals().unwrap(), (2, 0));
     }
 
     #[test]
