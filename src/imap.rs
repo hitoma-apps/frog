@@ -512,6 +512,17 @@ impl<S: Read + Write> ImapConn<S> {
         Ok(out)
     }
 
+    /// The folder with the `\All` special-use flag, which holds every message. Its name
+    /// differs between accounts and languages, so it's asked for rather than assumed.
+    pub fn all_mail_name(&mut self) -> Result<Option<String>> {
+        let resp = self.command("LIST \"\" \"*\"")?;
+        let lines = resp
+            .untagged
+            .iter()
+            .map(|line| String::from_utf8_lossy(line).into_owned());
+        Ok(all_mail_from_lines(lines))
+    }
+
     pub fn logout(&mut self) -> Result<()> {
         self.command("LOGOUT")?;
         Ok(())
@@ -528,6 +539,17 @@ fn literal_len(line: &[u8]) -> Option<usize> {
         return None;
     }
     std::str::from_utf8(digits).ok()?.parse().ok()
+}
+
+/// The name of the first LIST entry with the `\All` flag, if any.
+pub fn all_mail_from_lines<I: IntoIterator<Item = String>>(lines: I) -> Option<String> {
+    lines.into_iter().find_map(|line| {
+        let (attrs, name) = parse_list_line(&line)?;
+        attrs
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case("\\All"))
+            .then_some(name)
+    })
 }
 
 /// Parses one untagged LIST response: `* LIST (attrs) "delim" name`.
@@ -740,6 +762,24 @@ mod idle_tests {
 #[cfg(test)]
 mod list_tests {
     use super::*;
+
+    #[test]
+    fn finds_the_all_mail_folder_by_its_flag_whatever_its_name() {
+        let lines = [
+            "* LIST (\\HasNoChildren) \"/\" \"INBOX\"",
+            "* LIST (\\HasNoChildren \\Sent) \"/\" \"[Gmail]/Sent Mail\"",
+            "* LIST (\\HasNoChildren \\All) \"/\" \"[Google Mail]/Alle Nachrichten\"",
+        ]
+        .map(String::from);
+        assert_eq!(
+            all_mail_from_lines(lines),
+            Some("[Google Mail]/Alle Nachrichten".to_string())
+        );
+        assert_eq!(
+            all_mail_from_lines(["* LIST () \"/\" \"INBOX\"".to_string()]),
+            None
+        );
+    }
 
     #[test]
     fn quoted_name_and_attributes() {

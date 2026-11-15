@@ -12,7 +12,8 @@ use crate::backend::{
     label_refs,
 };
 
-/// Gmail's All Mail folder holds every message, whatever its labels.
+/// Gmail's All Mail folder holds every message, whatever its labels. This is the usual English
+/// name, used only if the server doesn't flag the folder with `\All`.
 pub const ALL_MAIL: &str = "[Gmail]/All Mail";
 /// How many UIDs go into one FETCH.
 const FETCH_CHUNK: usize = 200;
@@ -26,6 +27,8 @@ pub struct LiveSession<S: Read + Write> {
     idle: bool,
     /// Notices from IDLE that arrived during a command, not yet handed out.
     notices: Vec<IdleNotice>,
+    /// The All Mail folder's name on this account.
+    all_mail: String,
 }
 
 impl<S: Read + Write> LiveSession<S> {
@@ -39,18 +42,24 @@ impl<S: Read + Write> LiveSession<S> {
         }
         let condstore = caps.iter().any(|c| c.eq_ignore_ascii_case("CONDSTORE"));
         let idle = caps.iter().any(|c| c.eq_ignore_ascii_case("IDLE"));
+        // If the server doesn't say which folder is All Mail, the usual English name is tried.
+        let all_mail = conn
+            .all_mail_name()
+            .map_err(err)?
+            .unwrap_or_else(|| ALL_MAIL.to_string());
         Ok(Self {
             conn,
             selected: false,
             condstore,
             idle,
             notices: Vec::new(),
+            all_mail,
         })
     }
 
     fn ensure_selected(&mut self) -> Result<(), SourceError> {
         if !self.selected {
-            self.conn.select(ALL_MAIL).map_err(to_source_error)?;
+            self.conn.select(&self.all_mail).map_err(to_source_error)?;
             self.selected = true;
         }
         Ok(())
@@ -82,7 +91,7 @@ fn idle_notice(line: &str) -> Option<IdleNotice> {
 
 impl<S: Read + Write + Send + SetReadTimeout> MailSource for LiveSession<S> {
     fn select(&mut self) -> Result<MailboxInfo, SourceError> {
-        let sel = self.conn.select(ALL_MAIL).map_err(to_source_error)?;
+        let sel = self.conn.select(&self.all_mail).map_err(to_source_error)?;
         self.selected = true;
         Ok(MailboxInfo {
             uidvalidity: sel.uidvalidity,
@@ -380,6 +389,9 @@ mod tests {
                 "* 3 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 42] UIDs valid\r\n{tag} OK [READ-WRITE] SELECT completed\r\n"
             ),
             c if c.starts_with("UID STORE") => format!("{tag} OK STORE completed\r\n"),
+            c if c.starts_with("LIST") => format!(
+                "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n* LIST (\\HasNoChildren \\All) \"/\" \"[Google Mail]/Alle Nachrichten\"\r\n{tag} OK LIST completed\r\n"
+            ),
             "NOOP" => format!("{tag} OK NOOP completed\r\n"),
             "LOGOUT" => format!("* BYE bye\r\n{tag} OK LOGOUT completed\r\n"),
             _ => format!("{tag} BAD unknown command\r\n"),
@@ -418,6 +430,22 @@ mod tests {
     ) -> Result<LiveSession<TcpStream>, String> {
         let conn = ImapConn::new(TcpStream::connect(addr).unwrap()).unwrap();
         LiveSession::open(conn, "me@gmail.com", password)
+    }
+
+    #[test]
+    fn selects_the_folder_the_server_flags_as_all_mail() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let addr = spawn_fake(Arc::clone(&seen));
+        let mut s = session(addr, "app-pass").unwrap();
+        s.select().unwrap();
+        let commands = seen.lock().unwrap().clone();
+        assert!(
+            commands
+                .iter()
+                .any(|c| c == "SELECT \"[Google Mail]/Alle Nachrichten\""),
+            "{commands:?}"
+        );
+        assert!(!commands.iter().any(|c| c.contains("[Gmail]/All Mail")));
     }
 
     #[test]
