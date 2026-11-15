@@ -43,6 +43,40 @@ pub fn safe_file_name(name: &str) -> String {
     }
 }
 
+/// Writes `bytes` to the Downloads folder as `name`, or as `name (2)` and so on if that is taken.
+/// The file is owner-only. Returns its path.
+pub fn write_download(name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+    let dir = downloads_dir()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no Downloads folder"))?;
+    write_download_to(&dir, name, bytes)
+}
+
+/// `write_download`, into `dir`.
+pub fn write_download_to(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem, format!(".{ext}")),
+        _ => (name, String::new()),
+    };
+    let mut n = 1;
+    loop {
+        let file = if n == 1 {
+            format!("{stem}{ext}")
+        } else {
+            format!("{stem} ({n}){ext}")
+        };
+        let path = dir.join(file);
+        match new_private_file(&path) {
+            Ok(mut out) => {
+                out.write_all(bytes)?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => n += 1,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// The whole thread as plain text: each message's headers, then its text, oldest first.
 pub fn thread_text(items: &[Item]) -> String {
     let mut out = String::new();
@@ -160,6 +194,26 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("export-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn downloads_never_overwrite_and_are_owner_only() {
+        let dir = temp("download");
+        let first = write_download_to(&dir, "notes.txt", b"one").unwrap();
+        let second = write_download_to(&dir, "notes.txt", b"two").unwrap();
+        assert_eq!(first.file_name().unwrap(), "notes.txt");
+        assert_eq!(second.file_name().unwrap(), "notes (2).txt");
+        assert_eq!(std::fs::read(&first).unwrap(), b"one");
+        assert_eq!(std::fs::read(&second).unwrap(), b"two");
+        let third = write_download_to(&dir, "README", b"x").unwrap();
+        assert_eq!(third.file_name().unwrap(), "README");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&first).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
