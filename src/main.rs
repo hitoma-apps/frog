@@ -1912,6 +1912,48 @@ impl App {
                 }
                 ui.separator();
 
+                let active = self.search.trim().to_string();
+                let recent = self.settings.recent_searches.clone();
+                {
+                    if self.settings.saved_searches.is_empty()
+                        && active.is_empty()
+                        && recent.is_empty()
+                    {
+                        ui.weak("Saved and recent searches appear here.");
+                    }
+                    let searches = self.settings.saved_searches.clone();
+                    let mut remove: Option<usize> = None;
+                    for (i, text) in searches.iter().enumerate() {
+                        if self.search_row(ui, text) {
+                            remove = Some(i);
+                        }
+                    }
+                    if let Some(i) = remove {
+                        self.settings.saved_searches.remove(i);
+                        self.save_settings();
+                    }
+                    // The search on screen, in small type under the saved ones.
+                    if !active.is_empty() {
+                        ui.small(format!("Showing: {active}"));
+                    }
+                    if !recent.is_empty() {
+                        egui::CollapsingHeader::new("Most recent")
+                            .id_salt("recent_searches")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                for text in &recent {
+                                    let selected = active == *text;
+                                    if ui.selectable_label(selected, text).clicked() {
+                                        self.search = text.clone();
+                                        self.settings.note_search(text);
+                                        self.save_settings();
+                                        self.change_list();
+                                    }
+                                }
+                            });
+                    }
+                }
+
                 let favorites = self.settings.favorite_labels.clone();
                 if !favorites.is_empty() {
                     ui.heading("Favorites");
@@ -1950,50 +1992,6 @@ impl App {
                     .clicked()
                 {
                     self.open_waiting();
-                }
-
-                let active = self.search.trim().to_string();
-                let recent = self.settings.recent_searches.clone();
-                {
-                    ui.separator();
-                    ui.heading("Searches");
-                    if self.settings.saved_searches.is_empty()
-                        && active.is_empty()
-                        && recent.is_empty()
-                    {
-                        ui.weak("Saved and recent searches appear here.");
-                    }
-                    let searches = self.settings.saved_searches.clone();
-                    let mut remove: Option<usize> = None;
-                    for (i, text) in searches.iter().enumerate() {
-                        if self.search_row(ui, text) {
-                            remove = Some(i);
-                        }
-                    }
-                    if let Some(i) = remove {
-                        self.settings.saved_searches.remove(i);
-                        self.save_settings();
-                    }
-                    // The search on screen, in small type under the saved ones.
-                    if !active.is_empty() {
-                        ui.small(format!("Showing: {active}"));
-                    }
-                    if !recent.is_empty() {
-                        egui::CollapsingHeader::new("Most recent")
-                            .id_salt("recent_searches")
-                            .default_open(false)
-                            .show(ui, |ui| {
-                                for text in &recent {
-                                    let selected = active == *text;
-                                    if ui.selectable_label(selected, text).clicked() {
-                                        self.search = text.clone();
-                                        self.settings.note_search(text);
-                                        self.save_settings();
-                                        self.change_list();
-                                    }
-                                }
-                            });
-                    }
                 }
 
                 // The label tree is built once per change to the labels or their counts, not per
