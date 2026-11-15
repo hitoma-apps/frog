@@ -29,7 +29,9 @@ use gmail_imap_proto::labels::{LabelAction, SystemLabel};
 use gmail_imap_proto::linkcheck::{self, LinkInfo};
 use gmail_imap_proto::links::gmail_thread_url;
 use gmail_imap_proto::render_plaintext;
+use gmail_imap_proto::search;
 use gmail_imap_proto::settings::{self, CHECK_INTERVAL_RANGE, PAGE_SIZE_RANGE, Settings};
+use gmail_imap_proto::store::SearchHit;
 
 use backend::Message;
 use gmail_imap_proto::store::{StorageView, ThreadFilter};
@@ -41,6 +43,8 @@ const HELP_TEXT: &str = include_str!("help.txt");
 
 /// How many of the largest messages the storage view lists.
 const STORAGE_ROWS: usize = 500;
+/// How many messages a search lists.
+const SEARCH_ROWS: usize = 500;
 
 fn main() -> eframe::Result {
     let creds = match (
@@ -408,6 +412,10 @@ struct App {
     /// Threads whose notifications were clicked, sent from the notification threads.
     click_tx: std::sync::mpsc::Sender<u64>,
     click_rx: std::sync::mpsc::Receiver<u64>,
+    /// The last search the cache answered, and the messages it found.
+    search_results: Option<(search::Query, Arc<Vec<SearchHit>>)>,
+    /// The search last sent to the cache, so each one is sent once.
+    search_asked: Option<search::Query>,
     /// Whether the sign-in is the automatic one at startup, so the window can say so.
     auto_signin: bool,
     /// Whether the window layout has changed since it was last saved.
@@ -536,6 +544,8 @@ impl App {
             storage_asked: Instant::now(),
             click_tx,
             click_rx,
+            search_results: None,
+            search_asked: None,
             auto_signin: false,
             layout_dirty: false,
             layout_saved: Instant::now(),
@@ -763,6 +773,9 @@ impl App {
                 }
             }
             Event::Largest(view) => self.storage = Some(Arc::new(view)),
+            Event::Search { query, hits } => {
+                self.search_results = Some((query, Arc::new(hits)));
+            }
             Event::Window {
                 filter,
                 start,
@@ -825,6 +838,7 @@ impl App {
     /// mean something else in the next list, so the shift-click anchor goes too.
     fn change_list(&mut self) {
         self.storage_open = false;
+        self.search_asked = None;
         self.window_filter = None;
         self.window_rows.clear();
         self.window_total = 0;
@@ -890,6 +904,74 @@ impl App {
     }
 
     /// Opens a conversation. Its messages are read from the cache, and their bodies follow.
+    /// Sends the search box's query to the cache, once for each change to it.
+    fn refresh_search(&mut self) {
+        let query = search::parse(&self.search).query;
+        if query.is_empty() || self.search_asked.as_ref() == Some(&query) {
+            return;
+        }
+        self.search_asked = Some(query.clone());
+        self.send(Command::Search {
+            query,
+            limit: SEARCH_ROWS,
+        });
+    }
+
+    /// The search results: one row per matching message, newest first. A row opens its
+    /// conversation in the reader.
+    fn search_list(&mut self, ui: &mut egui::Ui) {
+        let parsed = search::parse(&self.search);
+        ui.heading(format!("Search: {}", self.search.trim()));
+        for warning in &parsed.warnings {
+            ui.weak(format!("Ignored: {warning}"));
+        }
+        if parsed.query.is_empty() {
+            ui.weak("Type words or operators, such as from:alice or has:attachment.");
+            return;
+        }
+        let results = match &self.search_results {
+            Some((query, hits)) if *query == parsed.query => Arc::clone(hits),
+            _ => {
+                ui.weak("Searching…");
+                return;
+            }
+        };
+        ui.weak(format!(
+            "{} messages, newest first. Only cached messages are searched.",
+            results.len()
+        ));
+        ui.separator();
+        let row_height = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
+        egui::ScrollArea::vertical()
+            .id_salt("search")
+            .auto_shrink([false, false])
+            .show_rows(ui, row_height, results.len(), |ui, range| {
+                for hit in &results[range] {
+                    ui.horizontal(|ui| {
+                        ui.weak(format_time(hit.when));
+                        let subject = if hit.subject.is_empty() {
+                            "(no subject)"
+                        } else {
+                            hit.subject.as_str()
+                        };
+                        if ui
+                            .selectable_label(false, format!("{} — {}", hit.from, subject))
+                            .on_hover_text("Open this conversation")
+                            .clicked()
+                        {
+                            self.open_conversation(hit.thrid);
+                        }
+                        if !hit.seen {
+                            ui.strong("unread");
+                        }
+                        if hit.attachment {
+                            ui.weak("attachment");
+                        }
+                    });
+                }
+            });
+    }
+
     /// Opens the thread of each notification the user clicked, and brings the window forward.
     fn open_clicked_notifications(&mut self, ctx: &egui::Context) {
         while let Ok(thrid) = self.click_rx.try_recv() {
@@ -900,6 +982,8 @@ impl App {
 
     /// Opens the storage view: the largest cached messages, biggest first.
     fn open_storage(&mut self) {
+        self.search.clear();
+        self.change_list();
         self.storage_open = true;
         self.storage_asked = Instant::now();
         self.send(Command::Largest {
@@ -2430,6 +2514,7 @@ impl eframe::App for App {
         self.open_clicked_notifications(ui.ctx());
         self.remember_window_position(ui.ctx());
         self.refresh_storage(ui.ctx());
+        self.refresh_search();
 
         if !self.connected {
             egui::CentralPanel::default().show(ui, |ui| {
@@ -2498,7 +2583,9 @@ impl eframe::App for App {
                 .resizable(true)
                 .default_size(self.settings.window.list_height)
                 .show(ui, |ui| {
-                    if self.storage_open {
+                    if !self.search.trim().is_empty() {
+                        self.search_list(ui);
+                    } else if self.storage_open {
                         self.storage_list(ui);
                     } else {
                         self.message_list(ui);

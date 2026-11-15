@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use directories::ProjectDirs;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 
+use crate::search::Query;
 use crate::uidset::UidSet;
 
 /// Default body cache size, in compressed bytes.
@@ -224,6 +225,20 @@ pub struct LargeMessage {
     pub subject: String,
     pub received: Option<i64>,
     pub size: u64,
+    pub attachment: bool,
+}
+
+/// A cached message that matches a search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchHit {
+    pub uid: u32,
+    pub msgid: u64,
+    pub thrid: u64,
+    pub from: String,
+    pub subject: String,
+    /// Received time, or sent time when the received time is unknown.
+    pub when: i64,
+    pub seen: bool,
     pub attachment: bool,
 }
 
@@ -1559,6 +1574,78 @@ impl Store {
         Ok(uids)
     }
 
+    /// The cached messages that match a search, newest first, at most `limit` of them. Every
+    /// part of the query must hold for the same message.
+    pub fn search_messages(&self, query: &Query, limit: usize) -> Result<Vec<SearchHit>> {
+        use rusqlite::types::Value;
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut sql = String::from(
+            "SELECT m.uid, m.msgid, m.thrid, m.from_addr, m.subject,
+                    COALESCE(m.received, m.sent), m.seen, m.attachment
+             FROM messages m WHERE m.uid IS NOT NULL",
+        );
+        let mut args: Vec<Value> = Vec::new();
+        for word in &query.words {
+            sql.push_str(
+                " AND m.msgid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)",
+            );
+            args.push(Value::Text(format!("\"{word}\"*")));
+        }
+        for word in &query.from {
+            sql.push_str(
+                " AND m.msgid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)",
+            );
+            args.push(Value::Text(format!("from_addr : \"{word}\"*")));
+        }
+        for word in &query.subject {
+            sql.push_str(
+                " AND m.msgid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)",
+            );
+            args.push(Value::Text(format!("subject : \"{word}\"*")));
+        }
+        for label in &query.labels {
+            sql.push_str(" AND m.msgid IN (SELECT msgid FROM message_labels WHERE label = ?)");
+            args.push(Value::Text(label.clone()));
+        }
+        match query.unread {
+            Some(true) => sql.push_str(" AND m.seen = 0"),
+            Some(false) => sql.push_str(" AND m.seen = 1"),
+            None => {}
+        }
+        if query.attachment == Some(true) {
+            sql.push_str(" AND m.attachment = 1");
+        }
+        if let Some(after) = query.after {
+            sql.push_str(" AND COALESCE(m.received, m.sent) >= ?");
+            args.push(Value::Integer(after));
+        }
+        if let Some(before) = query.before {
+            sql.push_str(" AND COALESCE(m.received, m.sent) < ?");
+            args.push(Value::Integer(before));
+        }
+        sql.push_str(" ORDER BY COALESCE(m.received, m.sent) DESC, m.uid DESC LIMIT ?");
+        args.push(Value::Integer(limit as i64));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let hits = stmt
+            .query_map(rusqlite::params_from_iter(args.iter()), |r| {
+                Ok(SearchHit {
+                    uid: r.get(0)?,
+                    msgid: r.get::<_, i64>(1)? as u64,
+                    thrid: r.get::<_, i64>(2)? as u64,
+                    from: r.get(3)?,
+                    subject: r.get(4)?,
+                    when: r.get(5)?,
+                    seen: r.get(6)?,
+                    attachment: r.get::<_, Option<bool>>(7)?.unwrap_or(false),
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(hits)
+    }
+
     /// The largest cached messages, biggest first, at most `limit` of them.
     pub fn storage_view(&self, limit: usize) -> Result<StorageView> {
         let sized: i64 = self.conn.query_row(
@@ -1857,6 +1944,64 @@ mod tests {
         tx.commit().unwrap();
         assert_eq!(s.list_messages(Some("Café"), 10).unwrap().len(), 2);
         assert!(s.list_messages(Some("Caf&AOk-"), 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_is_per_message_and_every_part_must_hold_for_it() {
+        use crate::search::parse;
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        s.upsert_messages(&[
+            msg(1, 1, &["Work"]),
+            msg(2, 2, &["Work"]),
+            msg(3, 3, &["Home"]),
+        ])
+        .unwrap();
+        s.set_structures(&[
+            (1, false, Some(2_000), Some(20)),
+            (2, true, Some(1_000), Some(10)),
+            (3, true, Some(3_000), Some(30)),
+        ])
+        .unwrap();
+        s.set_seen(1, true).unwrap();
+        let uids = |s: &Store, text: &str| -> Vec<u32> {
+            s.search_messages(&parse(text).query, 100)
+                .unwrap()
+                .iter()
+                .map(|h| h.uid)
+                .collect()
+        };
+        assert_eq!(uids(&s, "hello"), vec![3, 1, 2]);
+        assert_eq!(uids(&s, "label:Work"), vec![1, 2]);
+        assert_eq!(uids(&s, "label:Work is:unread"), vec![2]);
+        assert_eq!(uids(&s, "has:attachment"), vec![3, 2]);
+        assert_eq!(uids(&s, "from:sender3"), vec![3]);
+        assert_eq!(uids(&s, "subject:hello from:sender2"), vec![2]);
+        assert_eq!(uids(&s, "label:Home has:attachment"), vec![3]);
+        assert!(uids(&s, "label:Home is:read").is_empty());
+        assert!(uids(&s, "is:flagged").is_empty());
+    }
+
+    #[test]
+    fn date_operators_split_messages_at_local_midnight() {
+        use crate::search::parse;
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        s.upsert_messages(&[msg(1, 1, &["Work"]), msg(2, 2, &["Work"])])
+            .unwrap();
+        let day = parse("after:2026-11-01").query.after.unwrap();
+        s.set_structures(&[
+            (1, false, Some(day + 3_600), None),
+            (2, false, Some(day - 3_600), None),
+        ])
+        .unwrap();
+        let uids = |text: &str| -> Vec<u32> {
+            s.search_messages(&parse(text).query, 100)
+                .unwrap()
+                .iter()
+                .map(|h| h.uid)
+                .collect()
+        };
+        assert_eq!(uids("after:2026-11-01"), vec![1]);
+        assert_eq!(uids("before:2026-11-01"), vec![2]);
     }
 
     fn msg(msgid: u64, uid: u32, labels: &[&str]) -> CachedMessage {

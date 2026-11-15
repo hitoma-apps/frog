@@ -11,6 +11,7 @@ pub mod links;
 pub mod original;
 pub mod render;
 pub mod response;
+pub mod search;
 pub mod settings;
 pub mod store;
 pub mod uidset;

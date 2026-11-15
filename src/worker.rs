@@ -71,6 +71,11 @@ pub enum Command {
     Thread { thrid: u64 },
     /// Reads the largest cached messages, at most `limit` of them.
     Largest { limit: usize },
+    /// Searches the cached messages for a query.
+    Search {
+        query: gmail_imap_proto::search::Query,
+        limit: usize,
+    },
 }
 
 /// A row of the thread list: a conversation, its counts, and its newest message.
@@ -139,6 +144,11 @@ pub enum Event {
     },
     /// The largest cached messages, and how many messages have a known size.
     Largest(gmail_imap_proto::store::StorageView),
+    /// The messages matching a search. `query` says which search this answers.
+    Search {
+        query: gmail_imap_proto::search::Query,
+        hits: Vec<gmail_imap_proto::store::SearchHit>,
+    },
     /// Every cached message of one thread, newest first.
     Thread {
         thrid: u64,
@@ -549,7 +559,8 @@ impl Worker {
             Command::Window { .. }
             | Command::Thread { .. }
             | Command::ThreadRange { .. }
-            | Command::Largest { .. } => Ok(()),
+            | Command::Largest { .. }
+            | Command::Search { .. } => Ok(()),
         }
     }
 
@@ -1325,6 +1336,7 @@ fn answer_read(store: Option<&Store>, emit: &Emitter, cmd: &Command) {
         } => read_window(store, emit, filter, *start, *count),
         Command::Thread { thrid } => read_thread(store, emit, *thrid),
         Command::Largest { limit } => read_largest(store, emit, *limit),
+        Command::Search { query, limit } => read_search(store, emit, query, *limit),
         Command::ThreadRange {
             filter,
             start,
@@ -1343,6 +1355,7 @@ pub fn is_cache_read(cmd: &Command) -> bool {
             | Command::Thread { .. }
             | Command::ThreadRange { .. }
             | Command::Largest { .. }
+            | Command::Search { .. }
     )
 }
 
@@ -1355,6 +1368,26 @@ fn read_largest(store: Option<&Store>, emit: &Emitter, limit: usize) {
     };
     match view {
         Ok(view) => emit.send(Event::Largest(view)),
+        Err(e) => emit.send(Event::Error(format!("cache read failed: {e}"))),
+    }
+}
+
+/// Answers a search with the matching cached messages.
+fn read_search(
+    store: Option<&Store>,
+    emit: &Emitter,
+    query: &gmail_imap_proto::search::Query,
+    limit: usize,
+) {
+    let hits = match store {
+        Some(store) => store.search_messages(query, limit),
+        None => Ok(Vec::new()),
+    };
+    match hits {
+        Ok(hits) => emit.send(Event::Search {
+            query: query.clone(),
+            hits,
+        }),
         Err(e) => emit.send(Event::Error(format!("cache read failed: {e}"))),
     }
 }
@@ -2193,6 +2226,7 @@ mod sync_tests {
             Event::CheckFinished => "CheckFinished",
             Event::Window { .. } => "Window",
             Event::Largest(_) => "Largest",
+            Event::Search { .. } => "Search",
             Event::ThreadRange { .. } => "ThreadRange",
             Event::Thread { .. } => "Thread",
             Event::NewArrivals(_) => "NewArrivals",

@@ -1,13 +1,18 @@
 Gmail Labels Prototype: help
 
-== Search operators ==
+== Search ==
 
-There are none yet. Type words in the search box, then press Enter or click elsewhere to run the search.
+Type words or operators in the search box, then press Enter or click elsewhere. Results are messages, newest first. Click one to open its conversation.
 
-- Every word must match, so "invoice march" finds mail with both words.
-- A word matches the start of a word in the sender or the subject.
-- Searches cover the sender and subject only, not message bodies.
-- Operators such as "from:" are not supported yet. They're planned in issue 51.
+- Words must all match the sender or the subject, as whole words or the start of a word.
+- from:alice      the sender contains alice
+- subject:tax     the subject contains tax
+- label:Work      the message has the label Work. Use label:"Work stuff" for a name with spaces.
+- is:unread, is:read
+- has:attachment
+- after:2026-01-31, before:2026-01-31   received on or after, or before, that day (your local time)
+- Every part must match the same message.
+- Only cached messages are searched, not message bodies. Quoted phrases, "-" to exclude and OR are not supported yet.
 
 == Saved and recent searches ==
 
