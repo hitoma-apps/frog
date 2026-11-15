@@ -2044,20 +2044,23 @@ impl App {
                         ui.small(format!("Showing: {active}"));
                     }
                     if !recent.is_empty() {
-                        egui::CollapsingHeader::new("Most recent")
-                            .id_salt("recent_searches")
-                            .default_open(false)
-                            .show(ui, |ui| {
-                                for text in &recent {
-                                    let selected = active == *text;
-                                    if ui.selectable_label(selected, text).clicked() {
-                                        self.search = text.clone();
-                                        self.settings.note_search(text);
-                                        self.save_settings();
-                                        self.change_list();
+                        // Indented under the Search heading, so it reads as part of the section.
+                        ui.indent("recent_searches_group", |ui| {
+                            egui::CollapsingHeader::new("Most recent")
+                                .id_salt("recent_searches")
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    for text in &recent {
+                                        let selected = active == *text;
+                                        if ui.selectable_label(selected, text).clicked() {
+                                            self.search = text.clone();
+                                            self.settings.note_search(text);
+                                            self.save_settings();
+                                            self.change_list();
+                                        }
                                     }
-                                }
-                            });
+                                });
+                        });
                     }
                 }
 
