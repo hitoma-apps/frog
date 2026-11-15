@@ -416,7 +416,12 @@ impl Worker {
         match self.with_source(|_, src| src.idle_poll(IDLE_POLL)) {
             Ok(notices) => self.sync_from(&notices),
             Err(SourceError::Disconnected(_)) => {
-                self.reconnect();
+                // Deletions made while the connection was down weren't reported, so the
+                // next check reconciles the UIDs.
+                if self.reconnect() {
+                    self.state.reconcile = true;
+                    self.dispatch(Command::CheckNew);
+                }
             }
             Err(e) => {
                 // IDLE didn't work here. Fall back to periodic checks.
@@ -2120,6 +2125,8 @@ mod sync_tests {
     struct Pushing {
         inner: MockSource,
         script: Arc<Mutex<VecDeque<Vec<IdleNotice>>>>,
+        /// When set, the next IDLE wait fails as if the network had dropped.
+        drop_next: Arc<Mutex<bool>>,
     }
 
     impl MailSource for Pushing {
@@ -2159,6 +2166,9 @@ mod sync_tests {
             true
         }
         fn idle_poll(&mut self, wait: Duration) -> Result<Vec<IdleNotice>, SourceError> {
+            if std::mem::take(&mut *self.drop_next.lock().unwrap()) {
+                return Err(SourceError::Disconnected("connection dropped".into()));
+            }
             let next = self.script.lock().unwrap().pop_front();
             match next {
                 Some(notices) => Ok(notices),
@@ -2209,6 +2219,7 @@ mod sync_tests {
         let pushing = Pushing {
             inner: source.clone(),
             script,
+            drop_next: Arc::new(Mutex::new(false)),
         };
         let mut slot = Some(pushing);
         let link = spawn(
@@ -2301,6 +2312,7 @@ mod sync_tests {
         let pushing = Pushing {
             inner: source.clone(),
             script: Arc::new(Mutex::new(VecDeque::new())),
+            drop_next: Arc::new(Mutex::new(false)),
         };
         let mut slot = Some(pushing);
         let link = spawn(
@@ -2364,6 +2376,67 @@ mod sync_tests {
                 _ => {}
             }
         }
+    }
+
+    /// Like `loaded`, but every connection is allowed, so the worker can reconnect.
+    fn loaded_reconnectable(
+        source: &MockSource,
+        script: Arc<Mutex<VecDeque<Vec<IdleNotice>>>>,
+        drop_next: Arc<Mutex<bool>>,
+    ) -> Link {
+        let inner = source.clone();
+        let link = spawn(
+            egui::Context::default(),
+            Box::new(move || {
+                Ok(Box::new(Pushing {
+                    inner: inner.clone(),
+                    script: script.clone(),
+                    drop_next: drop_next.clone(),
+                }) as Box<dyn MailSource>)
+            }),
+            KEEPALIVE,
+            Duration::from_millis(1),
+            Some(Store::open_in_memory(DEFAULT_BODY_CAP).unwrap()),
+            Vec::new(),
+        );
+        link.commands.send(Command::Load { limit: 500 }).unwrap();
+        loop {
+            if matches!(next(&link), Event::LoadFinished) {
+                break;
+            }
+        }
+        link
+    }
+
+    #[test]
+    fn deletions_made_while_disconnected_are_removed_after_reconnecting() {
+        let source = MockSource::demo();
+        let handle = source.handle();
+        let script = Arc::new(Mutex::new(VecDeque::new()));
+        let drop_next = Arc::new(Mutex::new(false));
+        let link = loaded_reconnectable(&source, script, drop_next.clone());
+        handle.expunge(3);
+        *drop_next.lock().unwrap() = true;
+        for _ in 0..1000 {
+            match next(&link) {
+                Event::Removed(uids) => {
+                    assert_eq!(uids, vec![3]);
+                    return;
+                }
+                Event::Reconnecting
+                | Event::Reconnected
+                | Event::Body { .. }
+                | Event::Progress { .. }
+                | Event::LabelList(_)
+                | Event::LabelCounts { .. }
+                | Event::CheckFinished
+                | Event::IdleState(_)
+                | Event::Labels { .. } => {}
+                Event::Error(e) => panic!("error event: {e}"),
+                other => panic!("unexpected event: {}", name(&other)),
+            }
+        }
+        panic!("the deleted message was never removed");
     }
 
     #[test]
