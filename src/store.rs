@@ -620,11 +620,8 @@ fn set_aside(path: &Path) -> Result<()> {
 /// The thread of a stored message, by its `X-GM-MSGID`.
 fn thread_of(conn: &Connection, msgid: i64) -> Result<Option<u64>> {
     let thrid: Option<i64> = conn
-        .query_row(
-            "SELECT thrid FROM messages WHERE msgid = ?1",
-            params![msgid],
-            |r| r.get(0),
-        )
+        .prepare_cached("SELECT thrid FROM messages WHERE msgid = ?1")?
+        .query_row(params![msgid], |r| r.get(0))
         .optional()?;
     Ok(thrid.map(|t| t as u64))
 }
@@ -1299,7 +1296,7 @@ impl Store {
                 affected.insert(old);
             }
             affected.insert(m.thrid);
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO messages (msgid, thrid, uid, from_addr, subject, date, headers, seen, sent, from_email, attachment, received)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                  ON CONFLICT(msgid) DO UPDATE SET
@@ -1310,30 +1307,27 @@ impl Store {
                      from_email = excluded.from_email,
                      attachment = COALESCE(excluded.attachment, messages.attachment),
                      received = COALESCE(excluded.received, messages.received)",
-                params![
-                    msgid,
-                    to_i64(m.thrid)?,
-                    m.uid,
-                    m.from,
-                    m.subject,
-                    m.date,
-                    m.headers,
-                    m.seen,
-                    m.sent,
-                    m.from_email,
-                    m.attachment,
-                    m.received
-                ],
-            )?;
-            tx.execute(
-                "DELETE FROM message_labels WHERE msgid = ?1",
-                params![msgid],
-            )?;
+            )?
+            .execute(params![
+                msgid,
+                to_i64(m.thrid)?,
+                m.uid,
+                m.from,
+                m.subject,
+                m.date,
+                m.headers,
+                m.seen,
+                m.sent,
+                m.from_email,
+                m.attachment,
+                m.received
+            ])?;
+            tx.prepare_cached("DELETE FROM message_labels WHERE msgid = ?1")?
+                .execute(params![msgid])?;
+            let mut insert_label =
+                tx.prepare_cached("INSERT INTO message_labels (msgid, label) VALUES (?1, ?2)")?;
             for label in &m.labels {
-                tx.execute(
-                    "INSERT INTO message_labels (msgid, label) VALUES (?1, ?2)",
-                    params![msgid, label],
-                )?;
+                insert_label.execute(params![msgid, label])?;
             }
         }
         refresh_threads(&tx, &affected)?;
@@ -2417,6 +2411,52 @@ mod tests {
         drop(reader);
         drop(writer);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Times the newer queries on a large cache, and the one-time index rebuild a cache from
+    /// before schema v15 runs on first start. Run with
+    /// `cargo test --release -- --ignored --nocapture query_timing`.
+    #[test]
+    #[ignore = "timing check; run in release mode"]
+    fn query_timing() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        let mut all: Vec<CachedMessage> = (1..=200_000u64)
+            .map(|i| msg(i, i as u32, &["Work"]))
+            .collect();
+        for (i, m) in all.iter_mut().enumerate() {
+            m.from_email = format!("sender{}@example.com", i % 500);
+        }
+        let t = std::time::Instant::now();
+        for chunk in all.chunks(5_000) {
+            s.upsert_messages(chunk).unwrap();
+        }
+        println!("load 200k messages: {:?}", t.elapsed());
+        let time = |label: &str, f: &mut dyn FnMut()| {
+            let t = std::time::Instant::now();
+            f();
+            println!("{label}: {:?}", t.elapsed());
+        };
+        time("frequent_senders(500)", &mut || {
+            s.frequent_senders(500).unwrap();
+        });
+        time("waiting_for_reply", &mut || {
+            s.waiting_for_reply("me@example.com", 500).unwrap();
+        });
+        time("storage_view(500)", &mut || {
+            s.storage_view(500).unwrap();
+        });
+        let query = crate::search::parse("from:sender7 subject:hello").query;
+        time("search from:sender7 subject:hello", &mut || {
+            s.search_messages(&query, 500).unwrap();
+        });
+        time("threads count (All)", &mut || {
+            s.thread_count(&ThreadFilter::All).unwrap();
+        });
+        time("v15 FTS rebuild", &mut || {
+            let tx = s.conn.transaction().unwrap();
+            upgrade_fts_sender_address(&tx).unwrap();
+            tx.commit().unwrap();
+        });
     }
 
     /// Times pages of the thread list near the start and the end of a large cache. Run with

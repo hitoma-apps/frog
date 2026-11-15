@@ -69,3 +69,45 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod timing {
+    use super::*;
+
+    /// Times the per-frame helpers the reader and search call. Run with
+    /// `cargo test --release -- --ignored --nocapture frame_helper_timing`.
+    #[test]
+    #[ignore = "timing check; run in release mode"]
+    fn frame_helper_timing() {
+        let headers = format!(
+            "Received: from mx.example.net (mx.example.net [192.0.2.1])\r\n\
+             Authentication-Results: mx.google.com; spf=pass smtp.mailfrom=news@example.com\r\n\
+             DKIM-Signature: v=1; a=rsa-sha256; d=example.com; s=k1; h=from:to:subject:date;\r\n\
+             {}\r\nFrom: Example News <news@example.com>\r\nTo: me@example.com\r\n\
+             Subject: Weekly digest\r\nDate: Tue, 10 Nov 2026 09:30:00 +0000\r\n\
+             List-Unsubscribe: <mailto:unsub@example.com>\r\nX-Priority: 3\r\n\r\n",
+            "x".repeat(1500)
+        );
+        let n = 2_000;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(sender_warnings("Example News", "news@example.com"));
+        }
+        println!("sender_warnings: {:?} per call", t.elapsed() / n);
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(crate::importance::sender_importance(headers.as_bytes()));
+        }
+        println!(
+            "sender_importance (1.7 KB header block): {:?} per call",
+            t.elapsed() / n
+        );
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(crate::search::parse(
+                "from:alice label:\"Work stuff\" invoice",
+            ));
+        }
+        println!("search::parse: {:?} per call", t.elapsed() / n);
+    }
+}
