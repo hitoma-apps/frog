@@ -25,6 +25,7 @@ use eframe::egui;
 use gmail_imap_proto::auth::AuthCheck;
 use gmail_imap_proto::export;
 use gmail_imap_proto::impersonation;
+use gmail_imap_proto::importance;
 use gmail_imap_proto::labels::{LabelAction, SystemLabel};
 use gmail_imap_proto::linkcheck::{self, LinkInfo};
 use gmail_imap_proto::links::gmail_thread_url;
@@ -252,6 +253,8 @@ const ROW_GAP: f32 = 4.0;
 const CHECK_WIDTH: f32 = 24.0;
 /// Width of the star column, between the checkbox and the title.
 const STAR_WIDTH: f32 = 16.0;
+/// Width of the importance column, after the star.
+const IMPORTANCE_WIDTH: f32 = 16.0;
 
 /// The width a chip needs: its text, cut to `CHIP_TEXT_MAX`, plus padding.
 fn chip_width(ui: &egui::Ui, text: &str, font: &egui::FontId) -> f32 {
@@ -286,6 +289,24 @@ fn fit_text(ui: &egui::Ui, text: &str, font: &egui::FontId, max_w: f32) -> Strin
 }
 
 /// Paints a paperclip-like mark into `rect`: a tall rounded loop.
+/// Gmail's importance marker: a gold tag pointing right, in the middle of `rect`.
+fn paint_importance_marker(ui: &egui::Ui, rect: egui::Rect) {
+    let tag = egui::Rect::from_center_size(rect.center(), egui::vec2(11.0, 9.0));
+    let point = 4.0;
+    let points = vec![
+        tag.left_top(),
+        egui::pos2(tag.right() - point, tag.top()),
+        egui::pos2(tag.right(), tag.center().y),
+        egui::pos2(tag.right() - point, tag.bottom()),
+        tag.left_bottom(),
+    ];
+    ui.painter().add(egui::Shape::convex_polygon(
+        points,
+        egui::Color32::from_rgb(245, 180, 0),
+        egui::Stroke::NONE,
+    ));
+}
+
 /// A star outline in the middle of `rect`, in gold.
 fn paint_star(ui: &egui::Ui, rect: egui::Rect) {
     let center = rect.center();
@@ -2165,6 +2186,16 @@ impl App {
                                                 }
                                             });
                                             auth_line(ui, &m.auth);
+                                            if let Some(sent) = importance::sender_importance(&m.headers) {
+                                                let level = match sent.level {
+                                                    importance::Level::High => "high",
+                                                    importance::Level::Low => "low",
+                                                };
+                                                ui.weak(format!(
+                                                    "The sender marked this message as {level} importance ({}).",
+                                                    sent.header
+                                                ));
+                                            }
                                             for warning in &warnings {
                                                 ui.colored_label(
                                                     egui::Color32::LIGHT_RED,
@@ -2536,6 +2567,14 @@ fn draw_thread_row(ui: &mut egui::Ui, view: &RowView, checked: bool) -> RowActio
         if m.labels.contains(SystemLabel::Starred.as_wire()) {
             paint_star(ui, star_rect);
         }
+        // The importance column: Gmail's marker for a message it thinks is important.
+        let (marker_rect, _) = ui.allocate_exact_size(
+            egui::vec2(IMPORTANCE_WIDTH, row_height),
+            egui::Sense::hover(),
+        );
+        if m.labels.contains(SystemLabel::Important.as_wire()) {
+            paint_importance_marker(ui, marker_rect);
+        }
         let title_text = row_title(m, view.count, view.unread);
         let chips = row_chips(m, view.filter_label);
         let (shown, hidden) = chips.split_at(chips.len().min(MAX_CHIPS));
@@ -2556,10 +2595,11 @@ fn draw_thread_row(ui: &mut egui::Ui, view: &RowView, checked: bool) -> RowActio
         // Gaps: subject to first chip, between chips, last chip to date.
         // Items in order: checkbox, subject, attachment, chips, date. That's
         // one gap between each pair.
-        let gaps = (tags.len() as f32 + 4.0) * ROW_GAP;
+        let gaps = (tags.len() as f32 + 5.0) * ROW_GAP;
         let title_w = (pane_w
             - CHECK_WIDTH
             - STAR_WIDTH
+            - IMPORTANCE_WIDTH
             - DATE_WIDTH
             - ATTACH_WIDTH
             - widths.iter().sum::<f32>()
