@@ -1098,7 +1098,7 @@ impl App {
     /// The storage view. Each row shows a message's size and opens its thread.
     fn storage_list(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.heading("Largest messages");
+            ui.heading("Storage Helper");
             if ui.button("Refresh").clicked() {
                 self.storage_asked = Instant::now();
                 self.send(Command::Largest {
@@ -1500,7 +1500,8 @@ impl App {
     ) {
         let is_fav = key.is_some_and(|k| self.settings.favorite_labels.iter().any(|f| f == k));
         // While a search is typed, the search is the view, so no label is shown as selected.
-        let selected = self.search.trim().is_empty() && self.filter.as_deref() == key;
+        let selected =
+            self.search.trim().is_empty() && !self.storage_open && self.filter.as_deref() == key;
         let mut toggle = false;
         ui.horizontal(|ui| {
             // Truncate to the space the sidebar has, so a long name can't stop it shrinking.
@@ -1647,7 +1648,11 @@ impl App {
                     };
                     self.label_row(ui, key, name, count);
                 }
-                if ui.selectable_label(self.storage_open, "Storage").clicked() {
+                ui.separator();
+                ui.heading("Tools");
+                // A tool is a view, like a mailbox: it's highlighted while it's the one shown.
+                let helper_open = self.storage_open && self.search.trim().is_empty();
+                if ui.selectable_label(helper_open, "Storage Helper").clicked() {
                     self.open_storage();
                 }
 
