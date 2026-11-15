@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use gmail_imap_proto::auth::AuthCheck;
 use gmail_imap_proto::export;
+use gmail_imap_proto::impersonation;
 use gmail_imap_proto::labels::{LabelAction, SystemLabel};
 use gmail_imap_proto::linkcheck::{self, LinkInfo};
 use gmail_imap_proto::links::gmail_thread_url;
@@ -2044,6 +2045,12 @@ impl App {
                             format_time(m.when())
                         )
                     };
+                    let warnings = impersonation::sender_warnings(&m.from, &m.from_email);
+                    let title = if warnings.is_empty() {
+                        title
+                    } else {
+                        format!("{title}   [possible impersonation]")
+                    };
                     // The accent colours each message's header line and its bar. Bodies keep the
                     // normal text colour, so header and body read as separate.
                     let accent = ui.visuals().hyperlink_color;
@@ -2071,6 +2078,12 @@ impl App {
                                                 }
                                             });
                                             auth_line(ui, &m.auth);
+                                            for warning in &warnings {
+                                                ui.colored_label(
+                                                    egui::Color32::LIGHT_RED,
+                                                    format!("Possible impersonation: {warning}"),
+                                                );
+                                            }
                                             match self.rendered.get(&uid) {
                                                 Some(blocks) => {
                                                     for (i, block) in blocks.iter().enumerate() {

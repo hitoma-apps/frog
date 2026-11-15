@@ -4,6 +4,7 @@
 pub mod auth;
 pub mod export;
 pub mod imap;
+pub mod impersonation;
 pub mod labels;
 pub mod linkcheck;
 pub mod links;
