@@ -170,10 +170,13 @@ const ATTACH_WIDTH: f32 = 16.0;
 fn row_chips(m: &Message, filter: Option<&str>) -> Vec<String> {
     let mailbox_view = filter.is_none_or(|f| f.starts_with('\\'));
     let inbox = SystemLabel::Inbox.as_wire();
+    // The star column shows \Starred, so it isn't also a chip.
+    let starred = SystemLabel::Starred.as_wire();
     let mut labels: Vec<&String> = m
         .labels
         .iter()
         .filter(|l| Some(l.as_str()) != filter)
+        .filter(|l| l.as_str() != starred)
         .filter(|l| !(mailbox_view && l.as_str() == inbox))
         .collect();
     labels.sort_by_key(|l| (!l.starts_with('\\'), l.to_lowercase()));
@@ -247,6 +250,8 @@ const ARROW_GUTTER: f32 = 14.0;
 const ROW_GAP: f32 = 4.0;
 /// Width of the checkbox column, on the far left of every row.
 const CHECK_WIDTH: f32 = 24.0;
+/// Width of the star column, between the checkbox and the title.
+const STAR_WIDTH: f32 = 16.0;
 
 /// The width a chip needs: its text, cut to `CHIP_TEXT_MAX`, plus padding.
 fn chip_width(ui: &egui::Ui, text: &str, font: &egui::FontId) -> f32 {
@@ -281,6 +286,24 @@ fn fit_text(ui: &egui::Ui, text: &str, font: &egui::FontId, max_w: f32) -> Strin
 }
 
 /// Paints a paperclip-like mark into `rect`: a tall rounded loop.
+/// A star outline in the middle of `rect`, in gold.
+fn paint_star(ui: &egui::Ui, rect: egui::Rect) {
+    let center = rect.center();
+    let outer = rect.height() * 0.42;
+    let inner = outer * 0.45;
+    let points: Vec<egui::Pos2> = (0..10)
+        .map(|i| {
+            let radius = if i % 2 == 0 { outer } else { inner };
+            let angle = std::f32::consts::PI / 5.0 * i as f32 - std::f32::consts::FRAC_PI_2;
+            center + egui::vec2(angle.cos(), angle.sin()) * radius
+        })
+        .collect();
+    ui.painter().add(egui::Shape::closed_line(
+        points,
+        egui::Stroke::new(1.4, egui::Color32::from_rgb(230, 180, 40)),
+    ));
+}
+
 fn paint_paperclip(ui: &egui::Ui, rect: egui::Rect) {
     let color = ui.visuals().text_color();
     let clip = egui::Rect::from_center_size(rect.center(), egui::vec2(7.0, 12.0));
@@ -2507,6 +2530,12 @@ fn draw_thread_row(ui: &mut egui::Ui, view: &RowView, checked: bool) -> RowActio
         }
         // Every item has a fixed width, so the row can't grow frame to frame.
         // The date is the fixed column on the right. The subject takes the rest.
+        // The star column: an outline for a starred thread, empty otherwise.
+        let (star_rect, _) =
+            ui.allocate_exact_size(egui::vec2(STAR_WIDTH, row_height), egui::Sense::hover());
+        if m.labels.contains(SystemLabel::Starred.as_wire()) {
+            paint_star(ui, star_rect);
+        }
         let title_text = row_title(m, view.count, view.unread);
         let chips = row_chips(m, view.filter_label);
         let (shown, hidden) = chips.split_at(chips.len().min(MAX_CHIPS));
@@ -2527,10 +2556,15 @@ fn draw_thread_row(ui: &mut egui::Ui, view: &RowView, checked: bool) -> RowActio
         // Gaps: subject to first chip, between chips, last chip to date.
         // Items in order: checkbox, subject, attachment, chips, date. That's
         // one gap between each pair.
-        let gaps = (tags.len() as f32 + 3.0) * ROW_GAP;
-        let title_w =
-            (pane_w - CHECK_WIDTH - DATE_WIDTH - ATTACH_WIDTH - widths.iter().sum::<f32>() - gaps)
-                .max(40.0);
+        let gaps = (tags.len() as f32 + 4.0) * ROW_GAP;
+        let title_w = (pane_w
+            - CHECK_WIDTH
+            - STAR_WIDTH
+            - DATE_WIDTH
+            - ATTACH_WIDTH
+            - widths.iter().sum::<f32>()
+            - gaps)
+            .max(40.0);
 
         let title = egui::Frame::new()
             .fill(egui::Color32::TRANSPARENT)
@@ -2812,7 +2846,8 @@ mod tests {
     #[test]
     fn chips_leave_out_the_current_label() {
         let m = message_with(&["Work", "\\Starred", "Home"]);
-        assert_eq!(row_chips(&m, Some("Work")), vec!["\\Starred", "Home"]);
+        // \Starred is shown by the star column, not as a chip.
+        assert_eq!(row_chips(&m, Some("Work")), vec!["Home"]);
     }
 
     #[test]
