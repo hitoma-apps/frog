@@ -2037,7 +2037,6 @@ impl App {
                 if save.clicked() && self.settings.save_search(&text) {
                     self.save_settings();
                 }
-                ui.separator();
 
                 let active = self.search.trim().to_string();
                 let recent = self.settings.recent_searches.clone();
@@ -2083,6 +2082,8 @@ impl App {
                         });
                     }
                 }
+                // The divider comes after the search section, above the favourites and mailboxes.
+                ui.separator();
 
                 let favorites = self.settings.favorite_labels.clone();
                 if !favorites.is_empty() {
