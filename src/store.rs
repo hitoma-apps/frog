@@ -26,7 +26,7 @@ pub const DEFAULT_BODY_CAP: u64 = 1 << 30;
 /// zstd level. Mail is text, so a low level compresses well and stays fast.
 const ZSTD_LEVEL: i32 = 3;
 
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -275,6 +275,19 @@ pub struct LargeMessage {
     pub attachment: bool,
 }
 
+/// A sender's place in the sender statistics: how many cached messages they sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SenderStat {
+    /// The sender's address, lower-cased.
+    pub address: String,
+    /// A display form of the sender, as one of their messages shows it.
+    pub display: String,
+    pub messages: usize,
+    pub unread: usize,
+    /// The newest message's received time, or sent time where that's unknown.
+    pub latest: i64,
+}
+
 /// The storage view: the largest cached messages, and how many messages have a known size.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StorageView {
@@ -417,6 +430,37 @@ fn upgrade_label_names(tx: &Transaction) -> Result<()> {
         tx.execute("DELETE FROM message_labels WHERE label = ?1", params![raw])?;
     }
     rebuild_derived(tx)
+}
+
+/// The search index covered only `from_addr`, which holds the sender's display name when there is
+/// one. It now covers the sender's address too, so `from:` finds mail by either.
+fn upgrade_fts_sender_address(tx: &Transaction) -> Result<()> {
+    tx.execute_batch(
+        "DROP TRIGGER IF EXISTS messages_fts_added;
+         DROP TRIGGER IF EXISTS messages_fts_removed;
+         DROP TRIGGER IF EXISTS messages_fts_changed;
+         DROP TABLE IF EXISTS messages_fts;
+         CREATE VIRTUAL TABLE messages_fts USING fts5(
+             from_addr, from_email, subject, content='messages', content_rowid='msgid'
+         );
+         CREATE TRIGGER messages_fts_added AFTER INSERT ON messages BEGIN
+             INSERT INTO messages_fts (rowid, from_addr, from_email, subject)
+                 VALUES (NEW.msgid, NEW.from_addr, NEW.from_email, NEW.subject);
+         END;
+         CREATE TRIGGER messages_fts_removed AFTER DELETE ON messages BEGIN
+             INSERT INTO messages_fts (messages_fts, rowid, from_addr, from_email, subject)
+                 VALUES ('delete', OLD.msgid, OLD.from_addr, OLD.from_email, OLD.subject);
+         END;
+         CREATE TRIGGER messages_fts_changed AFTER UPDATE OF from_addr, from_email, subject ON messages
+         BEGIN
+             INSERT INTO messages_fts (messages_fts, rowid, from_addr, from_email, subject)
+                 VALUES ('delete', OLD.msgid, OLD.from_addr, OLD.from_email, OLD.subject);
+             INSERT INTO messages_fts (rowid, from_addr, from_email, subject)
+                 VALUES (NEW.msgid, NEW.from_addr, NEW.from_email, NEW.subject);
+         END;
+         INSERT INTO messages_fts (messages_fts) VALUES ('rebuild');",
+    )?;
+    Ok(())
 }
 
 fn upgrade_size(tx: &Transaction) -> Result<()> {
@@ -1200,6 +1244,9 @@ impl Store {
             // Message sizes, for the storage view. They don't affect thread summaries.
             upgrade_size(&tx)?;
         }
+        if version < 15 {
+            upgrade_fts_sender_address(&tx)?;
+        }
         if version < 14 {
             upgrade_label_names(&tx)?;
         }
@@ -1772,7 +1819,9 @@ impl Store {
             sql.push_str(
                 " AND m.msgid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)",
             );
-            args.push(Value::Text(format!("from_addr : \"{word}\"*")));
+            args.push(Value::Text(format!(
+                "{{from_addr from_email}} : \"{word}\"*"
+            )));
         }
         for word in &query.subject {
             sql.push_str(
@@ -1826,6 +1875,31 @@ impl Store {
         };
         self.attach_labels(&mut hits)?;
         Ok(hits)
+    }
+
+    /// The senders with the most cached messages, most first, at most `limit` of them.
+    pub fn frequent_senders(&self, limit: usize) -> Result<Vec<SenderStat>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT from_email, COUNT(*), SUM(seen = 0), MAX(COALESCE(received, sent)),
+                    MAX(from_addr)
+             FROM messages
+             WHERE uid IS NOT NULL AND from_email != ''
+             GROUP BY from_email
+             ORDER BY COUNT(*) DESC, from_email
+             LIMIT ?1",
+        )?;
+        let senders = stmt
+            .query_map(params![limit as i64], |r| {
+                Ok(SenderStat {
+                    address: r.get(0)?,
+                    messages: r.get::<_, i64>(1)? as usize,
+                    unread: r.get::<_, i64>(2)? as usize,
+                    latest: r.get(3)?,
+                    display: r.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(senders)
     }
 
     /// The largest cached messages, biggest first, at most `limit` of them.
@@ -2184,6 +2258,38 @@ mod tests {
         };
         assert_eq!(uids("after:2026-11-01"), vec![1]);
         assert_eq!(uids("before:2026-11-01"), vec![2]);
+    }
+
+    #[test]
+    fn from_finds_mail_by_display_name_or_address() {
+        use crate::search::parse;
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        let mut m = msg(1, 1, &["Work"]);
+        m.from = "Bob Smith".into();
+        m.from_email = "bob@example.com".into();
+        s.upsert_messages(&[m]).unwrap();
+        let found = |text: &str| s.search_messages(&parse(text).query, 10).unwrap().len();
+        assert_eq!(found("from:bob@example.com"), 1);
+        assert_eq!(found("from:smith"), 1);
+        assert_eq!(found("from:carol"), 0);
+    }
+
+    #[test]
+    fn frequent_senders_count_messages_per_address() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        let mut messages: Vec<CachedMessage> =
+            (1..=4u64).map(|i| msg(i, i as u32, &["Work"])).collect();
+        for m in messages.iter_mut().take(3) {
+            m.from_email = "bob@example.com".into();
+        }
+        s.upsert_messages(&messages).unwrap();
+        s.set_seen(1, true).unwrap();
+        let senders = s.frequent_senders(10).unwrap();
+        assert_eq!(senders[0].address, "bob@example.com");
+        assert_eq!(senders[0].messages, 3);
+        assert_eq!(senders[0].unread, 2);
+        assert_eq!(senders[1].messages, 1);
+        assert_eq!(s.frequent_senders(1).unwrap().len(), 1);
     }
 
     #[test]
