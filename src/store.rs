@@ -10,7 +10,7 @@
 //! There's one file per account, and each file holds one mailbox (All Mail).
 //! Plaintext for now. Encryption at rest is planned.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -64,7 +64,10 @@ impl From<std::io::Error> for StoreError {
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// A thread's list row, as the query returns it: thread, count, unread, attachment, head.
-type ThreadListRow = (u64, usize, usize, bool, CachedMessage);
+/// A thread's position in the list: its newest time, then its thread id.
+pub type ThreadKey = (i64, u64);
+
+type ThreadListRow = (ThreadKey, ThreadMeta, CachedMessage);
 /// A thread's counts and attachment flag, without its head message.
 type ThreadMeta = (u64, usize, usize, bool);
 
@@ -250,6 +253,52 @@ pub struct StorageView {
     pub sized: usize,
     /// Cached messages with a UID, whether or not their size is known.
     pub total: usize,
+}
+
+/// Remembers the sort keys of thread rows recently read, so a page near them can seek to its
+/// start instead of counting rows from the top. A change to the cache by another connection
+/// drops them, since row positions may have moved.
+#[derive(Default)]
+pub struct PageCursor {
+    filter: Option<ThreadFilter>,
+    version: i64,
+    /// Row index → sort key of that row.
+    anchors: BTreeMap<usize, ThreadKey>,
+}
+
+/// Most remembered rows. Past this, the memory is cleared and rebuilt as pages are read.
+const MAX_ANCHORS: usize = 4_096;
+
+impl PageCursor {
+    /// The page of `count` threads from row `start`, as `Store::thread_page` returns it.
+    pub fn page(
+        &mut self,
+        store: &Store,
+        filter: &ThreadFilter,
+        start: usize,
+        count: usize,
+    ) -> Result<Vec<ThreadSummary>> {
+        let version = store.data_version()?;
+        if self.filter.as_ref() != Some(filter) || self.version != version {
+            self.filter = Some(filter.clone());
+            self.version = version;
+            self.anchors.clear();
+        }
+        // Count forward from the nearest remembered row above `start`, if there is one.
+        let (after, skip) = match self.anchors.range(..start).next_back() {
+            Some((&index, &key)) => (Some(key), start - index - 1),
+            None => (None, start),
+        };
+        let rows = store.thread_page_after(filter, after, skip, count)?;
+        if self.anchors.len() + 2 > MAX_ANCHORS {
+            self.anchors.clear();
+        }
+        if let (Some((first, _)), Some((last, _))) = (rows.first(), rows.last()) {
+            self.anchors.insert(start, *first);
+            self.anchors.insert(start + rows.len() - 1, *last);
+        }
+        Ok(rows.into_iter().map(|(_, summary)| summary).collect())
+    }
 }
 
 /// The sent time (Unix seconds) from a header block's Date line, or 0 if there isn't one.
@@ -630,6 +679,14 @@ impl Store {
             back_up(&conn, path)?;
         }
         Self::init(conn, DEFAULT_BODY_CAP)
+    }
+
+    /// How many times other connections have changed the cache. A reader compares it between
+    /// reads, to tell when positions it remembered may be stale.
+    pub fn data_version(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("PRAGMA data_version", [], |r| r.get(0))?)
     }
 
     /// Opens a second, read-only connection to a cache the writer has already opened. In WAL
@@ -1296,65 +1353,90 @@ impl Store {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<ThreadSummary>> {
+        Ok(self
+            .thread_page_after(filter, None, offset, limit)?
+            .into_iter()
+            .map(|(_, summary)| summary)
+            .collect())
+    }
+
+    /// A page of the thread list, with each thread's sort key. With `after`, the page starts
+    /// from the first thread below that key, and `skip` counts rows from there. Without it,
+    /// `skip` counts from the top.
+    pub fn thread_page_after(
+        &self,
+        filter: &ThreadFilter,
+        after: Option<ThreadKey>,
+        skip: usize,
+        limit: usize,
+    ) -> Result<Vec<(ThreadKey, ThreadSummary)>> {
+        use rusqlite::types::Value;
         const COLUMNS: &str = "t.thrid, t.count, t.unread, m.msgid, m.thrid, m.uid,
                                m.from_addr, m.subject, m.date, m.seen, m.sent, m.from_email,
-                               t.attachments, m.received";
-        let (limit, offset) = (limit as i64, offset as i64);
-        let rows: Vec<ThreadListRow> = match filter {
-            ThreadFilter::All => {
-                let sql = format!(
-                    "SELECT {COLUMNS} FROM threads t
-                     JOIN messages m ON m.msgid = t.head_msgid
-                     ORDER BY t.newest_time DESC, t.thrid DESC LIMIT ?1 OFFSET ?2"
-                );
-                self.thread_rows(&sql, params![limit, offset])?
-            }
+                               t.attachments, m.received, t.newest_time";
+        let mut with = String::new();
+        let mut from = "FROM threads t";
+        let mut conditions = String::new();
+        let mut args: Vec<Value> = Vec::new();
+        match filter {
+            ThreadFilter::All => {}
             ThreadFilter::Label(label) => {
-                // Walk the threads newest first, and stop once a window is full. A
-                // label that most threads carry fills its window at once.
-                let sql = format!(
-                    "SELECT {COLUMNS} FROM threads t
-                     JOIN messages m ON m.msgid = t.head_msgid
-                     WHERE EXISTS (SELECT 1 FROM thread_labels tl
-                                   WHERE tl.label = ?1 AND tl.thrid = t.thrid)
-                     ORDER BY t.newest_time DESC, t.thrid DESC LIMIT ?2 OFFSET ?3"
+                conditions.push_str(
+                    " AND EXISTS (SELECT 1 FROM thread_labels tl
+                                  WHERE tl.label = ? AND tl.thrid = t.thrid)",
                 );
-                self.thread_rows(&sql, params![label, limit, offset])?
+                args.push(Value::Text(label.clone()));
             }
-            ThreadFilter::Search(text) => match fts_query(text) {
-                None => Vec::new(),
-                Some(query) => {
-                    let sql = format!(
-                        "WITH hits AS (
-                             SELECT DISTINCT m.thrid FROM messages_fts
-                             JOIN messages m ON m.msgid = messages_fts.rowid
-                             WHERE messages_fts MATCH ?1 AND m.uid IS NOT NULL)
-                         SELECT {COLUMNS} FROM hits h
-                         JOIN threads t ON t.thrid = h.thrid
-                         JOIN messages m ON m.msgid = t.head_msgid
-                         ORDER BY t.newest_time DESC, t.thrid DESC LIMIT ?2 OFFSET ?3"
-                    );
-                    self.thread_rows(&sql, params![query, limit, offset])?
-                }
-            },
-        };
-        let (meta, mut heads): (Vec<ThreadMeta>, Vec<CachedMessage>) = rows
-            .into_iter()
-            .map(|(t, c, u, a, m)| ((t, c, u, a), m))
-            .unzip();
+            ThreadFilter::Search(text) => {
+                let Some(query) = fts_query(text) else {
+                    return Ok(Vec::new());
+                };
+                with = "WITH hits AS (
+                            SELECT DISTINCT m.thrid FROM messages_fts
+                            JOIN messages m ON m.msgid = messages_fts.rowid
+                            WHERE messages_fts MATCH ? AND m.uid IS NOT NULL) "
+                    .to_string();
+                from = "FROM hits h JOIN threads t ON t.thrid = h.thrid";
+                args.push(Value::Text(query));
+            }
+        }
+        if let Some((newest, thrid)) = after {
+            conditions.push_str(" AND (t.newest_time, t.thrid) < (?, ?)");
+            args.push(Value::Integer(newest));
+            args.push(Value::Integer(thrid as i64));
+        }
+        let sql = format!(
+            "{with}SELECT {COLUMNS} {from}
+             JOIN messages m ON m.msgid = t.head_msgid
+             WHERE 1 = 1{conditions}
+             ORDER BY t.newest_time DESC, t.thrid DESC LIMIT ? OFFSET ?"
+        );
+        args.push(Value::Integer(limit as i64));
+        args.push(Value::Integer(skip as i64));
+        let rows = self.thread_rows(&sql, rusqlite::params_from_iter(args.iter()))?;
+        let (mut keys, mut meta, mut heads) = (Vec::new(), Vec::new(), Vec::new());
+        for (key, m, head) in rows {
+            keys.push(key);
+            meta.push(m);
+            heads.push(head);
+        }
         self.attach_labels(&mut heads)?;
-        Ok(meta
+        Ok(keys
             .into_iter()
+            .zip(meta)
             .zip(heads)
-            .map(
-                |((thrid, count, unread, attachments), head)| ThreadSummary {
-                    thrid,
-                    count,
-                    unread,
-                    attachments,
-                    head,
-                },
-            )
+            .map(|((key, (thrid, count, unread, attachments)), head)| {
+                (
+                    key,
+                    ThreadSummary {
+                        thrid,
+                        count,
+                        unread,
+                        attachments,
+                        head,
+                    },
+                )
+            })
             .collect())
     }
 
@@ -1379,10 +1461,13 @@ impl Store {
                     sent: r.get(10)?,
                 };
                 Ok((
-                    r.get::<_, i64>(0)? as u64,
-                    r.get::<_, i64>(1)? as usize,
-                    r.get::<_, i64>(2)? as usize,
-                    r.get::<_, i64>(12)? > 0,
+                    (r.get::<_, i64>(14)?, r.get::<_, i64>(0)? as u64),
+                    (
+                        r.get::<_, i64>(0)? as u64,
+                        r.get::<_, i64>(1)? as usize,
+                        r.get::<_, i64>(2)? as usize,
+                        r.get::<_, i64>(12)? > 0,
+                    ),
                     head,
                 ))
             })?
@@ -2004,6 +2089,50 @@ mod tests {
         assert_eq!(uids("before:2026-11-01"), vec![2]);
     }
 
+    #[test]
+    fn cursor_pages_match_offset_pages_even_after_the_cache_changes() {
+        let dir = std::env::temp_dir().join(format!("cursor-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cursor.sqlite");
+        let _ = std::fs::remove_file(&path);
+        // A writer and a reader on one file, as the app has them.
+        let mut writer = Store::open(&path).unwrap();
+        let messages: Vec<CachedMessage> =
+            (1..=300u64).map(|i| msg(i, i as u32, &["Work"])).collect();
+        writer.upsert_messages(&messages).unwrap();
+        let reader = Store::open_reader(&path).unwrap();
+        let mut cursor = PageCursor::default();
+        let starts = [0, 40, 80, 120, 7, 250, 260, 299, 150, 151, 0, 3, 200];
+        for filter in [ThreadFilter::All, ThreadFilter::Label("Work".into())] {
+            let check = |cursor: &mut PageCursor| {
+                for &start in &starts {
+                    let want: Vec<u64> = reader
+                        .thread_page(&filter, start, 10)
+                        .unwrap()
+                        .iter()
+                        .map(|t| t.thrid)
+                        .collect();
+                    let got: Vec<u64> = cursor
+                        .page(&reader, &filter, start, 10)
+                        .unwrap()
+                        .iter()
+                        .map(|t| t.thrid)
+                        .collect();
+                    assert_eq!(got, want, "start {start} for {filter:?}");
+                }
+            };
+            check(&mut cursor);
+            // Removing messages moves the rows below them, so remembered positions are stale.
+            writer.remove_uids(&[5, 6, 7, 100]).unwrap();
+            check(&mut cursor);
+            writer.upsert_messages(&[msg(301, 301, &["Work"])]).unwrap();
+            check(&mut cursor);
+        }
+        drop(reader);
+        drop(writer);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Times pages of the thread list near the start and the end of a large cache. Run with
     /// `cargo test --release -- --ignored --nocapture thread_page_timing`.
     #[test]
@@ -2016,10 +2145,27 @@ mod tests {
         for chunk in all.chunks(5_000) {
             s.upsert_messages(chunk).unwrap();
         }
-        for start in [0usize, 100_000, 190_000] {
+        // Scrolling down in order, as the list does, with the cursor.
+        let mut cursor = PageCursor::default();
+        let mut slowest = std::time::Duration::ZERO;
+        let mut total = std::time::Duration::ZERO;
+        for start in (0..200_000).step_by(40) {
+            let t = std::time::Instant::now();
+            cursor.page(&s, &ThreadFilter::All, start, 40).unwrap();
+            let took = t.elapsed();
+            total += took;
+            slowest = slowest.max(took);
+        }
+        println!("scrolling 5000 pages with the cursor: slowest {slowest:?}, total {total:?}");
+        // A jump with nothing remembered near it counts from the top.
+        for start in [100_000usize, 190_000] {
             let t = std::time::Instant::now();
             let page = s.thread_page(&ThreadFilter::All, start, 40).unwrap();
-            println!("start {start}: {} rows in {:?}", page.len(), t.elapsed());
+            println!(
+                "jump to {start} without the cursor: {} rows in {:?}",
+                page.len(),
+                t.elapsed()
+            );
         }
     }
 

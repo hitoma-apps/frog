@@ -16,7 +16,7 @@ use std::time::Duration;
 use eframe::egui;
 use gmail_imap_proto::labels::LabelAction;
 use gmail_imap_proto::store::{
-    DEFAULT_BODY_CAP, MailboxState, Store, ThreadFilter, account_cache_path,
+    DEFAULT_BODY_CAP, MailboxState, PageCursor, Store, ThreadFilter, account_cache_path,
 };
 use gmail_imap_proto::uidset::UidSet;
 
@@ -511,7 +511,7 @@ impl Worker {
         // Reads from the cache need no connection, so they never wait on a reconnect. They
         // come here only when there's no separate reader thread.
         if is_cache_read(&cmd) {
-            answer_read(self.store.as_ref(), &self.emit, &cmd);
+            answer_read(self.store.as_ref(), &self.emit, &cmd, None);
             return;
         }
         let mut retried = false;
@@ -1243,6 +1243,7 @@ fn read_window(
     filter: &ThreadFilter,
     start: usize,
     count: usize,
+    cursor: Option<&mut PageCursor>,
 ) {
     let Some(store) = store else {
         emit.send(Event::Window {
@@ -1254,9 +1255,11 @@ fn read_window(
         return;
     };
     let result = store.thread_count(filter).and_then(|total| {
-        store
-            .thread_page(filter, start, count)
-            .map(|page| (total, page))
+        let page = match cursor {
+            Some(cursor) => cursor.page(store, filter, start, count),
+            None => store.thread_page(filter, start, count),
+        };
+        page.map(|page| (total, page))
     });
     match result {
         Ok((total, page)) => {
@@ -1327,13 +1330,18 @@ fn read_thread_range(
 
 /// Answers a cache read: a window of the list, a conversation's messages, or the threads in a
 /// range. The reader thread answers these, or the worker when there's no separate reader.
-fn answer_read(store: Option<&Store>, emit: &Emitter, cmd: &Command) {
+fn answer_read(
+    store: Option<&Store>,
+    emit: &Emitter,
+    cmd: &Command,
+    cursor: Option<&mut PageCursor>,
+) {
     match cmd {
         Command::Window {
             filter,
             start,
             count,
-        } => read_window(store, emit, filter, *start, *count),
+        } => read_window(store, emit, filter, *start, *count, cursor),
         Command::Thread { thrid } => read_thread(store, emit, *thrid),
         Command::Largest { limit } => read_largest(store, emit, *limit),
         Command::Search { query, limit } => read_search(store, emit, query, *limit),
@@ -1395,8 +1403,10 @@ fn read_search(
 /// The reader thread: answers cache reads from its own connection, so they never wait for
 /// the worker's network calls, reconnects or IDLE.
 fn read_loop(store: Store, requests: Receiver<Command>, emit: Emitter) {
+    // The reader's own positions, so deep pages seek from a remembered row.
+    let mut cursor = PageCursor::default();
     for cmd in requests {
-        answer_read(Some(&store), &emit, &cmd);
+        answer_read(Some(&store), &emit, &cmd, Some(&mut cursor));
     }
 }
 
