@@ -45,6 +45,8 @@ const HELP_TEXT: &str = include_str!("help.txt");
 const STORAGE_ROWS: usize = 500;
 /// How many messages a search lists.
 const SEARCH_ROWS: usize = 500;
+/// How many senders the sender statistics list.
+const SENDER_ROWS: usize = 500;
 
 fn main() -> eframe::Result {
     let creds = match (
@@ -458,6 +460,10 @@ struct App {
     storage_open: bool,
     /// When the storage view last asked the cache, so it refreshes while sizes arrive.
     storage_asked: Instant,
+    /// Whether the sender statistics view is shown.
+    senders_open: bool,
+    /// The senders with the most cached messages, once the view has asked for them.
+    senders: Option<Arc<Vec<gmail_imap_proto::store::SenderStat>>>,
     /// Threads whose notifications were clicked, sent from the notification threads.
     click_tx: std::sync::mpsc::Sender<u64>,
     click_rx: std::sync::mpsc::Receiver<u64>,
@@ -593,6 +599,8 @@ impl App {
             storage: None,
             storage_open: false,
             storage_asked: Instant::now(),
+            senders_open: false,
+            senders: None,
             click_tx,
             click_rx,
             label_cache: None,
@@ -830,6 +838,7 @@ impl App {
                 }
             }
             Event::Largest(view) => self.storage = Some(Arc::new(view)),
+            Event::Senders(list) => self.senders = Some(Arc::new(list)),
             Event::Search { query, hits } => {
                 let rows: Vec<SearchRow> = hits
                     .into_iter()
@@ -909,6 +918,7 @@ impl App {
     /// mean something else in the next list, so the shift-click anchor goes too.
     fn change_list(&mut self) {
         self.storage_open = false;
+        self.senders_open = false;
         self.search_asked = None;
         self.window_filter = None;
         self.window_rows.clear();
@@ -1070,6 +1080,63 @@ impl App {
     }
 
     /// Opens the storage view: the largest cached messages, biggest first.
+    /// Opens the sender statistics: the senders with the most cached messages.
+    fn open_senders(&mut self) {
+        self.search.clear();
+        self.change_list();
+        self.senders_open = true;
+        self.send(Command::Senders { limit: SENDER_ROWS });
+    }
+
+    /// The sender statistics: one row per sender, most messages first. A row searches for that
+    /// sender's mail.
+    fn senders_list(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Sender Statistics");
+            if ui.button("Refresh").clicked() {
+                self.send(Command::Senders { limit: SENDER_ROWS });
+            }
+        });
+        let Some(senders) = self.senders.clone() else {
+            ui.weak("Counting…");
+            return;
+        };
+        ui.weak("Cached messages per sender. Click a sender to search their mail.");
+        ui.separator();
+        let row_height = ui.spacing().interact_size.y;
+        let mut search_for: Option<String> = None;
+        egui::ScrollArea::vertical()
+            .id_salt("senders")
+            .auto_shrink([false, false])
+            .show_rows(ui, row_height, senders.len(), |ui, range| {
+                for sender in &senders[range] {
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [64.0, row_height],
+                            egui::Label::new(format!("{}", sender.messages)),
+                        );
+                        ui.weak(format!("{} unread", sender.unread));
+                        ui.weak(format_time(sender.latest));
+                        let name = if sender.display.is_empty() || sender.display == sender.address
+                        {
+                            sender.address.clone()
+                        } else {
+                            format!("{} <{}>", sender.display, sender.address)
+                        };
+                        if ui.selectable_label(false, name).clicked() {
+                            search_for = Some(sender.address.clone());
+                        }
+                    });
+                }
+            });
+        if let Some(address) = search_for {
+            self.search = format!("from:{address}");
+            self.settings.note_search(&self.search);
+            self.save_settings();
+            self.change_list();
+        }
+    }
+
     fn open_storage(&mut self) {
         self.search.clear();
         self.change_list();
@@ -1500,8 +1567,10 @@ impl App {
     ) {
         let is_fav = key.is_some_and(|k| self.settings.favorite_labels.iter().any(|f| f == k));
         // While a search is typed, the search is the view, so no label is shown as selected.
-        let selected =
-            self.search.trim().is_empty() && !self.storage_open && self.filter.as_deref() == key;
+        let selected = self.search.trim().is_empty()
+            && !self.storage_open
+            && !self.senders_open
+            && self.filter.as_deref() == key;
         let mut toggle = false;
         ui.horizontal(|ui| {
             // Truncate to the space the sidebar has, so a long name can't stop it shrinking.
@@ -1654,6 +1723,13 @@ impl App {
                 let helper_open = self.storage_open && self.search.trim().is_empty();
                 if ui.selectable_label(helper_open, "Storage Helper").clicked() {
                     self.open_storage();
+                }
+                let stats_open = self.senders_open && self.search.trim().is_empty();
+                if ui
+                    .selectable_label(stats_open, "Sender Statistics")
+                    .clicked()
+                {
+                    self.open_senders();
                 }
 
                 let active = self.search.trim().to_string();
@@ -2782,6 +2858,8 @@ impl eframe::App for App {
                         self.search_list(ui);
                     } else if self.storage_open {
                         self.storage_list(ui);
+                    } else if self.senders_open {
+                        self.senders_list(ui);
                     } else {
                         self.message_list(ui);
                     }
