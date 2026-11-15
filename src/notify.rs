@@ -7,7 +7,10 @@ pub struct NewMail {
 }
 
 /// Shows one notification for a batch of new mail. Nothing is shown for an empty batch.
-pub fn new_mail(items: &[NewMail]) -> Result<(), String> {
+///
+/// `on_click` runs when the user clicks the notification. Waiting for that happens on a thread of
+/// its own, which ends when the notification goes away.
+pub fn new_mail(items: &[NewMail], on_click: impl FnOnce() + Send + 'static) -> Result<(), String> {
     let (summary, body) = match items {
         [] => return Ok(()),
         [one] => (
@@ -23,11 +26,19 @@ pub fn new_mail(items: &[NewMail]) -> Result<(), String> {
                 .join("\n"),
         ),
     };
-    notify_rust::Notification::new()
+    let handle = notify_rust::Notification::new()
         .appname("Gmail Labels Prototype")
         .summary(&summary)
         .body(&body)
+        .action("default", "Open")
         .show()
-        .map(drop)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    std::thread::spawn(move || {
+        handle.wait_for_action(|action| {
+            if action == "default" {
+                on_click();
+            }
+        });
+    });
+    Ok(())
 }

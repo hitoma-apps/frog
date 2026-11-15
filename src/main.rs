@@ -399,6 +399,9 @@ struct App {
     storage_open: bool,
     /// When the storage view last asked the cache, so it refreshes while sizes arrive.
     storage_asked: Instant,
+    /// Threads whose notifications were clicked, sent from the notification threads.
+    click_tx: std::sync::mpsc::Sender<u64>,
+    click_rx: std::sync::mpsc::Receiver<u64>,
     /// Whether the sign-in is the automatic one at startup, so the window can say so.
     auto_signin: bool,
     /// Whether the window layout has changed since it was last saved.
@@ -512,6 +515,7 @@ impl App {
                 login.password = password;
             }
         }
+        let (click_tx, click_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             ctx,
             settings,
@@ -523,6 +527,8 @@ impl App {
             storage: None,
             storage_open: false,
             storage_asked: Instant::now(),
+            click_tx,
+            click_rx,
             auto_signin: false,
             layout_dirty: false,
             layout_saved: Instant::now(),
@@ -667,15 +673,28 @@ impl App {
             }
             Event::NewArrivals(msgs) => {
                 if self.settings.notifications {
-                    let items: Vec<notify::NewMail> = msgs
+                    let new: Vec<&Message> = msgs
                         .iter()
                         .filter(|m| !m.seen && m.labels.contains(SystemLabel::Inbox.as_wire()))
+                        .collect();
+                    let items: Vec<notify::NewMail> = new
+                        .iter()
                         .map(|m| notify::NewMail {
                             from: m.from.clone(),
                             subject: m.subject.clone(),
                         })
                         .collect();
-                    if let Err(e) = notify::new_mail(&items) {
+                    // Clicking the notification opens the newest message in the batch.
+                    let newest = new.iter().max_by_key(|m| m.when()).map(|m| m.thrid);
+                    let tx = self.click_tx.clone();
+                    let ctx = self.ctx.clone();
+                    let on_click = move || {
+                        if let Some(thrid) = newest {
+                            let _ = tx.send(thrid);
+                        }
+                        ctx.request_repaint();
+                    };
+                    if let Err(e) = notify::new_mail(&items, on_click) {
                         eprintln!("Could not show a notification: {e}");
                     }
                 }
@@ -864,6 +883,14 @@ impl App {
     }
 
     /// Opens a conversation. Its messages are read from the cache, and their bodies follow.
+    /// Opens the thread of each notification the user clicked, and brings the window forward.
+    fn open_clicked_notifications(&mut self, ctx: &egui::Context) {
+        while let Ok(thrid) = self.click_rx.try_recv() {
+            self.open_conversation(thrid);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+    }
+
     /// Opens the storage view: the largest cached messages, biggest first.
     fn open_storage(&mut self) {
         self.storage_open = true;
@@ -2341,6 +2368,7 @@ impl Drop for App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_events();
+        self.open_clicked_notifications(ui.ctx());
         self.remember_window_position(ui.ctx());
         self.refresh_storage(ui.ctx());
 
