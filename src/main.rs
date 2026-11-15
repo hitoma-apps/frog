@@ -326,8 +326,18 @@ fn paint_importance_marker(ui: &egui::Ui, rect: egui::Rect) {
     ));
 }
 
-/// A star outline in the middle of `rect`, in gold.
-fn paint_star(ui: &egui::Ui, rect: egui::Rect) {
+/// Adds or removes the starred label.
+fn mark_starred(labels: &mut BTreeSet<String>, starred: bool) {
+    let label = SystemLabel::Starred.as_wire();
+    if starred {
+        labels.insert(label.to_string());
+    } else {
+        labels.remove(label);
+    }
+}
+
+/// A star in the middle of `rect`: filled gold when starred, otherwise a grey outline.
+fn paint_star(ui: &egui::Ui, rect: egui::Rect, starred: bool) {
     let center = rect.center();
     let outer = rect.height() * 0.42;
     let inner = outer * 0.45;
@@ -338,10 +348,23 @@ fn paint_star(ui: &egui::Ui, rect: egui::Rect) {
             center + egui::vec2(angle.cos(), angle.sin()) * radius
         })
         .collect();
-    ui.painter().add(egui::Shape::closed_line(
-        points,
-        egui::Stroke::new(1.4, egui::Color32::from_rgb(230, 180, 40)),
-    ));
+    if starred {
+        // Fan triangles from the centre cover the star, which is star-shaped about it.
+        let gold = egui::Color32::from_rgb(244, 180, 0);
+        for i in 0..points.len() {
+            let next = points[(i + 1) % points.len()];
+            ui.painter().add(egui::Shape::convex_polygon(
+                vec![center, points[i], next],
+                gold,
+                egui::Stroke::NONE,
+            ));
+        }
+    } else {
+        ui.painter().add(egui::Shape::closed_line(
+            points,
+            egui::Stroke::new(1.2, ui.visuals().weak_text_color()),
+        ));
+    }
 }
 
 fn paint_paperclip(ui: &egui::Ui, rect: egui::Rect) {
@@ -1082,6 +1105,7 @@ impl App {
         let row_height = ui.spacing().interact_size.y;
         let mut opened: Option<u64> = None;
         let mut clicked_label: Option<String> = None;
+        let mut star_clicks: Vec<(u64, bool)> = Vec::new();
         egui::ScrollArea::vertical()
             .id_salt("search")
             .auto_shrink([false, false])
@@ -1110,6 +1134,9 @@ impl App {
                             self.checked.remove(&row.thrid);
                         }
                     }
+                    if let Some(starred) = action.star {
+                        star_clicks.push((row.thrid, starred));
+                    }
                     if action.opened {
                         opened = Some(row.thrid);
                     }
@@ -1120,6 +1147,9 @@ impl App {
                         .set(highlight, egui::Shape::rect_filled(action.rect, 4.0, band));
                 }
             });
+        for (thrid, starred) in star_clicks {
+            self.set_star(thrid, starred);
+        }
         if let Some(thrid) = opened {
             self.open_conversation(thrid);
         }
@@ -1167,6 +1197,7 @@ impl App {
         let row_height = ui.spacing().interact_size.y;
         let mut opened: Option<u64> = None;
         let mut clicked_label: Option<String> = None;
+        let mut star_clicks: Vec<(u64, bool)> = Vec::new();
         egui::ScrollArea::vertical()
             .id_salt("waiting")
             .auto_shrink([false, false])
@@ -1195,6 +1226,9 @@ impl App {
                             self.checked.remove(&row.thrid);
                         }
                     }
+                    if let Some(starred) = action.star {
+                        star_clicks.push((row.thrid, starred));
+                    }
                     if action.opened {
                         opened = Some(row.thrid);
                     }
@@ -1205,6 +1239,9 @@ impl App {
                         .set(highlight, egui::Shape::rect_filled(action.rect, 4.0, band));
                 }
             });
+        for (thrid, starred) in star_clicks {
+            self.set_star(thrid, starred);
+        }
         if let Some(thrid) = opened {
             self.open_conversation(thrid);
         }
@@ -1391,6 +1428,44 @@ impl App {
         } else {
             self.open_thread.into_iter().collect()
         }
+    }
+
+    /// Stars or unstars a thread. The rows that show it change at once, and the server is told
+    /// next. Stars are thread-wide, like the other labels in the list.
+    fn set_star(&mut self, thrid: u64, starred: bool) {
+        for entry in &mut self.window_rows {
+            if entry.thrid == thrid {
+                mark_starred(&mut entry.head.labels, starred);
+            }
+        }
+        if let Some((_, rows)) = &mut self.search_results
+            && rows.iter().any(|r| r.thrid == thrid)
+        {
+            for row in Arc::make_mut(rows).iter_mut().filter(|r| r.thrid == thrid) {
+                mark_starred(&mut row.head.labels, starred);
+            }
+        }
+        if let Some(rows) = &mut self.waiting
+            && rows.iter().any(|r| r.thrid == thrid)
+        {
+            for row in Arc::make_mut(rows).iter_mut().filter(|r| r.thrid == thrid) {
+                mark_starred(&mut row.head.labels, starred);
+            }
+        }
+        for message in self.thread_msgs.values_mut() {
+            if message.thrid == thrid {
+                mark_starred(&mut message.labels, starred);
+            }
+        }
+        self.send(Command::Modify {
+            thrids: vec![thrid],
+            action: if starred {
+                LabelAction::Add
+            } else {
+                LabelAction::Remove
+            },
+            labels: vec![SystemLabel::Starred.as_wire().to_string()],
+        });
     }
 
     fn apply(&mut self, action: LabelAction, labels: Vec<String>) {
@@ -2104,6 +2179,7 @@ impl App {
         let mut wanted: Option<(usize, usize)> = None;
         let mut clicked_label: Option<String> = None;
         let mut opened: Option<u64> = None;
+        let mut star_clicks: Vec<(u64, bool)> = Vec::new();
         // Checkbox clicks in this frame: row, the state it was set to, and whether shift was held.
         let mut box_clicks: Vec<(usize, bool, bool)> = Vec::new();
         egui::ScrollArea::vertical()
@@ -2149,6 +2225,9 @@ impl App {
                         let shift = ui.input(|input| input.modifiers.shift);
                         box_clicks.push((i, state, shift));
                     }
+                    if let Some(starred) = action.star {
+                        star_clicks.push((thrid, starred));
+                    }
                     if action.opened {
                         opened = Some(thrid);
                     }
@@ -2174,6 +2253,9 @@ impl App {
             self.check_anchor = Some(row);
         }
 
+        for (thrid, starred) in star_clicks {
+            self.set_star(thrid, starred);
+        }
         if let Some(thrid) = opened {
             self.open_conversation(thrid);
         }
@@ -2728,6 +2810,7 @@ impl App {
 }
 
 /// The search results: one row of a message, as the list and the search results both draw it.
+#[derive(Clone)]
 struct SearchRow {
     head: Message,
     thrid: u64,
@@ -2759,6 +2842,8 @@ struct RowAction {
     label: Option<String>,
     /// Where the row was drawn, for its highlight.
     rect: egui::Rect,
+    /// The star was clicked: the thread should now be starred (`true`) or unstarred.
+    star: Option<bool>,
 }
 
 /// Draws a row: checkbox, unread dot and title, attachment, label chips, date. Lists and search
@@ -2771,6 +2856,7 @@ fn draw_thread_row(ui: &mut egui::Ui, view: &RowView, checked: bool) -> RowActio
         opened: false,
         label: None,
         rect: egui::Rect::NOTHING,
+        star: None,
     };
     let row = ui.horizontal(|ui| {
         // The gap between items is set here, and the widths below assume it.
@@ -2789,11 +2875,18 @@ fn draw_thread_row(ui: &mut egui::Ui, view: &RowView, checked: bool) -> RowActio
         }
         // Every item has a fixed width, so the row can't grow frame to frame.
         // The date is the fixed column on the right. The subject takes the rest.
-        // The star column: an outline for a starred thread, empty otherwise.
-        let (star_rect, _) =
-            ui.allocate_exact_size(egui::vec2(STAR_WIDTH, row_height), egui::Sense::hover());
-        if m.labels.contains(SystemLabel::Starred.as_wire()) {
-            paint_star(ui, star_rect);
+        // The star: grey outline when unstarred, filled gold when starred. Clicking it toggles it.
+        let starred = m.labels.contains(SystemLabel::Starred.as_wire());
+        let (star_rect, star_resp) =
+            ui.allocate_exact_size(egui::vec2(STAR_WIDTH, row_height), egui::Sense::click());
+        paint_star(ui, star_rect, starred);
+        let hint = if starred {
+            "Starred. Click to remove the star."
+        } else {
+            "Click to star"
+        };
+        if star_resp.on_hover_text(hint).clicked() {
+            action.star = Some(!starred);
         }
         // The importance column: Gmail's marker for a message it thinks is important.
         let (marker_rect, _) = ui.allocate_exact_size(
