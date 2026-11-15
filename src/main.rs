@@ -132,8 +132,8 @@ fn base_subject(subject: &str) -> String {
 /// Mailboxes always shown in the sidebar, even when the cache has none of their
 /// messages. `None` is All Mail, which is every message.
 const MAILBOXES: [(&str, Option<&str>); 8] = [
-    ("All Mail", None),
     ("Inbox", Some("\\Inbox")),
+    ("All Mail", None),
     ("Starred", Some("\\Starred")),
     ("Important", Some("\\Important")),
     ("Sent", Some("\\Sent")),
@@ -558,7 +558,8 @@ impl App {
             rendered: HashMap::new(),
             pending_link: None,
             search: String::new(),
-            filter: None,
+            // The Inbox is the first view on sign-in.
+            filter: Some("\\Inbox".to_string()),
             checked: BTreeSet::new(),
             open_thread: None,
             thread_msgs: BTreeMap::new(),
