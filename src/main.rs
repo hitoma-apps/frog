@@ -93,6 +93,12 @@ struct LabelNode {
     children: BTreeMap<String, LabelNode>,
 }
 
+/// The sidebar's label tree and the counts it shows, kept until the labels or counts change.
+struct LabelCache {
+    tree: LabelNode,
+    counts: BTreeMap<String, (usize, usize)>,
+}
+
 /// The labels as a tree, split at "/". Gmail's IMAP server uses "/" to nest labels.
 fn label_tree<'a>(labels: impl Iterator<Item = &'a String>) -> LabelNode {
     let mut root = LabelNode::default();
@@ -412,6 +418,8 @@ struct App {
     /// Threads whose notifications were clicked, sent from the notification threads.
     click_tx: std::sync::mpsc::Sender<u64>,
     click_rx: std::sync::mpsc::Receiver<u64>,
+    /// The sidebar's labels, built from the counts. `None` until they're needed again.
+    label_cache: Option<LabelCache>,
     /// The last search the cache answered, and the messages it found.
     search_results: Option<(search::Query, Arc<Vec<SearchHit>>)>,
     /// The search last sent to the cache, so each one is sent once.
@@ -544,6 +552,7 @@ impl App {
             storage_asked: Instant::now(),
             click_tx,
             click_rx,
+            label_cache: None,
             search_results: None,
             search_asked: None,
             auto_signin: false,
@@ -654,6 +663,7 @@ impl App {
             }
             Event::Reset => {
                 self.counts = Arc::default();
+                self.label_cache = None;
                 self.totals = (0, 0);
                 self.cached_count = 0;
                 self.change_list();
@@ -741,7 +751,10 @@ impl App {
                 self.view_stale = true;
             }
             Event::IdleState(on) => self.idle_on = on,
-            Event::LabelList(labels) => self.known_labels = Arc::new(labels.into_iter().collect()),
+            Event::LabelList(labels) => {
+                self.known_labels = Arc::new(labels.into_iter().collect());
+                self.label_cache = None;
+            }
             Event::LabelCounts {
                 labels,
                 threads,
@@ -753,6 +766,7 @@ impl App {
                         .map(|(label, t, u)| (label, (t, u)))
                         .collect(),
                 );
+                self.label_cache = None;
                 self.totals = (threads, unread);
             }
             Event::ThreadRange {
@@ -1573,20 +1587,28 @@ impl App {
                     }
                 }
 
-                // Labels from the server, plus any seen in the cache, with counts.
-                let mut user: BTreeMap<String, (usize, usize)> = counts
-                    .iter()
-                    .filter(|(k, _)| !k.starts_with('\\'))
-                    .map(|(k, c)| (k.clone(), *c))
-                    .collect();
-                for label in known.iter() {
-                    user.entry(label.clone()).or_insert((0, 0));
-                }
-                if !user.is_empty() {
-                    ui.separator();
-                    ui.heading("Labels");
+                // The label tree is built once per change to the labels or their counts, not per
+                // frame. It's taken out while it's drawn, since drawing needs `&mut self`.
+                if self.label_cache.is_none() {
+                    // Labels from the server, plus any seen in the cache, with counts.
+                    let mut user: BTreeMap<String, (usize, usize)> = counts
+                        .iter()
+                        .filter(|(k, _)| !k.starts_with('\\'))
+                        .map(|(k, c)| (k.clone(), *c))
+                        .collect();
+                    for label in known.iter() {
+                        user.entry(label.clone()).or_insert((0, 0));
+                    }
                     let tree = label_tree(user.keys());
-                    self.label_tree(ui, &tree, &user, "");
+                    self.label_cache = Some(LabelCache { tree, counts: user });
+                }
+                if let Some(cache) = self.label_cache.take() {
+                    if !cache.counts.is_empty() {
+                        ui.separator();
+                        ui.heading("Labels");
+                        self.label_tree(ui, &cache.tree, &cache.counts, "");
+                    }
+                    self.label_cache = Some(cache);
                 }
             });
     }

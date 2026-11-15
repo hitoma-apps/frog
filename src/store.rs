@@ -2004,6 +2004,25 @@ mod tests {
         assert_eq!(uids("before:2026-11-01"), vec![2]);
     }
 
+    /// Times pages of the thread list near the start and the end of a large cache. Run with
+    /// `cargo test --release -- --ignored --nocapture thread_page_timing`.
+    #[test]
+    #[ignore = "timing check; run in release mode"]
+    fn thread_page_timing() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        let all: Vec<CachedMessage> = (1..=200_000u64)
+            .map(|i| msg(i, i as u32, &["Work"]))
+            .collect();
+        for chunk in all.chunks(5_000) {
+            s.upsert_messages(chunk).unwrap();
+        }
+        for start in [0usize, 100_000, 190_000] {
+            let t = std::time::Instant::now();
+            let page = s.thread_page(&ThreadFilter::All, start, 40).unwrap();
+            println!("start {start}: {} rows in {:?}", page.len(), t.elapsed());
+        }
+    }
+
     fn msg(msgid: u64, uid: u32, labels: &[&str]) -> CachedMessage {
         CachedMessage {
             msgid,
