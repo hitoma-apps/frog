@@ -108,6 +108,39 @@ impl ListSql {
     }
 }
 
+/// The columns a thread-list row reads, from `threads t` joined to its head message `m`.
+const THREAD_COLUMNS: &str = "t.thrid, t.count, t.unread, m.msgid, m.thrid, m.uid,
+                              m.from_addr, m.subject, m.date, m.seen, m.sent, m.from_email,
+                              t.attachments, m.received, t.newest_time";
+
+/// The field the thread list is sorted by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortKey {
+    /// The newest message's date.
+    Date,
+    /// The newest message's sender address.
+    Sender,
+    /// The newest message's subject.
+    Subject,
+}
+
+/// How the thread list is sorted. Ties are broken by thread id, in the same direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListOrder {
+    pub key: SortKey,
+    pub descending: bool,
+}
+
+impl Default for ListOrder {
+    /// Newest first, as the list has always shown it.
+    fn default() -> Self {
+        Self {
+            key: SortKey::Date,
+            descending: true,
+        }
+    }
+}
+
 /// A thread's position in the list: its newest time, then its thread id.
 pub type ThreadKey = (i64, u64);
 
@@ -309,6 +342,8 @@ pub const SAMPLE_STRIDE: usize = 1_000;
 /// have moved.
 pub struct PageCursor {
     stride: usize,
+    /// The thread ids in another sort order, for the current filter and cache version.
+    sorted: Option<(ThreadFilter, ListOrder, i64, Vec<u64>)>,
     filter: Option<ThreadFilter>,
     version: i64,
     /// Row index → sort key, for rows recently read.
@@ -327,6 +362,7 @@ impl PageCursor {
     pub fn new(stride: usize) -> Self {
         Self {
             stride: stride.max(1),
+            sorted: None,
             filter: None,
             version: 0,
             recent: BTreeMap::new(),
@@ -335,15 +371,32 @@ impl PageCursor {
         }
     }
 
-    /// The page of `count` threads from row `start`, as `Store::thread_page` returns it.
+    /// The page of `count` threads from row `start`, in the order `order` gives. The newest-first
+    /// order uses the remembered rows; any other order keeps the list of ids for the filter.
     pub fn page(
         &mut self,
         store: &Store,
         filter: &ThreadFilter,
+        order: ListOrder,
         start: usize,
         count: usize,
     ) -> Result<Vec<ThreadSummary>> {
         let version = store.data_version()?;
+        if order != ListOrder::default() {
+            let fresh = matches!(
+                &self.sorted,
+                Some((f, o, v, _)) if f == filter && *o == order && *v == version
+            );
+            if !fresh {
+                let ids = store.thread_order(filter, order)?;
+                self.sorted = Some((filter.clone(), order, version, ids));
+            }
+            let ids: Vec<u64> = match &self.sorted {
+                Some((_, _, _, ids)) => ids.iter().skip(start).take(count).copied().collect(),
+                None => Vec::new(),
+            };
+            return store.threads_by_id(&ids);
+        }
         if self.filter.as_ref() != Some(filter) || self.version != version {
             self.filter = Some(filter.clone());
             self.version = version;
@@ -1465,6 +1518,94 @@ impl Store {
     /// The threads a list shows, newest first, from `offset` on. Each comes with its
     /// newest message. A label or search shows whole threads: every message of a
     /// thread counts, whichever labels it carries.
+    /// The ids of every thread a list shows, in the order `order` gives.
+    pub fn thread_order(&self, filter: &ThreadFilter, order: ListOrder) -> Result<Vec<u64>> {
+        let Some(list) = ListSql::for_filter(filter) else {
+            return Ok(Vec::new());
+        };
+        let key = match order.key {
+            SortKey::Date => "t.newest_time",
+            SortKey::Sender => "LOWER(m.from_email)",
+            SortKey::Subject => "LOWER(m.subject)",
+        };
+        let dir = if order.descending { "DESC" } else { "ASC" };
+        let sql = format!(
+            "{with}SELECT t.thrid {from}
+             JOIN messages m ON m.msgid = t.head_msgid
+             WHERE 1 = 1{conditions}
+             ORDER BY {key} {dir}, t.thrid {dir}",
+            with = list.with,
+            from = list.from,
+            conditions = list.conditions,
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let ids = stmt
+            .query_map(rusqlite::params_from_iter(list.args.iter()), |r| {
+                Ok(r.get::<_, i64>(0)? as u64)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
+    /// The threads with these ids, in the order given. An id with no thread is left out.
+    pub fn threads_by_id(&self, ids: &[u64]) -> Result<Vec<ThreadSummary>> {
+        use rusqlite::types::Value;
+        let mut found: HashMap<u64, (ThreadMeta, CachedMessage)> = HashMap::new();
+        for chunk in ids.chunks(400) {
+            let marks = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT {THREAD_COLUMNS} FROM threads t
+                 JOIN messages m ON m.msgid = t.head_msgid
+                 WHERE t.thrid IN ({marks})"
+            );
+            let args: Vec<Value> = chunk.iter().map(|&t| Value::Integer(t as i64)).collect();
+            for (_, meta, head) in
+                self.thread_rows(&sql, rusqlite::params_from_iter(args.iter()))?
+            {
+                found.insert(meta.0, (meta, head));
+            }
+        }
+        let mut metas = Vec::new();
+        let mut heads = Vec::new();
+        for id in ids {
+            if let Some((meta, head)) = found.remove(id) {
+                metas.push(meta);
+                heads.push(head);
+            }
+        }
+        self.attach_labels(&mut heads)?;
+        Ok(metas
+            .into_iter()
+            .zip(heads)
+            .map(
+                |((thrid, count, unread, attachments), head)| ThreadSummary {
+                    thrid,
+                    count,
+                    unread,
+                    attachments,
+                    head,
+                },
+            )
+            .collect())
+    }
+
+    /// A page of the thread list in the order `order` gives, from `offset` on.
+    pub fn thread_page_sorted(
+        &self,
+        filter: &ThreadFilter,
+        order: ListOrder,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<ThreadSummary>> {
+        let page: Vec<u64> = self
+            .thread_order(filter, order)?
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect();
+        self.threads_by_id(&page)
+    }
+
     pub fn thread_page(
         &self,
         filter: &ThreadFilter,
@@ -1489,9 +1630,6 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<(ThreadKey, ThreadSummary)>> {
         use rusqlite::types::Value;
-        const COLUMNS: &str = "t.thrid, t.count, t.unread, m.msgid, m.thrid, m.uid,
-                               m.from_addr, m.subject, m.date, m.seen, m.sent, m.from_email,
-                               t.attachments, m.received, t.newest_time";
         let Some(mut list) = ListSql::for_filter(filter) else {
             return Ok(Vec::new());
         };
@@ -1502,7 +1640,7 @@ impl Store {
             list.args.push(Value::Integer(thrid as i64));
         }
         let sql = format!(
-            "{with}SELECT {COLUMNS} {from}
+            "{with}SELECT {THREAD_COLUMNS} {from}
              JOIN messages m ON m.msgid = t.head_msgid
              WHERE 1 = 1{conditions}
              ORDER BY t.newest_time DESC, t.thrid DESC LIMIT ? OFFSET ?",
@@ -2337,6 +2475,63 @@ mod tests {
     }
 
     #[test]
+    fn thread_lists_sort_by_date_sender_and_subject_in_either_direction() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        let mut messages: Vec<CachedMessage> =
+            (1..=3u64).map(|i| msg(i, i as u32, &["Work"])).collect();
+        messages[0].from_email = "carol@example.com".into();
+        messages[0].subject = "Banana".into();
+        messages[1].from_email = "alice@example.com".into();
+        messages[1].subject = "apple".into();
+        messages[2].from_email = "bob@example.com".into();
+        messages[2].subject = "Cherry".into();
+        s.upsert_messages(&messages).unwrap();
+        let order = |key, descending| ListOrder { key, descending };
+        let subjects = |o| -> Vec<String> {
+            s.thread_page_sorted(&ThreadFilter::All, o, 0, 10)
+                .unwrap()
+                .iter()
+                .map(|t| t.head.subject.clone())
+                .collect()
+        };
+        // Date, newest first, matches the plain thread page.
+        let by_date: Vec<u64> = s
+            .thread_page(&ThreadFilter::All, 0, 10)
+            .unwrap()
+            .iter()
+            .map(|t| t.thrid)
+            .collect();
+        assert_eq!(
+            s.thread_order(&ThreadFilter::All, ListOrder::default())
+                .unwrap(),
+            by_date
+        );
+        assert_eq!(
+            subjects(order(SortKey::Subject, false)),
+            vec!["apple", "Banana", "Cherry"]
+        );
+        assert_eq!(
+            subjects(order(SortKey::Subject, true)),
+            vec!["Cherry", "Banana", "apple"]
+        );
+        let senders: Vec<String> = s
+            .thread_page_sorted(&ThreadFilter::All, order(SortKey::Sender, false), 0, 10)
+            .unwrap()
+            .iter()
+            .map(|t| t.head.from_email.clone())
+            .collect();
+        assert_eq!(
+            senders,
+            vec!["alice@example.com", "bob@example.com", "carol@example.com"]
+        );
+        // A page reads from its offset.
+        let second = s
+            .thread_page_sorted(&ThreadFilter::All, order(SortKey::Sender, false), 1, 1)
+            .unwrap();
+        assert_eq!(second[0].head.from_email, "bob@example.com");
+    }
+
+    #[test]
     fn frequent_senders_count_messages_per_address() {
         let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
         let mut messages: Vec<CachedMessage> =
@@ -2352,6 +2547,45 @@ mod tests {
         assert_eq!(senders[0].unread, 2);
         assert_eq!(senders[1].messages, 1);
         assert_eq!(s.frequent_senders(1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cursor_pages_in_another_order_follow_the_cache() {
+        let dir = std::env::temp_dir().join(format!("cursor-order-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("order.sqlite");
+        let _ = std::fs::remove_file(&path);
+        let mut writer = Store::open(&path).unwrap();
+        let messages: Vec<CachedMessage> =
+            (1..=60u64).map(|i| msg(i, i as u32, &["Work"])).collect();
+        writer.upsert_messages(&messages).unwrap();
+        let reader = Store::open_reader(&path).unwrap();
+        let order = ListOrder {
+            key: SortKey::Sender,
+            descending: true,
+        };
+        let mut cursor = PageCursor::new(SAMPLE_STRIDE);
+        let check = |cursor: &mut PageCursor| {
+            for start in [0usize, 13, 40, 57] {
+                let want: Vec<u64> = reader
+                    .thread_page_sorted(&ThreadFilter::All, order, start, 10)
+                    .unwrap()
+                    .iter()
+                    .map(|t| t.thrid)
+                    .collect();
+                let got: Vec<u64> = cursor
+                    .page(&reader, &ThreadFilter::All, order, start, 10)
+                    .unwrap()
+                    .iter()
+                    .map(|t| t.thrid)
+                    .collect();
+                assert_eq!(got, want, "start {start}");
+            }
+        };
+        check(&mut cursor);
+        writer.remove_uids(&[2, 9, 30]).unwrap();
+        check(&mut cursor);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -2393,7 +2627,7 @@ mod tests {
                         .map(|t| t.thrid)
                         .collect();
                     let got: Vec<u64> = cursor
-                        .page(&reader, &filter, start, 10)
+                        .page(&reader, &filter, ListOrder::default(), start, 10)
                         .unwrap()
                         .iter()
                         .map(|t| t.thrid)
@@ -2452,6 +2686,30 @@ mod tests {
         time("threads count (All)", &mut || {
             s.thread_count(&ThreadFilter::All).unwrap();
         });
+        time("thread_order by date", &mut || {
+            s.thread_order(&ThreadFilter::All, ListOrder::default())
+                .unwrap();
+        });
+        time("thread_order by sender", &mut || {
+            s.thread_order(
+                &ThreadFilter::All,
+                ListOrder {
+                    key: SortKey::Sender,
+                    descending: false,
+                },
+            )
+            .unwrap();
+        });
+        time("thread_order by subject", &mut || {
+            s.thread_order(
+                &ThreadFilter::All,
+                ListOrder {
+                    key: SortKey::Subject,
+                    descending: false,
+                },
+            )
+            .unwrap();
+        });
         time("v15 FTS rebuild", &mut || {
             let tx = s.conn.transaction().unwrap();
             upgrade_fts_sender_address(&tx).unwrap();
@@ -2477,7 +2735,9 @@ mod tests {
         let mut total = std::time::Duration::ZERO;
         for start in (0..200_000).step_by(40) {
             let t = std::time::Instant::now();
-            cursor.page(&s, &ThreadFilter::All, start, 40).unwrap();
+            cursor
+                .page(&s, &ThreadFilter::All, ListOrder::default(), start, 40)
+                .unwrap();
             let took = t.elapsed();
             total += took;
             slowest = slowest.max(took);
@@ -2487,7 +2747,9 @@ mod tests {
         let mut jumper = PageCursor::new(SAMPLE_STRIDE);
         for start in [100_000usize, 190_000, 55_555, 190_123] {
             let t = std::time::Instant::now();
-            let page = jumper.page(&s, &ThreadFilter::All, start, 40).unwrap();
+            let page = jumper
+                .page(&s, &ThreadFilter::All, ListOrder::default(), start, 40)
+                .unwrap();
             println!("jump to {start}: {} rows in {:?}", page.len(), t.elapsed());
         }
     }

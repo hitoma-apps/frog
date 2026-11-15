@@ -16,7 +16,7 @@ use std::time::Duration;
 use eframe::egui;
 use gmail_imap_proto::labels::LabelAction;
 use gmail_imap_proto::store::{
-    DEFAULT_BODY_CAP, MailboxState, PageCursor, SAMPLE_STRIDE, Store, ThreadFilter,
+    DEFAULT_BODY_CAP, ListOrder, MailboxState, PageCursor, SAMPLE_STRIDE, Store, ThreadFilter,
     account_cache_path,
 };
 use gmail_imap_proto::uidset::UidSet;
@@ -58,13 +58,15 @@ pub enum Command {
     /// The IDs of the threads in a range of the list, to check or uncheck them all.
     ThreadRange {
         filter: ThreadFilter,
+        order: ListOrder,
         start: usize,
         count: usize,
         checked: bool,
     },
-    /// Reads one window of the thread list from the cache.
+    /// Reads one window of the thread list from the cache, in the order `order` gives.
     Window {
         filter: ThreadFilter,
+        order: ListOrder,
         start: usize,
         count: usize,
     },
@@ -143,6 +145,7 @@ pub enum Event {
     /// One window of the thread list, starting at `start`, out of `total` threads.
     Window {
         filter: ThreadFilter,
+        order: ListOrder,
         start: usize,
         threads: Vec<ThreadEntry>,
         total: usize,
@@ -1252,6 +1255,7 @@ fn read_window(
     store: Option<&Store>,
     emit: &Emitter,
     filter: &ThreadFilter,
+    order: ListOrder,
     start: usize,
     count: usize,
     cursor: Option<&mut PageCursor>,
@@ -1259,6 +1263,7 @@ fn read_window(
     let Some(store) = store else {
         emit.send(Event::Window {
             filter: filter.clone(),
+            order,
             start,
             threads: Vec::new(),
             total: 0,
@@ -1267,8 +1272,8 @@ fn read_window(
     };
     let result = store.thread_count(filter).and_then(|total| {
         let page = match cursor {
-            Some(cursor) => cursor.page(store, filter, start, count),
-            None => store.thread_page(filter, start, count),
+            Some(cursor) => cursor.page(store, filter, order, start, count),
+            None => store.thread_page_sorted(filter, order, start, count),
         };
         page.map(|page| (total, page))
     });
@@ -1289,6 +1294,7 @@ fn read_window(
                 .collect();
             emit.send(Event::Window {
                 filter: filter.clone(),
+                order,
                 start,
                 threads,
                 total,
@@ -1318,12 +1324,13 @@ fn read_thread_range(
     store: Option<&Store>,
     emit: &Emitter,
     filter: &ThreadFilter,
+    order: ListOrder,
     start: usize,
     count: usize,
     checked: bool,
 ) {
     let thrids: Vec<u64> = match store {
-        Some(store) => match store.thread_page(filter, start, count) {
+        Some(store) => match store.thread_page_sorted(filter, order, start, count) {
             Ok(page) => page.into_iter().map(|t| t.thrid).collect(),
             Err(e) => {
                 emit.send(Event::Error(format!("cache read failed: {e}")));
@@ -1350,9 +1357,10 @@ fn answer_read(
     match cmd {
         Command::Window {
             filter,
+            order,
             start,
             count,
-        } => read_window(store, emit, filter, *start, *count, cursor),
+        } => read_window(store, emit, filter, *order, *start, *count, cursor),
         Command::Thread { thrid } => read_thread(store, emit, *thrid),
         Command::Largest { limit } => read_largest(store, emit, *limit),
         Command::Senders { limit } => read_senders(store, emit, *limit),
@@ -1360,10 +1368,11 @@ fn answer_read(
         Command::Search { query, limit } => read_search(store, emit, query, *limit),
         Command::ThreadRange {
             filter,
+            order,
             start,
             count,
             checked,
-        } => read_thread_range(store, emit, filter, *start, *count, *checked),
+        } => read_thread_range(store, emit, filter, *order, *start, *count, *checked),
         _ => {}
     }
 }
@@ -1547,6 +1556,7 @@ mod tests {
         link.commands
             .send(Command::Window {
                 filter,
+                order: ListOrder::default(),
                 start,
                 count,
             })
@@ -1889,6 +1899,7 @@ mod tests {
         link.commands
             .send(Command::ThreadRange {
                 filter: ThreadFilter::All,
+                order: ListOrder::default(),
                 start: 0,
                 count: 3,
                 checked: true,
@@ -2019,6 +2030,7 @@ mod tests {
             .expect("a file cache has a reader")
             .send(Command::Window {
                 filter: ThreadFilter::All,
+                order: ListOrder::default(),
                 start: 0,
                 count: 500,
             })

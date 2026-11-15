@@ -35,7 +35,7 @@ use gmail_imap_proto::search;
 use gmail_imap_proto::settings::{self, CHECK_INTERVAL_RANGE, PAGE_SIZE_RANGE, Settings};
 
 use backend::Message;
-use gmail_imap_proto::store::{StorageView, ThreadFilter};
+use gmail_imap_proto::store::{ListOrder, SortKey, StorageView, ThreadFilter};
 use reader::{Block, Segment};
 use worker::{Command, Event, Link, ThreadEntry};
 
@@ -623,7 +623,9 @@ struct App {
     /// The row of the last checkbox click, for a shift-click to extend from.
     check_anchor: Option<usize>,
     /// The last window asked for, so the same one isn't asked for twice.
-    sent_window: Option<(ThreadFilter, usize, usize)>,
+    sent_window: Option<(ThreadFilter, ListOrder, usize, usize)>,
+    /// How the thread list is sorted.
+    sort: ListOrder,
     /// Something on screen has changed. Refreshes are throttled.
     view_stale: bool,
     /// When the list and conversation were last refreshed.
@@ -735,6 +737,7 @@ impl App {
             window_total: 0,
             window_filter: None,
             sent_window: None,
+            sort: ListOrder::default(),
             check_anchor: None,
             label_open: HashSet::new(),
             view_stale: false,
@@ -985,12 +988,13 @@ impl App {
             }
             Event::Window {
                 filter,
+                order,
                 start,
                 threads,
                 total,
             } => {
                 // An answer for a list that has since changed is out of date, so it's dropped.
-                if filter == self.thread_filter() {
+                if filter == self.thread_filter() && order == self.sort {
                     self.window_filter = Some(filter);
                     self.window_start = start;
                     self.window_rows = threads;
@@ -1060,6 +1064,7 @@ impl App {
         let filter = self.thread_filter();
         self.send(Command::ThreadRange {
             filter,
+            order: self.sort,
             start,
             count,
             checked,
@@ -1097,16 +1102,60 @@ impl App {
         self.set_read_state(thrids, seen);
     }
 
+    /// Sorts the thread list by `key`. Choosing the key already in use reverses the order.
+    fn set_sort(&mut self, key: SortKey) {
+        self.sort = if self.sort.key == key {
+            ListOrder {
+                key,
+                descending: !self.sort.descending,
+            }
+        } else {
+            // Dates start newest first; names start A to Z.
+            ListOrder {
+                key,
+                descending: key == SortKey::Date,
+            }
+        };
+        self.change_list();
+    }
+
+    /// The sort buttons above the thread list. The key in use shows its direction.
+    fn sort_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.weak("Sort:");
+            for (key, name) in [
+                (SortKey::Date, "Date"),
+                (SortKey::Sender, "Sender"),
+                (SortKey::Subject, "Subject"),
+            ] {
+                let active = self.sort.key == key;
+                let text = match (active, self.sort.descending) {
+                    (true, true) => format!("{name} ▼"),
+                    (true, false) => format!("{name} ▲"),
+                    (false, _) => name.to_string(),
+                };
+                if ui
+                    .selectable_label(active, text)
+                    .on_hover_text("Click again to reverse the order")
+                    .clicked()
+                {
+                    self.set_sort(key);
+                }
+            }
+        });
+    }
+
     /// Asks the worker for rows of the thread list, unless that exact range was just asked for.
     fn request_window(&mut self, start: usize, count: usize) {
         let filter = self.thread_filter();
-        let key = (filter.clone(), start, count);
+        let key = (filter.clone(), self.sort, start, count);
         if self.sent_window.as_ref() == Some(&key) {
             return;
         }
         self.sent_window = Some(key);
         self.send(Command::Window {
             filter,
+            order: self.sort,
             start,
             count,
         });
@@ -1461,7 +1510,7 @@ impl App {
         }
         self.view_stale = false;
         self.view_asked = Instant::now();
-        if let Some((_, start, count)) = self.sent_window.take() {
+        if let Some((_, _, start, count)) = self.sent_window.take() {
             self.request_window(start, count);
         }
         if let Some(thrid) = self.open_thread {
@@ -2299,6 +2348,7 @@ impl App {
         } else {
             "threads"
         };
+        self.sort_bar(ui);
         ui.weak(match &filter {
             ThreadFilter::Search(text) => format!("{} {noun} match \"{text}\"", self.window_total),
             _ => format!("{} {noun}", self.window_total),
