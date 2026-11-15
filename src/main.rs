@@ -2639,6 +2639,8 @@ impl App {
         let mut open_original: Option<u32> = None;
         // An attachment chosen to save, as (message, index in its attachment list).
         let mut save_request: Option<(u32, usize)> = None;
+        // A message whose attachments are all to be saved, into a folder the user picks.
+        let mut save_all_request: Option<u32> = None;
         let mut pending: Option<LinkInfo> = None;
         egui::ScrollArea::vertical()
             .id_salt("reader")
@@ -2711,7 +2713,7 @@ impl App {
                                                 ui.horizontal_wrapped(|ui| {
                                                     ui.weak("Attachments:");
                                                     for (i, att) in list.iter().enumerate() {
-                                                        let mut hover = format!("{}\nSave to your Downloads folder.", att.content_type);
+                                                        let mut hover = format!("{}\nChoose where to save it.", att.content_type);
                                                         let program = attachments::is_program(&att.name);
                                                         if program {
                                                             hover.push_str("\nA program file: review it before opening.");
@@ -2725,6 +2727,14 @@ impl App {
                                                         if ui.button(text).on_hover_text(hover).clicked() {
                                                             save_request = Some((uid, i));
                                                         }
+                                                    }
+                                                    if list.len() > 1
+                                                        && ui
+                                                            .button(format!("Save all ({})…", list.len()))
+                                                            .on_hover_text("Save every attachment into a folder you choose.")
+                                                            .clicked()
+                                                    {
+                                                        save_all_request = Some(uid);
                                                     }
                                                 });
                                             }
@@ -2791,14 +2801,16 @@ impl App {
         if let Some((uid, index)) = save_request {
             self.save_attachment(uid, index);
         }
+        if let Some(uid) = save_all_request {
+            self.save_all_attachments(uid);
+        }
         if let Some(uid) = open_original {
             self.original = Some(uid);
             self.request_body(uid);
         }
     }
 
-    /// Writes an attachment to the Downloads folder, under a name that doesn't overwrite
-    /// anything already there.
+    /// Saves one attachment to a file the user chooses. The dialog starts in Downloads.
     fn save_attachment(&mut self, uid: u32, index: usize) {
         let Some(raw) = self.thread_msgs.get(&uid).and_then(|m| m.body.as_deref()) else {
             self.status = Some("The message isn't loaded yet.".into());
@@ -2813,9 +2825,54 @@ impl App {
             .get(&uid)
             .and_then(|list| list.get(index))
             .map_or_else(|| "attachment".to_string(), |a| a.name.clone());
-        self.status = Some(match export::write_download(&name, &bytes) {
-            Ok(path) => format!("Saved {}", path.display()),
-            Err(e) => format!("Could not save {name}: {e}"),
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Save attachment")
+            .set_file_name(&name);
+        if let Some(dir) = export::downloads_dir() {
+            dialog = dialog.set_directory(dir);
+        }
+        // Cancelling the dialog saves nothing and says nothing.
+        let Some(path) = dialog.save_file() else {
+            return;
+        };
+        self.status = Some(match export::write_private_file(&path, &bytes) {
+            Ok(()) => format!("Saved {}", path.display()),
+            Err(e) => format!("Could not save {}: {e}", path.display()),
+        });
+    }
+
+    /// Saves every attachment of one message into a folder the user picks. A name that's already
+    /// there gets " (2)" and so on, so nothing is overwritten.
+    fn save_all_attachments(&mut self, uid: u32) {
+        let Some(raw) = self.thread_msgs.get(&uid).and_then(|m| m.body.as_deref()) else {
+            self.status = Some("The message isn't loaded yet.".into());
+            return;
+        };
+        let Some(list) = self.attachments.get(&uid).cloned() else {
+            return;
+        };
+        let mut dialog = rfd::FileDialog::new().set_title("Save attachments to folder");
+        if let Some(dir) = export::downloads_dir() {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(dir) = dialog.pick_folder() else {
+            return;
+        };
+        let mut saved = 0;
+        let mut failed = Vec::new();
+        for (i, att) in list.iter().enumerate() {
+            match attachments::contents(raw, i) {
+                Some(bytes) => match export::write_download_to(&dir, &att.name, &bytes) {
+                    Ok(_) => saved += 1,
+                    Err(e) => failed.push(format!("{} ({e})", att.name)),
+                },
+                None => failed.push(format!("{} (could not be read)", att.name)),
+            }
+        }
+        self.status = Some(if failed.is_empty() {
+            format!("Saved {saved} attachments to {}", dir.display())
+        } else {
+            format!("Saved {saved}; could not save {}", failed.join(", "))
         });
     }
 

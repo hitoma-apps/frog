@@ -43,15 +43,20 @@ pub fn safe_file_name(name: &str) -> String {
     }
 }
 
-/// Writes `bytes` to the Downloads folder as `name`, or as `name (2)` and so on if that is taken.
-/// The file is owner-only. Returns its path.
-pub fn write_download(name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
-    let dir = downloads_dir()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no Downloads folder"))?;
-    write_download_to(&dir, name, bytes)
+/// Writes `bytes` to `path`, replacing any file there. A file it creates is owner-only.
+pub fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(bytes)
 }
 
-/// `write_download`, into `dir`.
+/// Writes `bytes` into `dir` as `name`, or as `name (2)` and so on if that is taken. The file is
+/// owner-only. Returns its path.
 pub fn write_download_to(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
     let (stem, ext) = match name.rsplit_once('.') {
