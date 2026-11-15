@@ -16,7 +16,8 @@ use std::time::Duration;
 use eframe::egui;
 use gmail_imap_proto::labels::LabelAction;
 use gmail_imap_proto::store::{
-    DEFAULT_BODY_CAP, MailboxState, PageCursor, Store, ThreadFilter, account_cache_path,
+    DEFAULT_BODY_CAP, MailboxState, PageCursor, SAMPLE_STRIDE, Store, ThreadFilter,
+    account_cache_path,
 };
 use gmail_imap_proto::uidset::UidSet;
 
@@ -1404,7 +1405,7 @@ fn read_search(
 /// the worker's network calls, reconnects or IDLE.
 fn read_loop(store: Store, requests: Receiver<Command>, emit: Emitter) {
     // The reader's own positions, so deep pages seek from a remembered row.
-    let mut cursor = PageCursor::default();
+    let mut cursor = PageCursor::new(SAMPLE_STRIDE);
     for cmd in requests {
         answer_read(Some(&store), &emit, &cmd, Some(&mut cursor));
     }

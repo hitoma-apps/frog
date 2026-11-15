@@ -64,6 +64,50 @@ impl From<std::io::Error> for StoreError {
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// A thread's list row, as the query returns it: thread, count, unread, attachment, head.
+/// The FROM, WHERE and arguments of a thread-list query, for one filter.
+struct ListSql {
+    /// A WITH clause, for filters that need one.
+    with: String,
+    from: &'static str,
+    /// Extra conditions, each starting with ` AND `.
+    conditions: String,
+    args: Vec<rusqlite::types::Value>,
+}
+
+impl ListSql {
+    /// The query parts for `filter`, or `None` when it can match nothing (an empty search).
+    fn for_filter(filter: &ThreadFilter) -> Option<Self> {
+        use rusqlite::types::Value;
+        let mut list = ListSql {
+            with: String::new(),
+            from: "FROM threads t",
+            conditions: String::new(),
+            args: Vec::new(),
+        };
+        match filter {
+            ThreadFilter::All => {}
+            ThreadFilter::Label(label) => {
+                list.conditions.push_str(
+                    " AND EXISTS (SELECT 1 FROM thread_labels tl
+                                  WHERE tl.label = ? AND tl.thrid = t.thrid)",
+                );
+                list.args.push(Value::Text(label.clone()));
+            }
+            ThreadFilter::Search(text) => {
+                let query = fts_query(text)?;
+                list.with = "WITH hits AS (
+                                 SELECT DISTINCT m.thrid FROM messages_fts
+                                 JOIN messages m ON m.msgid = messages_fts.rowid
+                                 WHERE messages_fts MATCH ? AND m.uid IS NOT NULL) "
+                    .to_string();
+                list.from = "FROM hits h JOIN threads t ON t.thrid = h.thrid";
+                list.args.push(Value::Text(query));
+            }
+        }
+        Some(list)
+    }
+}
+
 /// A thread's position in the list: its newest time, then its thread id.
 pub type ThreadKey = (i64, u64);
 
@@ -255,21 +299,43 @@ pub struct StorageView {
     pub total: usize,
 }
 
-/// Remembers the sort keys of thread rows recently read, so a page near them can seek to its
-/// start instead of counting rows from the top. A change to the cache by another connection
-/// drops them, since row positions may have moved.
-#[derive(Default)]
+/// Rows between the sort keys sampled for jumps. A jump counts forward from the nearest sampled
+/// row, so it counts at most this many rows.
+pub const SAMPLE_STRIDE: usize = 1_000;
+
+/// Remembers sort keys of thread rows, so a page can seek to its start instead of counting rows
+/// from the top. Two kinds are kept: rows recently read, which make scrolling in order cheap,
+/// and a sample of every `stride`-th row, which makes a jump cheap. Both are dropped when
+/// another connection changes the cache (see `Store::data_version`), since row positions may
+/// have moved.
 pub struct PageCursor {
+    stride: usize,
     filter: Option<ThreadFilter>,
     version: i64,
-    /// Row index → sort key of that row.
-    anchors: BTreeMap<usize, ThreadKey>,
+    /// Row index → sort key, for rows recently read.
+    recent: BTreeMap<usize, ThreadKey>,
+    /// Row index → sort key, for every `stride`-th row. Filled on the first jump.
+    sampled: BTreeMap<usize, ThreadKey>,
+    /// Whether `sampled` has been filled for the current filter and version.
+    is_sampled: bool,
 }
 
-/// Most remembered rows. Past this, the memory is cleared and rebuilt as pages are read.
-const MAX_ANCHORS: usize = 4_096;
+/// Most recently read rows remembered. Past this, they're dropped and remembered again.
+const MAX_RECENT: usize = 4_096;
 
 impl PageCursor {
+    /// A cursor that samples every `stride`-th row for jumps.
+    pub fn new(stride: usize) -> Self {
+        Self {
+            stride: stride.max(1),
+            filter: None,
+            version: 0,
+            recent: BTreeMap::new(),
+            sampled: BTreeMap::new(),
+            is_sampled: false,
+        }
+    }
+
     /// The page of `count` threads from row `start`, as `Store::thread_page` returns it.
     pub fn page(
         &mut self,
@@ -282,22 +348,47 @@ impl PageCursor {
         if self.filter.as_ref() != Some(filter) || self.version != version {
             self.filter = Some(filter.clone());
             self.version = version;
-            self.anchors.clear();
+            self.recent.clear();
+            self.sampled.clear();
+            self.is_sampled = false;
+        }
+        // A jump with no row close above `start` to count from: sample the whole list once, so
+        // the row to count from is never more than `stride` rows away.
+        let close = self
+            .nearest(start)
+            .is_some_and(|(i, _)| start - i <= self.stride);
+        if !close && start > 0 && !self.is_sampled {
+            for (index, key) in store.thread_keys_every(filter, self.stride)? {
+                self.sampled.insert(index, key);
+            }
+            self.is_sampled = true;
         }
         // Count forward from the nearest remembered row above `start`, if there is one.
-        let (after, skip) = match self.anchors.range(..start).next_back() {
-            Some((&index, &key)) => (Some(key), start - index - 1),
+        let (after, skip) = match self.nearest(start) {
+            Some((index, key)) => (Some(key), start - index - 1),
             None => (None, start),
         };
         let rows = store.thread_page_after(filter, after, skip, count)?;
-        if self.anchors.len() + 2 > MAX_ANCHORS {
-            self.anchors.clear();
+        if self.recent.len() + 2 > MAX_RECENT {
+            self.recent.clear();
         }
         if let (Some((first, _)), Some((last, _))) = (rows.first(), rows.last()) {
-            self.anchors.insert(start, *first);
-            self.anchors.insert(start + rows.len() - 1, *last);
+            self.recent.insert(start, *first);
+            self.recent.insert(start + rows.len() - 1, *last);
         }
         Ok(rows.into_iter().map(|(_, summary)| summary).collect())
+    }
+
+    /// The closest known row above `start`: the one with the largest index below it.
+    fn nearest(&self, start: usize) -> Option<(usize, ThreadKey)> {
+        let recent = self.recent.range(..start).next_back();
+        let sampled = self.sampled.range(..start).next_back();
+        match (recent, sampled) {
+            (Some((&a, &ka)), Some((&b, &kb))) => Some(if a >= b { (a, ka) } else { (b, kb) }),
+            (Some((&a, &ka)), None) => Some((a, ka)),
+            (None, Some((&b, &kb))) => Some((b, kb)),
+            (None, None) => None,
+        }
     }
 }
 
@@ -1374,46 +1465,27 @@ impl Store {
         const COLUMNS: &str = "t.thrid, t.count, t.unread, m.msgid, m.thrid, m.uid,
                                m.from_addr, m.subject, m.date, m.seen, m.sent, m.from_email,
                                t.attachments, m.received, t.newest_time";
-        let mut with = String::new();
-        let mut from = "FROM threads t";
-        let mut conditions = String::new();
-        let mut args: Vec<Value> = Vec::new();
-        match filter {
-            ThreadFilter::All => {}
-            ThreadFilter::Label(label) => {
-                conditions.push_str(
-                    " AND EXISTS (SELECT 1 FROM thread_labels tl
-                                  WHERE tl.label = ? AND tl.thrid = t.thrid)",
-                );
-                args.push(Value::Text(label.clone()));
-            }
-            ThreadFilter::Search(text) => {
-                let Some(query) = fts_query(text) else {
-                    return Ok(Vec::new());
-                };
-                with = "WITH hits AS (
-                            SELECT DISTINCT m.thrid FROM messages_fts
-                            JOIN messages m ON m.msgid = messages_fts.rowid
-                            WHERE messages_fts MATCH ? AND m.uid IS NOT NULL) "
-                    .to_string();
-                from = "FROM hits h JOIN threads t ON t.thrid = h.thrid";
-                args.push(Value::Text(query));
-            }
-        }
+        let Some(mut list) = ListSql::for_filter(filter) else {
+            return Ok(Vec::new());
+        };
         if let Some((newest, thrid)) = after {
-            conditions.push_str(" AND (t.newest_time, t.thrid) < (?, ?)");
-            args.push(Value::Integer(newest));
-            args.push(Value::Integer(thrid as i64));
+            list.conditions
+                .push_str(" AND (t.newest_time, t.thrid) < (?, ?)");
+            list.args.push(Value::Integer(newest));
+            list.args.push(Value::Integer(thrid as i64));
         }
         let sql = format!(
             "{with}SELECT {COLUMNS} {from}
              JOIN messages m ON m.msgid = t.head_msgid
              WHERE 1 = 1{conditions}
-             ORDER BY t.newest_time DESC, t.thrid DESC LIMIT ? OFFSET ?"
+             ORDER BY t.newest_time DESC, t.thrid DESC LIMIT ? OFFSET ?",
+            with = list.with,
+            from = list.from,
+            conditions = list.conditions,
         );
-        args.push(Value::Integer(limit as i64));
-        args.push(Value::Integer(skip as i64));
-        let rows = self.thread_rows(&sql, rusqlite::params_from_iter(args.iter()))?;
+        list.args.push(Value::Integer(limit as i64));
+        list.args.push(Value::Integer(skip as i64));
+        let rows = self.thread_rows(&sql, rusqlite::params_from_iter(list.args.iter()))?;
         let (mut keys, mut meta, mut heads) = (Vec::new(), Vec::new(), Vec::new());
         for (key, m, head) in rows {
             keys.push(key);
@@ -1438,6 +1510,38 @@ impl Store {
                 )
             })
             .collect())
+    }
+
+    /// The sort key of every `stride`-th thread in the list, starting with the first, paired
+    /// with its position. These are the rows a jump counts from.
+    pub fn thread_keys_every(
+        &self,
+        filter: &ThreadFilter,
+        stride: usize,
+    ) -> Result<Vec<(usize, ThreadKey)>> {
+        let Some(list) = ListSql::for_filter(filter) else {
+            return Ok(Vec::new());
+        };
+        let sql = format!(
+            "{with}SELECT t.newest_time, t.thrid {from}
+             JOIN messages m ON m.msgid = t.head_msgid
+             WHERE 1 = 1{conditions}
+             ORDER BY t.newest_time DESC, t.thrid DESC",
+            with = list.with,
+            from = list.from,
+            conditions = list.conditions,
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let keys = stmt.query_map(rusqlite::params_from_iter(list.args.iter()), |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as u64))
+        })?;
+        let mut out = Vec::new();
+        for (index, key) in keys.enumerate() {
+            if index % stride == 0 {
+                out.push((index, key?));
+            }
+        }
+        Ok(out)
     }
 
     /// Runs a thread-list query. Each row is the thread's summary and its newest message.
@@ -2090,6 +2194,20 @@ mod tests {
     }
 
     #[test]
+    fn sampled_keys_are_every_stride_th_row_of_the_list() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        let all: Vec<CachedMessage> = (1..=95u64).map(|i| msg(i, i as u32, &["Work"])).collect();
+        s.upsert_messages(&all).unwrap();
+        let rows = s.thread_page(&ThreadFilter::All, 0, 200).unwrap();
+        let sampled = s.thread_keys_every(&ThreadFilter::All, 10).unwrap();
+        let indices: Vec<usize> = sampled.iter().map(|(i, _)| *i).collect();
+        assert_eq!(indices, (0..95).step_by(10).collect::<Vec<_>>());
+        for (index, key) in sampled {
+            assert_eq!(key.1, rows[index].thrid, "row {index}");
+        }
+    }
+
+    #[test]
     fn cursor_pages_match_offset_pages_even_after_the_cache_changes() {
         let dir = std::env::temp_dir().join(format!("cursor-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2101,7 +2219,8 @@ mod tests {
             (1..=300u64).map(|i| msg(i, i as u32, &["Work"])).collect();
         writer.upsert_messages(&messages).unwrap();
         let reader = Store::open_reader(&path).unwrap();
-        let mut cursor = PageCursor::default();
+        // A stride of 7 samples the rows finely, so jumps in this test use the sample.
+        let mut cursor = PageCursor::new(7);
         let starts = [0, 40, 80, 120, 7, 250, 260, 299, 150, 151, 0, 3, 200];
         for filter in [ThreadFilter::All, ThreadFilter::Label("Work".into())] {
             let check = |cursor: &mut PageCursor| {
@@ -2146,7 +2265,7 @@ mod tests {
             s.upsert_messages(chunk).unwrap();
         }
         // Scrolling down in order, as the list does, with the cursor.
-        let mut cursor = PageCursor::default();
+        let mut cursor = PageCursor::new(SAMPLE_STRIDE);
         let mut slowest = std::time::Duration::ZERO;
         let mut total = std::time::Duration::ZERO;
         for start in (0..200_000).step_by(40) {
@@ -2157,15 +2276,12 @@ mod tests {
             slowest = slowest.max(took);
         }
         println!("scrolling 5000 pages with the cursor: slowest {slowest:?}, total {total:?}");
-        // A jump with nothing remembered near it counts from the top.
-        for start in [100_000usize, 190_000] {
+        // Jumps: the first samples the list, and later ones count from a sampled row.
+        let mut jumper = PageCursor::new(SAMPLE_STRIDE);
+        for start in [100_000usize, 190_000, 55_555, 190_123] {
             let t = std::time::Instant::now();
-            let page = s.thread_page(&ThreadFilter::All, start, 40).unwrap();
-            println!(
-                "jump to {start} without the cursor: {} rows in {:?}",
-                page.len(),
-                t.elapsed()
-            );
+            let page = jumper.page(&s, &ThreadFilter::All, start, 40).unwrap();
+            println!("jump to {start}: {} rows in {:?}", page.len(), t.elapsed());
         }
     }
 
