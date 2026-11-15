@@ -43,6 +43,21 @@ const HELP_TEXT: &str = include_str!("help.txt");
 
 /// How many of the largest messages the storage view lists.
 const STORAGE_ROWS: usize = 500;
+/// How long the search box must be still before a search is sent.
+const SEARCH_PAUSE: Duration = Duration::from_millis(250);
+
+/// How long to wait before sending a search. A search typed at `typed` waits for the pause to pass
+/// since then. `now_requested` skips the wait. Returns zero when the search can go now.
+fn search_wait(typed: Option<Instant>, now_requested: bool, now: Instant) -> Duration {
+    if now_requested {
+        return Duration::ZERO;
+    }
+    match typed {
+        Some(at) => SEARCH_PAUSE.saturating_sub(now.saturating_duration_since(at)),
+        None => Duration::ZERO,
+    }
+}
+
 /// How many messages a search lists.
 const SEARCH_ROWS: usize = 500;
 /// How many senders the sender statistics list.
@@ -479,6 +494,10 @@ struct App {
     search_results: Option<(search::Query, Arc<Vec<SearchRow>>)>,
     /// The search last sent to the cache, so each one is sent once.
     search_asked: Option<search::Query>,
+    /// When the search box last changed, so a search waits until typing pauses.
+    search_typed: Option<Instant>,
+    /// Set when Enter is pressed or focus leaves the box: the search is sent at once.
+    search_now: bool,
     /// Whether the sign-in is the automatic one at startup, so the window can say so.
     auto_signin: bool,
     /// Whether the window layout has changed since it was last saved.
@@ -614,6 +633,8 @@ impl App {
             label_cache: None,
             search_results: None,
             search_asked: None,
+            search_typed: None,
+            search_now: false,
             auto_signin: false,
             layout_dirty: false,
             layout_saved: Instant::now(),
@@ -1014,11 +1035,19 @@ impl App {
 
     /// Opens a conversation. Its messages are read from the cache, and their bodies follow.
     /// Sends the search box's query to the cache, once for each change to it.
-    fn refresh_search(&mut self) {
+    fn refresh_search(&mut self, ctx: &egui::Context) {
         let query = search::parse(&self.search).query;
         if query.is_empty() || self.search_asked.as_ref() == Some(&query) {
             return;
         }
+        let wait = search_wait(self.search_typed, self.search_now, Instant::now());
+        if !wait.is_zero() {
+            // Still typing: look again once the pause has passed.
+            ctx.request_repaint_after(wait);
+            return;
+        }
+        self.search_typed = None;
+        self.search_now = false;
         self.search_asked = Some(query.clone());
         self.send(Command::Search {
             query,
@@ -1782,10 +1811,14 @@ impl App {
                         .desired_width(f32::INFINITY),
                 );
                 if search.changed() {
+                    self.search_typed = Some(Instant::now());
+                    self.search_now = false;
                     self.change_list();
                 }
-                // Leaving the box, or pressing Enter in it, counts as running the search.
+                // Leaving the box, or pressing Enter in it, counts as running the search: it's
+                // sent at once, rather than after the pause.
                 if search.lost_focus() {
+                    self.search_now = true;
                     let text = self.search.clone();
                     self.settings.note_search(&text);
                     self.save_settings();
@@ -2899,7 +2932,7 @@ impl eframe::App for App {
         self.open_clicked_notifications(ui.ctx());
         self.remember_window_position(ui.ctx());
         self.refresh_storage(ui.ctx());
-        self.refresh_search();
+        self.refresh_search(ui.ctx());
 
         if !self.connected {
             egui::CentralPanel::default().show(ui, |ui| {
@@ -3072,6 +3105,20 @@ mod tests {
             Some("2011/Moving")
         );
         assert!(tree.children["Work"].children.is_empty());
+    }
+
+    #[test]
+    fn a_search_waits_for_the_pause_unless_asked_to_go_now() {
+        let now = Instant::now();
+        assert_eq!(search_wait(None, false, now), Duration::ZERO);
+        assert_eq!(search_wait(Some(now), true, now), Duration::ZERO);
+        let typing = search_wait(Some(now), false, now);
+        assert!(
+            typing > Duration::ZERO && typing <= SEARCH_PAUSE,
+            "{typing:?}"
+        );
+        let later = now + SEARCH_PAUSE;
+        assert_eq!(search_wait(Some(now), false, later), Duration::ZERO);
     }
 
     #[test]
