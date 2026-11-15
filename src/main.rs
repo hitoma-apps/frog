@@ -47,6 +47,8 @@ const STORAGE_ROWS: usize = 500;
 const SEARCH_ROWS: usize = 500;
 /// How many senders the sender statistics list.
 const SENDER_ROWS: usize = 500;
+/// How many threads the waiting-for-reply view lists.
+const WAITING_ROWS: usize = 500;
 
 fn main() -> eframe::Result {
     let creds = match (
@@ -462,6 +464,10 @@ struct App {
     storage_asked: Instant,
     /// Whether the sender statistics view is shown.
     senders_open: bool,
+    /// Whether the waiting-for-reply view is shown.
+    waiting_open: bool,
+    /// The threads waiting for a reply, once the view has asked for them.
+    waiting: Option<Arc<Vec<SearchRow>>>,
     /// The senders with the most cached messages, once the view has asked for them.
     senders: Option<Arc<Vec<gmail_imap_proto::store::SenderStat>>>,
     /// Threads whose notifications were clicked, sent from the notification threads.
@@ -601,6 +607,8 @@ impl App {
             storage_asked: Instant::now(),
             senders_open: false,
             senders: None,
+            waiting_open: false,
+            waiting: None,
             click_tx,
             click_rx,
             label_cache: None,
@@ -839,6 +847,24 @@ impl App {
             }
             Event::Largest(view) => self.storage = Some(Arc::new(view)),
             Event::Senders(list) => self.senders = Some(Arc::new(list)),
+            Event::Waiting(threads) => {
+                let rows: Vec<SearchRow> = threads
+                    .into_iter()
+                    .filter_map(|(c, count)| {
+                        let thrid = c.thrid;
+                        let unread = !c.seen;
+                        let attachments = c.attachment.unwrap_or(false);
+                        Message::from_cached(c).map(|head| SearchRow {
+                            head,
+                            thrid,
+                            count,
+                            unread,
+                            attachments,
+                        })
+                    })
+                    .collect();
+                self.waiting = Some(Arc::new(rows));
+            }
             Event::Search { query, hits } => {
                 let rows: Vec<SearchRow> = hits
                     .into_iter()
@@ -849,6 +875,7 @@ impl App {
                         Message::from_cached(c).map(|head| SearchRow {
                             head,
                             thrid,
+                            count: 1,
                             unread,
                             attachments,
                         })
@@ -919,6 +946,7 @@ impl App {
     fn change_list(&mut self) {
         self.storage_open = false;
         self.senders_open = false;
+        self.waiting_open = false;
         self.search_asked = None;
         self.window_filter = None;
         self.window_rows.clear();
@@ -1039,7 +1067,7 @@ impl App {
                     let view = RowView {
                         head: &row.head,
                         thrid: row.thrid,
-                        count: 1,
+                        count: row.count,
                         unread: row.unread,
                         attachments: row.attachments,
                         filter_label: None,
@@ -1080,6 +1108,82 @@ impl App {
     }
 
     /// Opens the storage view: the largest cached messages, biggest first.
+    /// Opens the threads waiting for a reply: those whose newest message is yours.
+    fn open_waiting(&mut self) {
+        self.search.clear();
+        self.change_list();
+        self.waiting_open = true;
+        if let Some(account) = self.account.clone() {
+            self.send(Command::Waiting {
+                account,
+                limit: WAITING_ROWS,
+            });
+        }
+    }
+
+    /// The threads waiting for a reply, drawn like the thread list. Clicking a title opens it.
+    fn waiting_list(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Waiting for Reply");
+            if ui.button("Refresh").clicked() {
+                self.open_waiting();
+            }
+        });
+        ui.weak("Threads whose newest cached message is yours, so no one has answered yet.");
+        let Some(rows) = self.waiting.clone() else {
+            ui.weak("Looking…");
+            return;
+        };
+        ui.separator();
+        let row_height = ui.spacing().interact_size.y;
+        let mut opened: Option<u64> = None;
+        let mut clicked_label: Option<String> = None;
+        egui::ScrollArea::vertical()
+            .id_salt("waiting")
+            .auto_shrink([false, false])
+            .show_rows(ui, row_height, rows.len(), |ui, range| {
+                for row in &rows[range] {
+                    let band = if self.open_thread == Some(row.thrid) {
+                        ui.visuals().selection.bg_fill
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    };
+                    let highlight = ui.painter().add(egui::Shape::Noop);
+                    let view = RowView {
+                        head: &row.head,
+                        thrid: row.thrid,
+                        count: row.count,
+                        unread: row.unread,
+                        attachments: row.attachments,
+                        filter_label: None,
+                        row_height,
+                    };
+                    let action = draw_thread_row(ui, &view, self.checked.contains(&row.thrid));
+                    if let Some(state) = action.checked {
+                        if state {
+                            self.checked.insert(row.thrid);
+                        } else {
+                            self.checked.remove(&row.thrid);
+                        }
+                    }
+                    if action.opened {
+                        opened = Some(row.thrid);
+                    }
+                    if let Some(label) = action.label {
+                        clicked_label = Some(label);
+                    }
+                    ui.painter()
+                        .set(highlight, egui::Shape::rect_filled(action.rect, 4.0, band));
+                }
+            });
+        if let Some(thrid) = opened {
+            self.open_conversation(thrid);
+        }
+        if let Some(label) = clicked_label {
+            self.set_label_filter(Some(label));
+        }
+    }
+
     /// Opens the sender statistics: the senders with the most cached messages.
     fn open_senders(&mut self) {
         self.search.clear();
@@ -1570,6 +1674,7 @@ impl App {
         let selected = self.search.trim().is_empty()
             && !self.storage_open
             && !self.senders_open
+            && !self.waiting_open
             && self.filter.as_deref() == key;
         let mut toggle = false;
         ui.horizontal(|ui| {
@@ -1730,6 +1835,13 @@ impl App {
                     .clicked()
                 {
                     self.open_senders();
+                }
+                let waiting_open = self.waiting_open && self.search.trim().is_empty();
+                if ui
+                    .selectable_label(waiting_open, "Waiting for Reply")
+                    .clicked()
+                {
+                    self.open_waiting();
                 }
 
                 let active = self.search.trim().to_string();
@@ -2586,6 +2698,8 @@ impl App {
 struct SearchRow {
     head: Message,
     thrid: u64,
+    /// Messages in the thread, shown in the title.
+    count: usize,
     unread: bool,
     attachments: bool,
 }
@@ -2860,6 +2974,8 @@ impl eframe::App for App {
                         self.storage_list(ui);
                     } else if self.senders_open {
                         self.senders_list(ui);
+                    } else if self.waiting_open {
+                        self.waiting_list(ui);
                     } else {
                         self.message_list(ui);
                     }

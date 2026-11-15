@@ -74,6 +74,8 @@ pub enum Command {
     Largest { limit: usize },
     /// Counts the cached messages each sender sent, most first.
     Senders { limit: usize },
+    /// Threads whose newest cached message is from `account`.
+    Waiting { account: String, limit: usize },
     /// Searches the cached messages for a query.
     Search {
         query: gmail_imap_proto::search::Query,
@@ -149,6 +151,8 @@ pub enum Event {
     Largest(gmail_imap_proto::store::StorageView),
     /// The senders with the most cached messages.
     Senders(Vec<gmail_imap_proto::store::SenderStat>),
+    /// Threads waiting for a reply, with each thread's message count.
+    Waiting(Vec<(gmail_imap_proto::store::CachedMessage, usize)>),
     /// The messages matching a search. `query` says which search this answers.
     Search {
         query: gmail_imap_proto::search::Query,
@@ -566,6 +570,7 @@ impl Worker {
             | Command::ThreadRange { .. }
             | Command::Largest { .. }
             | Command::Senders { .. }
+            | Command::Waiting { .. }
             | Command::Search { .. } => Ok(()),
         }
     }
@@ -1351,6 +1356,7 @@ fn answer_read(
         Command::Thread { thrid } => read_thread(store, emit, *thrid),
         Command::Largest { limit } => read_largest(store, emit, *limit),
         Command::Senders { limit } => read_senders(store, emit, *limit),
+        Command::Waiting { account, limit } => read_waiting(store, emit, account, *limit),
         Command::Search { query, limit } => read_search(store, emit, query, *limit),
         Command::ThreadRange {
             filter,
@@ -1371,8 +1377,21 @@ pub fn is_cache_read(cmd: &Command) -> bool {
             | Command::ThreadRange { .. }
             | Command::Largest { .. }
             | Command::Senders { .. }
+            | Command::Waiting { .. }
             | Command::Search { .. }
     )
+}
+
+/// Answers the waiting-for-reply view.
+fn read_waiting(store: Option<&Store>, emit: &Emitter, account: &str, limit: usize) {
+    let threads = match store {
+        Some(store) => store.waiting_for_reply(account, limit),
+        None => Ok(Vec::new()),
+    };
+    match threads {
+        Ok(threads) => emit.send(Event::Waiting(threads)),
+        Err(e) => emit.send(Event::Error(format!("cache read failed: {e}"))),
+    }
 }
 
 /// Answers the sender statistics with the senders who have the most cached messages.
@@ -2257,6 +2276,7 @@ mod sync_tests {
             Event::Window { .. } => "Window",
             Event::Largest(_) => "Largest",
             Event::Senders(_) => "Senders",
+            Event::Waiting(_) => "Waiting",
             Event::Search { .. } => "Search",
             Event::ThreadRange { .. } => "ThreadRange",
             Event::Thread { .. } => "Thread",

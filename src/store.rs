@@ -1877,6 +1877,52 @@ impl Store {
         Ok(hits)
     }
 
+    /// Threads whose newest cached message is from `account`, so no one has answered it, newest
+    /// first, with each thread's message count. Drafts don't count.
+    pub fn waiting_for_reply(
+        &self,
+        account: &str,
+        limit: usize,
+    ) -> Result<Vec<(CachedMessage, usize)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.uid, m.msgid, m.thrid, m.from_addr, m.subject, m.date, m.seen,
+                    m.sent, m.from_email, m.attachment, m.received, t.count
+             FROM threads t
+             JOIN messages m ON m.msgid = t.head_msgid
+             WHERE m.from_email = ?1
+               AND NOT EXISTS (SELECT 1 FROM message_labels l
+                               WHERE l.msgid = m.msgid AND l.label = '\\Draft')
+             ORDER BY COALESCE(m.received, m.sent) DESC, t.thrid DESC
+             LIMIT ?2",
+        )?;
+        let mut rows: Vec<(CachedMessage, usize)> = stmt
+            .query_map(params![account.to_ascii_lowercase(), limit as i64], |r| {
+                let message = CachedMessage {
+                    uid: r.get(0)?,
+                    msgid: r.get::<_, i64>(1)? as u64,
+                    thrid: r.get::<_, i64>(2)? as u64,
+                    labels: BTreeSet::new(),
+                    from: r.get(3)?,
+                    from_email: r.get(8)?,
+                    attachment: r.get(9)?,
+                    received: r.get(10)?,
+                    subject: r.get(4)?,
+                    date: r.get(5)?,
+                    headers: Vec::new(),
+                    seen: r.get(6)?,
+                    sent: r.get(7)?,
+                };
+                Ok((message, r.get::<_, i64>(11)? as usize))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut heads: Vec<CachedMessage> = rows.iter().map(|(m, _)| m.clone()).collect();
+        self.attach_labels(&mut heads)?;
+        for ((row, _), head) in rows.iter_mut().zip(heads) {
+            row.labels = head.labels;
+        }
+        Ok(rows)
+    }
+
     /// The senders with the most cached messages, most first, at most `limit` of them.
     pub fn frequent_senders(&self, limit: usize) -> Result<Vec<SenderStat>> {
         let mut stmt = self.conn.prepare(
@@ -2272,6 +2318,28 @@ mod tests {
         assert_eq!(found("from:bob@example.com"), 1);
         assert_eq!(found("from:smith"), 1);
         assert_eq!(found("from:carol"), 0);
+    }
+
+    #[test]
+    fn waiting_for_reply_lists_threads_whose_newest_message_is_mine() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        let mut a1 = msg(1, 1, &["Work"]);
+        a1.from_email = "bob@example.com".into();
+        a1.thrid = 500;
+        let mut a2 = msg(2, 2, &["Work"]);
+        a2.from_email = "me@example.com".into();
+        a2.thrid = 500;
+        let mut b1 = msg(3, 3, &["Work"]);
+        b1.from_email = "me@example.com".into();
+        b1.thrid = 600;
+        let mut b2 = msg(4, 4, &["Work"]);
+        b2.from_email = "bob@example.com".into();
+        b2.thrid = 600;
+        s.upsert_messages(&[a1, a2, b1, b2]).unwrap();
+        let rows = s.waiting_for_reply("ME@example.com", 10).unwrap();
+        let thrids: Vec<u64> = rows.iter().map(|(m, _)| m.thrid).collect();
+        assert_eq!(thrids, vec![500]);
+        assert_eq!(rows[0].1, 2);
     }
 
     #[test]
