@@ -215,6 +215,22 @@ fn human_size(bytes: usize) -> String {
     }
 }
 
+/// The paths of a label's parents, outermost first, as the label tree names them: `Work/Projects/Q1`
+/// has `Work` and `Work/Projects`. A label with no parent has none.
+fn ancestor_paths(label: &str) -> Vec<String> {
+    let segments: Vec<&str> = label.split('/').collect();
+    let mut out = Vec::new();
+    let mut path = String::new();
+    for segment in &segments[..segments.len().saturating_sub(1)] {
+        if !path.is_empty() {
+            path.push('/');
+        }
+        path.push_str(segment);
+        out.push(path.clone());
+    }
+    out
+}
+
 /// Mailboxes always shown in the sidebar, even when the cache has none of their
 /// messages. `None` is All Mail, which is every message.
 const MAILBOXES: [(&str, Option<&str>); 8] = [
@@ -1073,6 +1089,10 @@ impl App {
 
     /// Shows the threads with one label, or All Mail for `None`. Clears the search.
     fn set_label_filter(&mut self, key: Option<String>) {
+        // Open the label's parents, so its row is visible in the sidebar.
+        if let Some(label) = &key {
+            self.label_open.extend(ancestor_paths(label));
+        }
         self.filter = key;
         self.search.clear();
         self.change_list();
@@ -3555,6 +3575,16 @@ mod tests {
         let full = full_date(ts);
         assert!(full.starts_with("2026-11-14T15:00:00"), "{full}");
         assert!(full.ends_with(" (Saturday)"), "{full}");
+    }
+
+    #[test]
+    fn a_label_selects_with_its_parents_open() {
+        assert_eq!(
+            ancestor_paths("Work/Projects/Q1"),
+            vec!["Work", "Work/Projects"]
+        );
+        assert_eq!(ancestor_paths("Inbox"), Vec::<String>::new());
+        assert_eq!(ancestor_paths("Work/"), vec!["Work"]);
     }
 
     #[test]
