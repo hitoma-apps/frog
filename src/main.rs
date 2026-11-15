@@ -36,6 +36,9 @@ use gmail_imap_proto::store::{StorageView, ThreadFilter};
 use reader::{Block, Segment};
 use worker::{Command, Event, Link, ThreadEntry};
 
+/// The help window's text. Plain text: `== Heading ==` lines, `- ` bullets and paragraphs.
+const HELP_TEXT: &str = include_str!("help.txt");
+
 /// How many of the largest messages the storage view lists.
 const STORAGE_ROWS: usize = 500;
 
@@ -394,6 +397,8 @@ struct App {
     settings_open: bool,
     /// The IMAP command log is open in its own window.
     log_open: bool,
+    /// The help window is open.
+    help_open: bool,
     /// The largest cached messages, once the storage view has asked for them.
     storage: Option<Arc<StorageView>>,
     /// Whether the list shows the storage view instead of threads.
@@ -523,6 +528,7 @@ impl App {
             settings_path,
             settings_open: false,
             log_open: false,
+            help_open: false,
             account: None,
             credentials: None,
             storage: None,
@@ -1290,6 +1296,9 @@ impl App {
                 }
                 if ui.button("Log").clicked() {
                     self.log_open = !self.log_open;
+                }
+                if ui.button("Help").clicked() {
+                    self.help_open = true;
                 }
             });
         });
@@ -2319,6 +2328,43 @@ impl App {
         }
     }
 
+    /// Help, from `help.txt`: a title, then `== Headings ==`, `- ` bullets and plain paragraphs.
+    fn help_window(&mut self, ctx: &egui::Context) {
+        if !self.help_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Help")
+            .default_size([520.0, 440.0])
+            .resizable(true)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("help")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for line in HELP_TEXT.lines() {
+                            if let Some(heading) = line
+                                .strip_prefix("== ")
+                                .and_then(|rest| rest.strip_suffix(" =="))
+                            {
+                                ui.add_space(8.0);
+                                ui.strong(heading);
+                            } else if let Some(item) = line.strip_prefix("- ") {
+                                ui.label(format!("\u{2022} {item}"));
+                            } else if line.is_empty() {
+                                ui.add_space(4.0);
+                            } else {
+                                ui.label(line);
+                            }
+                        }
+                    });
+            });
+        if !open {
+            self.help_open = false;
+        }
+    }
+
     /// The IMAP commands sent this session, in their own window.
     fn log_window(&mut self, ctx: &egui::Context) {
         if !self.log_open {
@@ -2467,6 +2513,7 @@ impl eframe::App for App {
         self.settings_window(&ctx);
         self.original_window(&ctx);
         self.log_window(&ctx);
+        self.help_window(&ctx);
     }
 }
 

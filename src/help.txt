@@ -1,0 +1,21 @@
+Gmail Labels Prototype: help
+
+== Search operators ==
+
+There are none yet. Type words in the search box, then press Enter or click elsewhere to run the search.
+
+- Every word must match, so "invoice march" finds mail with both words.
+- A word matches the start of a word in the sender or the subject.
+- Searches cover the sender and subject only, not message bodies.
+- Operators such as "from:" are not supported yet. They're planned in issue 51.
+
+== Saved and recent searches ==
+
+- "Save search" in the toolbar keeps the current search under Searches in the sidebar. Up to 10 are kept.
+- "Most recent" under Searches lists the last five searches, saved or not.
+
+== Saving mail ==
+
+- "Save .eml" in the reader writes each message of the conversation as its own file.
+- "Save text" writes the whole conversation as one text file.
+- Files go to your Downloads folder. The status bar shows where they went.
