@@ -275,20 +275,6 @@ pub struct LargeMessage {
     pub attachment: bool,
 }
 
-/// A cached message that matches a search.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SearchHit {
-    pub uid: u32,
-    pub msgid: u64,
-    pub thrid: u64,
-    pub from: String,
-    pub subject: String,
-    /// Received time, or sent time when the received time is unknown.
-    pub when: i64,
-    pub seen: bool,
-    pub attachment: bool,
-}
-
 /// The storage view: the largest cached messages, and how many messages have a known size.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StorageView {
@@ -1765,14 +1751,14 @@ impl Store {
 
     /// The cached messages that match a search, newest first, at most `limit` of them. Every
     /// part of the query must hold for the same message.
-    pub fn search_messages(&self, query: &Query, limit: usize) -> Result<Vec<SearchHit>> {
+    pub fn search_messages(&self, query: &Query, limit: usize) -> Result<Vec<CachedMessage>> {
         use rusqlite::types::Value;
         if query.is_empty() {
             return Ok(Vec::new());
         }
         let mut sql = String::from(
-            "SELECT m.uid, m.msgid, m.thrid, m.from_addr, m.subject,
-                    COALESCE(m.received, m.sent), m.seen, m.attachment
+            "SELECT m.uid, m.msgid, m.thrid, m.from_addr, m.subject, m.date, m.seen,
+                    m.sent, m.from_email, m.attachment, m.received
              FROM messages m WHERE m.uid IS NOT NULL",
         );
         let mut args: Vec<Value> = Vec::new();
@@ -1817,21 +1803,28 @@ impl Store {
         sql.push_str(" ORDER BY COALESCE(m.received, m.sent) DESC, m.uid DESC LIMIT ?");
         args.push(Value::Integer(limit as i64));
 
-        let mut stmt = self.conn.prepare(&sql)?;
-        let hits = stmt
-            .query_map(rusqlite::params_from_iter(args.iter()), |r| {
-                Ok(SearchHit {
+        let mut hits = {
+            let mut stmt = self.conn.prepare(&sql)?;
+            stmt.query_map(rusqlite::params_from_iter(args.iter()), |r| {
+                Ok(CachedMessage {
                     uid: r.get(0)?,
                     msgid: r.get::<_, i64>(1)? as u64,
                     thrid: r.get::<_, i64>(2)? as u64,
+                    labels: BTreeSet::new(),
                     from: r.get(3)?,
+                    from_email: r.get(8)?,
+                    attachment: r.get(9)?,
+                    received: r.get(10)?,
                     subject: r.get(4)?,
-                    when: r.get(5)?,
+                    date: r.get(5)?,
+                    headers: Vec::new(),
                     seen: r.get(6)?,
-                    attachment: r.get::<_, Option<bool>>(7)?.unwrap_or(false),
+                    sent: r.get(7)?,
                 })
             })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        self.attach_labels(&mut hits)?;
         Ok(hits)
     }
 
@@ -2156,7 +2149,7 @@ mod tests {
             s.search_messages(&parse(text).query, 100)
                 .unwrap()
                 .iter()
-                .map(|h| h.uid)
+                .map(|h| h.uid.unwrap())
                 .collect()
         };
         assert_eq!(uids(&s, "hello"), vec![3, 1, 2]);
@@ -2186,7 +2179,7 @@ mod tests {
             s.search_messages(&parse(text).query, 100)
                 .unwrap()
                 .iter()
-                .map(|h| h.uid)
+                .map(|h| h.uid.unwrap())
                 .collect()
         };
         assert_eq!(uids("after:2026-11-01"), vec![1]);

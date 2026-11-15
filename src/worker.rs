@@ -148,7 +148,7 @@ pub enum Event {
     /// The messages matching a search. `query` says which search this answers.
     Search {
         query: gmail_imap_proto::search::Query,
-        hits: Vec<gmail_imap_proto::store::SearchHit>,
+        hits: Vec<gmail_imap_proto::store::CachedMessage>,
     },
     /// Every cached message of one thread, newest first.
     Thread {

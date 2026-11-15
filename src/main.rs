@@ -31,7 +31,6 @@ use gmail_imap_proto::links::gmail_thread_url;
 use gmail_imap_proto::render_plaintext;
 use gmail_imap_proto::search;
 use gmail_imap_proto::settings::{self, CHECK_INTERVAL_RANGE, PAGE_SIZE_RANGE, Settings};
-use gmail_imap_proto::store::SearchHit;
 
 use backend::Message;
 use gmail_imap_proto::store::{StorageView, ThreadFilter};
@@ -421,7 +420,7 @@ struct App {
     /// The sidebar's labels, built from the counts. `None` until they're needed again.
     label_cache: Option<LabelCache>,
     /// The last search the cache answered, and the messages it found.
-    search_results: Option<(search::Query, Arc<Vec<SearchHit>>)>,
+    search_results: Option<(search::Query, Arc<Vec<SearchRow>>)>,
     /// The search last sent to the cache, so each one is sent once.
     search_asked: Option<search::Query>,
     /// Whether the sign-in is the automatic one at startup, so the window can say so.
@@ -788,7 +787,21 @@ impl App {
             }
             Event::Largest(view) => self.storage = Some(Arc::new(view)),
             Event::Search { query, hits } => {
-                self.search_results = Some((query, Arc::new(hits)));
+                let rows: Vec<SearchRow> = hits
+                    .into_iter()
+                    .filter_map(|c| {
+                        let thrid = c.thrid;
+                        let unread = !c.seen;
+                        let attachments = c.attachment.unwrap_or(false);
+                        Message::from_cached(c).map(|head| SearchRow {
+                            head,
+                            thrid,
+                            unread,
+                            attachments,
+                        })
+                    })
+                    .collect();
+                self.search_results = Some((query, Arc::new(rows)));
             }
             Event::Window {
                 filter,
@@ -931,8 +944,8 @@ impl App {
         });
     }
 
-    /// The search results: one row per matching message, newest first. A row opens its
-    /// conversation in the reader.
+    /// The search results: one row per matching message, newest first, drawn like the thread
+    /// list. Clicking a title opens its conversation.
     fn search_list(&mut self, ui: &mut egui::Ui) {
         let parsed = search::parse(&self.search);
         ui.heading(format!("Search: {}", self.search.trim()));
@@ -944,7 +957,7 @@ impl App {
             return;
         }
         let results = match &self.search_results {
-            Some((query, hits)) if *query == parsed.query => Arc::clone(hits),
+            Some((query, rows)) if *query == parsed.query => Arc::clone(rows),
             _ => {
                 ui.weak("Searching…");
                 return;
@@ -955,35 +968,53 @@ impl App {
             results.len()
         ));
         ui.separator();
-        let row_height = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
+        let row_height = ui.spacing().interact_size.y;
+        let mut opened: Option<u64> = None;
+        let mut clicked_label: Option<String> = None;
         egui::ScrollArea::vertical()
             .id_salt("search")
             .auto_shrink([false, false])
             .show_rows(ui, row_height, results.len(), |ui, range| {
-                for hit in &results[range] {
-                    ui.horizontal(|ui| {
-                        ui.weak(format_time(hit.when));
-                        let subject = if hit.subject.is_empty() {
-                            "(no subject)"
+                for row in &results[range] {
+                    let band = if self.open_thread == Some(row.thrid) {
+                        ui.visuals().selection.bg_fill
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    };
+                    let highlight = ui.painter().add(egui::Shape::Noop);
+                    let view = RowView {
+                        head: &row.head,
+                        thrid: row.thrid,
+                        count: 1,
+                        unread: row.unread,
+                        attachments: row.attachments,
+                        filter_label: None,
+                        row_height,
+                    };
+                    let action = draw_thread_row(ui, &view, self.checked.contains(&row.thrid));
+                    if let Some(state) = action.checked {
+                        if state {
+                            self.checked.insert(row.thrid);
                         } else {
-                            hit.subject.as_str()
-                        };
-                        if ui
-                            .selectable_label(false, format!("{} — {}", hit.from, subject))
-                            .on_hover_text("Open this conversation")
-                            .clicked()
-                        {
-                            self.open_conversation(hit.thrid);
+                            self.checked.remove(&row.thrid);
                         }
-                        if !hit.seen {
-                            ui.strong("unread");
-                        }
-                        if hit.attachment {
-                            ui.weak("attachment");
-                        }
-                    });
+                    }
+                    if action.opened {
+                        opened = Some(row.thrid);
+                    }
+                    if let Some(label) = action.label {
+                        clicked_label = Some(label);
+                    }
+                    ui.painter()
+                        .set(highlight, egui::Shape::rect_filled(action.rect, 4.0, band));
                 }
             });
+        if let Some(thrid) = opened {
+            self.open_conversation(thrid);
+        }
+        if let Some(label) = clicked_label {
+            self.set_label_filter(Some(label));
+        }
     }
 
     /// Opens the thread of each notification the user clicked, and brings the window forward.
@@ -1424,7 +1455,8 @@ impl App {
         count: (usize, usize),
     ) {
         let is_fav = key.is_some_and(|k| self.settings.favorite_labels.iter().any(|f| f == k));
-        let selected = self.filter.as_deref() == key;
+        // While a search is typed, the search is the view, so no label is shown as selected.
+        let selected = self.search.trim().is_empty() && self.filter.as_deref() == key;
         let mut toggle = false;
         ui.horizontal(|ui| {
             // Truncate to the space the sidebar has, so a long name can't stop it shrinking.
@@ -1524,6 +1556,35 @@ impl App {
             .id_salt("sidebar")
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                ui.heading("Search");
+                let search = ui.add(
+                    egui::TextEdit::singleline(&mut self.search)
+                        .hint_text("Search mail")
+                        .desired_width(f32::INFINITY),
+                );
+                if search.changed() {
+                    self.change_list();
+                }
+                // Leaving the box, or pressing Enter in it, counts as running the search.
+                if search.lost_focus() {
+                    let text = self.search.clone();
+                    self.settings.note_search(&text);
+                    self.save_settings();
+                }
+                let text = self.search.trim().to_string();
+                let saveable = !text.is_empty()
+                    && !self.settings.saved_searches.contains(&text)
+                    && self.settings.saved_searches.len() < settings::MAX_SAVED_SEARCHES;
+                let save = ui
+                    .add_enabled(saveable, egui::Button::new("Save search"))
+                    .on_disabled_hover_text(
+                        "Type a search that isn't saved yet. Up to 10 are kept.",
+                    );
+                if save.clicked() && self.settings.save_search(&text) {
+                    self.save_settings();
+                }
+                ui.separator();
+
                 let favorites = self.settings.favorite_labels.clone();
                 if !favorites.is_empty() {
                     ui.heading("Favorites");
@@ -1548,12 +1609,15 @@ impl App {
 
                 let active = self.search.trim().to_string();
                 let recent = self.settings.recent_searches.clone();
-                if !self.settings.saved_searches.is_empty()
-                    || !active.is_empty()
-                    || !recent.is_empty()
                 {
                     ui.separator();
                     ui.heading("Searches");
+                    if self.settings.saved_searches.is_empty()
+                        && active.is_empty()
+                        && recent.is_empty()
+                    {
+                        ui.weak("Saved and recent searches appear here.");
+                    }
                     let searches = self.settings.saved_searches.clone();
                     let mut remove: Option<usize> = None;
                     for (i, text) in searches.iter().enumerate() {
@@ -1698,31 +1762,6 @@ impl App {
                 self.apply_read_state(false);
             }
             ui.separator();
-            let search = ui.add(
-                egui::TextEdit::singleline(&mut self.search)
-                    .hint_text("Search mail")
-                    .desired_width(180.0),
-            );
-            if search.changed() {
-                self.change_list();
-            }
-            // Leaving the box, or pressing Enter in it, counts as running the search.
-            if search.lost_focus() {
-                let text = self.search.clone();
-                self.settings.note_search(&text);
-                self.save_settings();
-            }
-            let text = self.search.trim().to_string();
-            let saveable = !text.is_empty()
-                && !self.settings.saved_searches.contains(&text)
-                && self.settings.saved_searches.len() < settings::MAX_SAVED_SEARCHES;
-            let save = ui
-                .add_enabled(saveable, egui::Button::new("Save search"))
-                .on_disabled_hover_text("Type a search that isn't saved yet. Up to 10 are kept.");
-            if save.clicked() && self.settings.save_search(&text) {
-                self.save_settings();
-            }
-            ui.separator();
             ui.add(
                 egui::TextEdit::singleline(&mut self.label_input)
                     .hint_text("label name")
@@ -1821,124 +1860,34 @@ impl App {
                         egui::Color32::TRANSPARENT
                     };
                     let highlight = ui.painter().add(egui::Shape::Noop);
-                    let row = ui.horizontal(|ui| {
-                        // The gap between items is set here, and the widths below assume it.
-                        ui.spacing_mut().item_spacing.x = ROW_GAP;
-                        // Leave room for the scrollbar, which can sit over the right edge.
-                        let pane_w = ui.available_width() - ui.spacing().scroll.allocated_width();
-                        let mut checked = self.checked.contains(&thrid);
-                        let box_changed = ui
-                            .add_sized(
-                                [CHECK_WIDTH, row_height],
-                                egui::Checkbox::without_text(&mut checked),
-                            )
-                            .changed();
-                        if box_changed {
-                            if checked {
-                                self.checked.insert(thrid);
-                            } else {
-                                self.checked.remove(&thrid);
-                            }
-                            let shift = ui.input(|input| input.modifiers.shift);
-                            box_clicks.push((i, checked, shift));
+                    let view = RowView {
+                        head: m,
+                        thrid,
+                        count,
+                        unread,
+                        attachments: entry.attachments,
+                        filter_label: filter_label.as_deref(),
+                        row_height,
+                    };
+                    let action = draw_thread_row(ui, &view, self.checked.contains(&thrid));
+                    if let Some(state) = action.checked {
+                        if state {
+                            self.checked.insert(thrid);
+                        } else {
+                            self.checked.remove(&thrid);
                         }
-                        // Every item has a fixed width, so the row can't grow frame to frame.
-                        // The date is the fixed column on the right. The subject takes the rest.
-                        let title_text = row_title(m, count, unread);
-                        let chips = row_chips(m, filter_label.as_deref());
-                        let (shown, hidden) = chips.split_at(chips.len().min(MAX_CHIPS));
-                        // (raw label to filter by, shown text, tooltip). The "+N" chip has no label.
-                        let mut tags: Vec<(Option<String>, String, String)> = shown
-                            .iter()
-                            .map(|raw| (Some(raw.clone()), display_label(raw), display_label(raw)))
-                            .collect();
-                        if !hidden.is_empty() {
-                            let names: Vec<String> =
-                                hidden.iter().map(|r| display_label(r)).collect();
-                            tags.push((None, format!("+{}", hidden.len()), names.join("\n")));
-                        }
-                        let font = egui::TextStyle::Small.resolve(ui.style());
-                        let widths: Vec<f32> = tags
-                            .iter()
-                            .map(|(_, t, _)| chip_width(ui, t, &font))
-                            .collect();
-                        // Gaps: subject to first chip, between chips, last chip to date.
-                        // Items in order: checkbox, subject, attachment, chips, date. That's
-                        // one gap between each pair.
-                        let gaps = (tags.len() as f32 + 3.0) * ROW_GAP;
-                        let title_w = (pane_w
-                            - CHECK_WIDTH
-                            - DATE_WIDTH
-                            - ATTACH_WIDTH
-                            - widths.iter().sum::<f32>()
-                            - gaps)
-                            .max(40.0);
-
-                        let title = egui::Frame::new()
-                            .fill(egui::Color32::TRANSPARENT)
-                            .corner_radius(4)
-                            .show(ui, |ui| {
-                                ui.set_min_size(egui::vec2(title_w, row_height));
-                                ui.set_max_width(title_w);
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 4.0;
-                                    if unread {
-                                        // Bold isn't available in this font, so unread gets a dot.
-                                        let (dot, _) = ui.allocate_exact_size(
-                                            egui::vec2(8.0, row_height),
-                                            egui::Sense::hover(),
-                                        );
-                                        ui.painter().circle_filled(
-                                            dot.center(),
-                                            3.5,
-                                            ui.visuals().strong_text_color(),
-                                        );
-                                    }
-                                    ui.add(
-                                        egui::Label::new(title_text)
-                                            .truncate()
-                                            .sense(egui::Sense::click()),
-                                    )
-                                })
-                                .inner
-                            })
-                            .inner;
-                        if title
-                            .on_hover_text(format!("{}\nthread {thrid}", sender_line(m)))
-                            .clicked()
-                        {
-                            opened = Some(thrid);
-                        }
-
-                        // The attachment column: a paperclip for a thread with an attachment.
-                        let (clip_rect, clip) = ui.allocate_exact_size(
-                            egui::vec2(ATTACH_WIDTH, row_height),
-                            egui::Sense::hover(),
-                        );
-                        if entry.attachments {
-                            paint_paperclip(ui, clip_rect);
-                            clip.on_hover_text("Has attachments");
-                        }
-
-                        for ((raw, text, tip), w) in tags.iter().zip(&widths) {
-                            let (rect, resp) = ui.allocate_exact_size(
-                                egui::vec2(*w, row_height),
-                                egui::Sense::click(),
-                            );
-                            paint_chip(ui, rect, text, &font);
-                            if resp.on_hover_text(tip).clicked()
-                                && let Some(label) = raw
-                            {
-                                clicked_label = Some(label.clone());
-                            }
-                        }
-
-                        let date = egui::RichText::new(format_time(m.when())).weak();
-                        ui.add_sized([DATE_WIDTH, row_height], egui::Label::new(date).truncate());
-                    });
+                        let shift = ui.input(|input| input.modifiers.shift);
+                        box_clicks.push((i, state, shift));
+                    }
+                    if action.opened {
+                        opened = Some(thrid);
+                    }
+                    if let Some(label) = action.label {
+                        clicked_label = Some(label);
+                    }
                     ui.painter().set(
                         highlight,
-                        egui::Shape::rect_filled(row.response.rect, 4.0, row_band),
+                        egui::Shape::rect_filled(action.rect, 4.0, row_band),
                     );
                 }
             });
@@ -2496,6 +2445,151 @@ impl App {
             self.log_open = false;
         }
     }
+}
+
+/// The search results: one row of a message, as the list and the search results both draw it.
+struct SearchRow {
+    head: Message,
+    thrid: u64,
+    unread: bool,
+    attachments: bool,
+}
+
+/// One row of a thread list.
+struct RowView<'a> {
+    head: &'a Message,
+    thrid: u64,
+    count: usize,
+    unread: bool,
+    attachments: bool,
+    /// The label the list is filtered by. Its chip isn't shown.
+    filter_label: Option<&'a str>,
+    row_height: f32,
+}
+
+/// What a row did this frame.
+struct RowAction {
+    /// The checkbox was clicked, and is now in this state.
+    checked: Option<bool>,
+    /// The title was clicked: open the thread.
+    opened: bool,
+    /// A label chip was clicked: show that label.
+    label: Option<String>,
+    /// Where the row was drawn, for its highlight.
+    rect: egui::Rect,
+}
+
+/// Draws a row: checkbox, unread dot and title, attachment, label chips, date. Lists and search
+/// results both use it, so their rows line up the same way.
+fn draw_thread_row(ui: &mut egui::Ui, view: &RowView, checked: bool) -> RowAction {
+    let m = view.head;
+    let row_height = view.row_height;
+    let mut action = RowAction {
+        checked: None,
+        opened: false,
+        label: None,
+        rect: egui::Rect::NOTHING,
+    };
+    let row = ui.horizontal(|ui| {
+        // The gap between items is set here, and the widths below assume it.
+        ui.spacing_mut().item_spacing.x = ROW_GAP;
+        // Leave room for the scrollbar, which can sit over the right edge.
+        let pane_w = ui.available_width() - ui.spacing().scroll.allocated_width();
+        let mut is_checked = checked;
+        let box_changed = ui
+            .add_sized(
+                [CHECK_WIDTH, row_height],
+                egui::Checkbox::without_text(&mut is_checked),
+            )
+            .changed();
+        if box_changed {
+            action.checked = Some(is_checked);
+        }
+        // Every item has a fixed width, so the row can't grow frame to frame.
+        // The date is the fixed column on the right. The subject takes the rest.
+        let title_text = row_title(m, view.count, view.unread);
+        let chips = row_chips(m, view.filter_label);
+        let (shown, hidden) = chips.split_at(chips.len().min(MAX_CHIPS));
+        // (raw label to filter by, shown text, tooltip). The "+N" chip has no label.
+        let mut tags: Vec<(Option<String>, String, String)> = shown
+            .iter()
+            .map(|raw| (Some(raw.clone()), display_label(raw), display_label(raw)))
+            .collect();
+        if !hidden.is_empty() {
+            let names: Vec<String> = hidden.iter().map(|r| display_label(r)).collect();
+            tags.push((None, format!("+{}", hidden.len()), names.join("\n")));
+        }
+        let font = egui::TextStyle::Small.resolve(ui.style());
+        let widths: Vec<f32> = tags
+            .iter()
+            .map(|(_, t, _)| chip_width(ui, t, &font))
+            .collect();
+        // Gaps: subject to first chip, between chips, last chip to date.
+        // Items in order: checkbox, subject, attachment, chips, date. That's
+        // one gap between each pair.
+        let gaps = (tags.len() as f32 + 3.0) * ROW_GAP;
+        let title_w =
+            (pane_w - CHECK_WIDTH - DATE_WIDTH - ATTACH_WIDTH - widths.iter().sum::<f32>() - gaps)
+                .max(40.0);
+
+        let title = egui::Frame::new()
+            .fill(egui::Color32::TRANSPARENT)
+            .corner_radius(4)
+            .show(ui, |ui| {
+                ui.set_min_size(egui::vec2(title_w, row_height));
+                ui.set_max_width(title_w);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    if view.unread {
+                        // Bold isn't available in this font, so unread gets a dot.
+                        let (dot, _) = ui
+                            .allocate_exact_size(egui::vec2(8.0, row_height), egui::Sense::hover());
+                        ui.painter().circle_filled(
+                            dot.center(),
+                            3.5,
+                            ui.visuals().strong_text_color(),
+                        );
+                    }
+                    ui.add(
+                        egui::Label::new(title_text)
+                            .truncate()
+                            .sense(egui::Sense::click()),
+                    )
+                })
+                .inner
+            })
+            .inner;
+        if title
+            .on_hover_text(format!("{}\nthread {}", sender_line(m), view.thrid))
+            .clicked()
+        {
+            action.opened = true;
+        }
+
+        // The attachment column: a paperclip for a thread with an attachment.
+        let (clip_rect, clip) =
+            ui.allocate_exact_size(egui::vec2(ATTACH_WIDTH, row_height), egui::Sense::hover());
+        if view.attachments {
+            paint_paperclip(ui, clip_rect);
+            clip.on_hover_text("Has attachments");
+        }
+
+        for ((raw, text, tip), w) in tags.iter().zip(&widths) {
+            let (rect, resp) =
+                ui.allocate_exact_size(egui::vec2(*w, row_height), egui::Sense::click());
+            paint_chip(ui, rect, text, &font);
+            if resp.on_hover_text(tip).clicked()
+                && let Some(label) = raw
+            {
+                action.label = Some(label.clone());
+            }
+        }
+
+        let date = egui::RichText::new(format_time(m.when())).weak();
+        ui.add_sized([DATE_WIDTH, row_height], egui::Label::new(date).truncate());
+    });
+    action.rect = row.response.rect;
+    action
 }
 
 /// Bytes as a size for people: GB with one decimal, otherwise MB.
