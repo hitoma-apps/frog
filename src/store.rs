@@ -25,7 +25,7 @@ pub const DEFAULT_BODY_CAP: u64 = 1 << 30;
 /// zstd level. Mail is text, so a low level compresses well and stays fast.
 const ZSTD_LEVEL: i32 = 3;
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -255,6 +255,29 @@ pub struct CheckReport {
 
 /// Adds the received-time column (schema v12), and renames the thread sort key from the sent
 /// time to a time that's received when known. Does nothing if that's already done.
+/// Label names are kept decoded (see `utf7`). Caches from before that stored them as the server
+/// sent them, so the names are decoded in place and the derived tables rebuilt. A name that
+/// already exists decoded keeps that row.
+fn upgrade_label_names(tx: &Transaction) -> Result<()> {
+    let raw_names: Vec<String> = {
+        let mut stmt = tx.prepare("SELECT DISTINCT label FROM message_labels")?;
+        stmt.query_map([], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?
+    };
+    for raw in raw_names {
+        let name = crate::utf7::decode(&raw);
+        if name == raw {
+            continue;
+        }
+        tx.execute(
+            "UPDATE OR IGNORE message_labels SET label = ?2 WHERE label = ?1",
+            params![raw, name],
+        )?;
+        tx.execute("DELETE FROM message_labels WHERE label = ?1", params![raw])?;
+    }
+    rebuild_derived(tx)
+}
+
 fn upgrade_size(tx: &Transaction) -> Result<()> {
     let has_size: i64 = tx.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'size'",
@@ -1027,6 +1050,9 @@ impl Store {
         if version < 13 {
             // Message sizes, for the storage view. They don't affect thread summaries.
             upgrade_size(&tx)?;
+        }
+        if version < 14 {
+            upgrade_label_names(&tx)?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -1818,6 +1844,19 @@ mod tests {
         assert_eq!(uids, vec![2, 1]);
         assert!(v.rows[0].attachment);
         assert_eq!(s.storage_view(1).unwrap().rows.len(), 1);
+    }
+
+    #[test]
+    fn old_label_names_are_decoded_by_the_upgrade() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        // The first message has the name as an older cache stored it, in modified UTF-7.
+        s.upsert_messages(&[msg(1, 1, &["Caf&AOk-"]), msg(2, 2, &["Café"])])
+            .unwrap();
+        let tx = s.conn.transaction().unwrap();
+        upgrade_label_names(&tx).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(s.list_messages(Some("Café"), 10).unwrap().len(), 2);
+        assert!(s.list_messages(Some("Caf&AOk-"), 10).unwrap().is_empty());
     }
 
     fn msg(msgid: u64, uid: u32, labels: &[&str]) -> CachedMessage {

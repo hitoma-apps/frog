@@ -13,6 +13,7 @@ pub mod response;
 pub mod settings;
 pub mod store;
 pub mod uidset;
+pub mod utf7;
 
 pub use labels::{Label, LabelAction, LabelRef, SystemLabel, uid_store_labels};
 pub use render::render_plaintext;

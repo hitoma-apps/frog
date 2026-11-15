@@ -130,7 +130,7 @@ pub fn uid_store_labels(
         }
         match label {
             LabelRef::System(sys) => push_quoted(&mut out, sys.as_wire()),
-            LabelRef::Name(name) => push_quoted(&mut out, name),
+            LabelRef::Name(name) => push_quoted(&mut out, &crate::utf7::encode(name)),
         }
     }
     out.push(')');
@@ -193,4 +193,16 @@ fn push_quoted(out: &mut String, s: &str) {
         out.push(c);
     }
     out.push('"');
+}
+
+#[cfg(test)]
+mod utf7_command_tests {
+    use super::*;
+
+    #[test]
+    fn a_non_ascii_label_is_sent_in_modified_utf7() {
+        let cmd = uid_store_labels(&[7], LabelAction::Add, &[LabelRef::Name("Café")]).unwrap();
+        assert!(cmd.contains("\"Caf&AOk-\""), "{cmd}");
+        assert!(!cmd.contains("Café"), "{cmd}");
+    }
 }

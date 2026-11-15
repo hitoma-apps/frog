@@ -380,8 +380,8 @@ fn labels_from(v: &Value<'_>) -> Vec<String> {
         .iter()
         .filter_map(|item| match item {
             Value::Number(n) => Some(n.to_string()),
-            Value::Bytes(b) => Some(String::from_utf8_lossy(b).into_owned()),
-            other => other.as_str().map(str::to_owned),
+            Value::Bytes(b) => Some(crate::utf7::decode(&String::from_utf8_lossy(b))),
+            other => other.as_str().map(crate::utf7::decode),
         })
         .collect()
 }

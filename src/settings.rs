@@ -30,8 +30,11 @@ pub struct Settings {
     pub page_size: usize,
     /// Show a desktop notification when new mail arrives.
     pub notifications: bool,
-    /// Raw label names pinned to the top of the sidebar, in the order they were added.
+    /// Label names pinned to the top of the sidebar, in the order they were added.
     pub favorite_labels: Vec<String>,
+    /// 1 once favourites are kept decoded (see `utf7`). Older files lack it, so it reads as 0.
+    #[serde(default)]
+    pub label_names: u32,
     /// Searches saved in the sidebar, in the order they were saved.
     #[serde(default)]
     pub saved_searches: Vec<String>,
@@ -80,6 +83,7 @@ impl Default for Settings {
             page_size: 500,
             notifications: true,
             favorite_labels: Vec::new(),
+            label_names: 1,
             saved_searches: Vec::new(),
             recent_searches: Vec::new(),
             window: WindowLayout::default(),
@@ -149,11 +153,18 @@ impl Settings {
 
     /// Reads settings from `path`. A missing or unreadable file gives the defaults.
     pub fn load_from(path: &Path) -> Self {
-        std::fs::read_to_string(path)
+        let mut settings = std::fs::read_to_string(path)
             .ok()
             .and_then(|text| serde_json::from_str::<Settings>(&text).ok())
-            .unwrap_or_default()
-            .clamped()
+            .unwrap_or_default();
+        if settings.label_names < 1 {
+            // Favourites were saved as the server sent them. They're decoded once, here.
+            for name in &mut settings.favorite_labels {
+                *name = crate::utf7::decode(name);
+            }
+            settings.label_names = 1;
+        }
+        settings.clamped()
     }
 
     /// Writes settings to `path`, replacing the file in one step.
@@ -202,6 +213,7 @@ mod tests {
             check_interval_secs: 120,
             page_size: 200,
             notifications: false,
+            label_names: 1,
             favorite_labels: vec!["\\Starred".into(), "Work".into()],
             saved_searches: Vec::new(),
             recent_searches: Vec::new(),
@@ -335,5 +347,22 @@ mod recent_search_tests {
         };
         let s = s.clamped();
         assert_eq!(s.recent_searches, vec!["x", "y", "z", "w", "v"]);
+    }
+}
+
+#[cfg(test)]
+mod label_name_tests {
+    use super::*;
+
+    #[test]
+    fn an_older_file_has_its_favourites_decoded_once() {
+        let dir = std::env::temp_dir().join(format!("label-names-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{"favorite_labels":["Caf&AOk-","Work"]}"#).unwrap();
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.favorite_labels, vec!["Café", "Work"]);
+        assert_eq!(loaded.label_names, 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

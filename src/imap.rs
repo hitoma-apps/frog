@@ -505,7 +505,7 @@ impl<S: Read + Write> ImapConn<S> {
             if name.eq_ignore_ascii_case("INBOX") || name.starts_with("[Gmail]") {
                 continue;
             }
-            out.push(name);
+            out.push(crate::utf7::decode(&name));
         }
         out.sort();
         out.dedup();
