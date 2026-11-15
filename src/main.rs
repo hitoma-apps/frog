@@ -2080,55 +2080,134 @@ impl App {
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            if ui
-                .button("Archive")
-                .on_hover_text("Remove \\Inbox")
-                .clicked()
-            {
-                self.apply(
-                    LabelAction::Remove,
-                    vec![SystemLabel::Inbox.as_wire().into()],
-                );
-            }
-            if ui.button("Trash").on_hover_text("Add \\Trash").clicked() {
-                self.apply(LabelAction::Add, vec![SystemLabel::Trash.as_wire().into()]);
-            }
-            if ui.button("Star").on_hover_text("Add \\Starred").clicked() {
-                self.apply(
-                    LabelAction::Add,
-                    vec![SystemLabel::Starred.as_wire().into()],
-                );
-            }
+            self.select_all_box(ui);
             ui.separator();
-            if ui.button("Mark read").clicked() {
-                self.apply_read_state(true);
-            }
-            if ui.button("Mark unread").clicked() {
-                self.apply_read_state(false);
-            }
-            ui.separator();
-            ui.add(
-                egui::TextEdit::singleline(&mut self.label_input)
-                    .hint_text("label name")
-                    .desired_width(160.0),
-            );
-            let name = self.label_input.trim().to_string();
-            let has_name = !name.is_empty();
-            if ui
-                .add_enabled(has_name, egui::Button::new("Add label"))
-                .clicked()
-            {
-                self.apply(LabelAction::Add, vec![name.clone()]);
-            }
-            if ui
-                .add_enabled(has_name, egui::Button::new("Remove label"))
-                .clicked()
-            {
-                self.apply(LabelAction::Remove, vec![name]);
+            if self.checked.is_empty() {
+                // Actions act on checked threads, so they're shown once some are checked.
+                ui.weak("Check threads to act on them.");
+            } else {
+                self.action_buttons(ui);
             }
         });
         if let Some(status) = &self.status {
             ui.colored_label(egui::Color32::LIGHT_RED, status);
+        }
+    }
+
+    /// The actions on checked threads, shown only when some are checked.
+    fn action_buttons(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .button("Archive")
+            .on_hover_text("Remove \\Inbox")
+            .clicked()
+        {
+            self.apply(
+                LabelAction::Remove,
+                vec![SystemLabel::Inbox.as_wire().into()],
+            );
+        }
+        if ui.button("Trash").on_hover_text("Add \\Trash").clicked() {
+            self.apply(LabelAction::Add, vec![SystemLabel::Trash.as_wire().into()]);
+        }
+        if ui.button("Star").on_hover_text("Add \\Starred").clicked() {
+            self.apply(
+                LabelAction::Add,
+                vec![SystemLabel::Starred.as_wire().into()],
+            );
+        }
+        ui.separator();
+        if ui.button("Mark read").clicked() {
+            self.apply_read_state(true);
+        }
+        if ui.button("Mark unread").clicked() {
+            self.apply_read_state(false);
+        }
+        ui.separator();
+        ui.add(
+            egui::TextEdit::singleline(&mut self.label_input)
+                .hint_text("label name")
+                .desired_width(160.0),
+        );
+        let name = self.label_input.trim().to_string();
+        let has_name = !name.is_empty();
+        if ui
+            .add_enabled(has_name, egui::Button::new("Add label"))
+            .clicked()
+        {
+            self.apply(LabelAction::Add, vec![name.clone()]);
+        }
+        if ui
+            .add_enabled(has_name, egui::Button::new("Remove label"))
+            .clicked()
+        {
+            self.apply(LabelAction::Remove, vec![name]);
+        }
+    }
+
+    /// The threads a view lists, when the view holds them in memory (search and waiting for
+    /// reply). `None` for the thread list, which reads its rows from the cache.
+    fn listed_thrids(&self) -> Option<Vec<u64>> {
+        let mut seen = HashSet::new();
+        let thrids: Vec<u64> = if self.waiting_open && self.search.trim().is_empty() {
+            self.waiting
+                .as_ref()?
+                .iter()
+                .map(|r| r.thrid)
+                .filter(|t| seen.insert(*t))
+                .collect()
+        } else if !self.search.trim().is_empty() {
+            let query = search::parse(&self.search).query;
+            match &self.search_results {
+                Some((q, rows)) if *q == query => rows
+                    .iter()
+                    .map(|r| r.thrid)
+                    .filter(|t| seen.insert(*t))
+                    .collect(),
+                _ => Vec::new(),
+            }
+        } else {
+            return None;
+        };
+        Some(thrids)
+    }
+
+    /// The select-all box for the threads in view. It's blank when none are checked, dashed when
+    /// some are, and ticked when all are. A click selects all, or unselects all when any are checked.
+    fn select_all_box(&mut self, ui: &mut egui::Ui) {
+        // Views without checkboxes have nothing to select.
+        let checkable = !self.storage_open && !self.senders_open;
+        let listed = self.listed_thrids();
+        let total = match &listed {
+            Some(thrids) => thrids.len(),
+            None if checkable => self.window_total,
+            None => 0,
+        };
+        let picked = match &listed {
+            Some(thrids) => thrids.iter().filter(|t| self.checked.contains(t)).count(),
+            None => self.checked.len(),
+        };
+        let all = total > 0 && picked >= total;
+        let partial = picked > 0 && !all;
+        let mut ticked = all;
+        let hover = if picked > 0 {
+            "Unselect all"
+        } else {
+            "Select all"
+        };
+        let response = ui
+            .add_enabled(
+                total > 0 && checkable,
+                egui::Checkbox::without_text(&mut ticked).indeterminate(partial),
+            )
+            .on_hover_text(hover);
+        if response.clicked() {
+            if picked > 0 {
+                self.checked.clear();
+            } else if let Some(thrids) = listed {
+                self.checked.extend(thrids);
+            } else {
+                self.request_thread_range(0, total, true);
+            }
         }
     }
 
