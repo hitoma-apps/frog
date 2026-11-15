@@ -145,6 +145,44 @@ fn format_time(ts: i64) -> String {
         .unwrap_or_default()
 }
 
+/// A date for the lists, as Gmail shows one: the time for today or for the last 12 hours,
+/// the month and day this year, and an ISO date for an earlier year.
+fn list_time(ts: i64, now: chrono::DateTime<chrono::Local>) -> String {
+    use chrono::Datelike;
+    if ts <= 0 {
+        return String::new();
+    }
+    let Some(when) =
+        chrono::DateTime::from_timestamp(ts, 0).map(|d| d.with_timezone(&chrono::Local))
+    else {
+        return String::new();
+    };
+    let recent = now.signed_duration_since(when) < chrono::TimeDelta::hours(12);
+    if when.date_naive() == now.date_naive() || recent {
+        when.format("%-I:%M %p").to_string()
+    } else if when.year() == now.year() {
+        when.format("%b %-d").to_string()
+    } else {
+        when.format("%Y-%m-%d").to_string()
+    }
+}
+
+/// `list_time` for now.
+fn list_date(ts: i64) -> String {
+    list_time(ts, chrono::Local::now())
+}
+
+/// The full date for a tooltip: ISO 8601 with the offset, then the day of the week in brackets.
+fn full_date(ts: i64) -> String {
+    chrono::DateTime::from_timestamp(ts, 0)
+        .map(|utc| {
+            utc.with_timezone(&chrono::Local)
+                .format("%Y-%m-%dT%H:%M:%S%:z (%A)")
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
 /// A subject without its reply and forward prefixes, lowercased, so that a thread's
 /// messages compare as one subject.
 fn base_subject(subject: &str) -> String {
@@ -1286,7 +1324,8 @@ impl App {
                             egui::Label::new(format!("{}", sender.messages)),
                         );
                         ui.weak(format!("{} unread", sender.unread));
-                        ui.weak(format_time(sender.latest));
+                        ui.weak(list_date(sender.latest))
+                            .on_hover_text(full_date(sender.latest));
                         let name = if sender.display.is_empty() || sender.display == sender.address
                         {
                             sender.address.clone()
@@ -1375,7 +1414,7 @@ impl App {
                             ui.weak("attachment");
                         }
                         if let Some(t) = row.received {
-                            ui.weak(format_time(t));
+                            ui.weak(list_date(t)).on_hover_text(full_date(t));
                         }
                     });
                 }
@@ -2529,13 +2568,13 @@ impl App {
                         continue;
                     };
                     let title = if shared_subject.is_some() {
-                        format!("{}   {}", sender_line(m), format_time(m.when()))
+                        format!("{}   {}", sender_line(m), list_date(m.when()))
                     } else {
                         format!(
                             "{} — {}   {}",
                             sender_line(m),
                             m.subject,
-                            format_time(m.when())
+                            list_date(m.when())
                         )
                     };
                     let warnings = impersonation::sender_warnings(&m.from, &m.from_email);
@@ -2622,7 +2661,9 @@ impl App {
                                                     ));
                                                 }
                                             }
-                                        });
+                                        })
+                                        .header_response
+                                        .on_hover_text(full_date(m.when()));
                                 });
                             });
                         });
@@ -3057,8 +3098,9 @@ fn draw_thread_row(ui: &mut egui::Ui, view: &RowView, checked: bool) -> RowActio
             }
         }
 
-        let date = egui::RichText::new(format_time(m.when())).weak();
-        ui.add_sized([DATE_WIDTH, row_height], egui::Label::new(date).truncate());
+        let date = egui::RichText::new(list_date(m.when())).weak();
+        ui.add_sized([DATE_WIDTH, row_height], egui::Label::new(date).truncate())
+            .on_hover_text(full_date(m.when()));
     });
     action.rect = row.response.rect;
     action
@@ -3289,6 +3331,43 @@ mod tests {
         );
         let later = now + SEARCH_PAUSE;
         assert_eq!(search_wait(Some(now), false, later), Duration::ZERO);
+    }
+
+    #[test]
+    fn list_dates_follow_the_gmail_rules() {
+        use chrono::{Local, TimeZone};
+        let at = |y, mo, d, h, mi| Local.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap();
+        let now = at(2026, 11, 14, 15, 0);
+        // Today, and within the last 12 hours even across midnight: the time.
+        assert_eq!(
+            list_time(at(2026, 11, 14, 11, 15).timestamp(), now),
+            "11:15 AM"
+        );
+        let early = at(2026, 11, 14, 3, 0);
+        assert_eq!(
+            list_time(at(2026, 11, 13, 20, 0).timestamp(), early),
+            "8:00 PM"
+        );
+        // Earlier this year: month and day.
+        assert_eq!(list_time(at(2026, 11, 2, 9, 0).timestamp(), now), "Nov 2");
+        // An earlier year: an ISO date.
+        assert_eq!(
+            list_time(at(2025, 12, 31, 23, 0).timestamp(), now),
+            "2025-12-31"
+        );
+        assert_eq!(list_time(0, now), "");
+    }
+
+    #[test]
+    fn full_dates_are_iso_with_the_weekday() {
+        use chrono::{Local, TimeZone};
+        let ts = Local
+            .with_ymd_and_hms(2026, 11, 14, 15, 0, 0)
+            .unwrap()
+            .timestamp();
+        let full = full_date(ts);
+        assert!(full.starts_with("2026-11-14T15:00:00"), "{full}");
+        assert!(full.ends_with(" (Saturday)"), "{full}");
     }
 
     #[test]
