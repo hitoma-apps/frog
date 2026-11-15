@@ -21,6 +21,8 @@ const FETCH_CHUNK: usize = 200;
 pub struct LiveSession<S: Read + Write> {
     conn: ImapConn<S>,
     selected: bool,
+    /// The mailbox's `UIDNEXT` from its last SELECT, which bounds the UID searches.
+    uidnext: Option<u32>,
     /// The server advertised CONDSTORE, so changes can be fetched by modseq.
     condstore: bool,
     /// The server advertised IDLE, so changes can be pushed.
@@ -50,6 +52,7 @@ impl<S: Read + Write> LiveSession<S> {
         Ok(Self {
             conn,
             selected: false,
+            uidnext: None,
             condstore,
             idle,
             notices: Vec::new(),
@@ -59,7 +62,8 @@ impl<S: Read + Write> LiveSession<S> {
 
     fn ensure_selected(&mut self) -> Result<(), SourceError> {
         if !self.selected {
-            self.conn.select(&self.all_mail).map_err(to_source_error)?;
+            let sel = self.conn.select(&self.all_mail).map_err(to_source_error)?;
+            self.uidnext = sel.uidnext;
             self.selected = true;
         }
         Ok(())
@@ -92,6 +96,7 @@ fn idle_notice(line: &str) -> Option<IdleNotice> {
 impl<S: Read + Write + Send + SetReadTimeout> MailSource for LiveSession<S> {
     fn select(&mut self) -> Result<MailboxInfo, SourceError> {
         let sel = self.conn.select(&self.all_mail).map_err(to_source_error)?;
+        self.uidnext = sel.uidnext;
         self.selected = true;
         Ok(MailboxInfo {
             uidvalidity: sel.uidvalidity,
@@ -106,7 +111,9 @@ impl<S: Read + Write + Send + SetReadTimeout> MailSource for LiveSession<S> {
 
     fn search_from(&mut self, start: u32) -> Result<Vec<u32>, SourceError> {
         self.ensure_selected()?;
-        self.conn.uid_search_from(start).map_err(to_source_error)
+        self.conn
+            .uid_search_from(start, self.uidnext)
+            .map_err(to_source_error)
     }
 
     fn fetch_headers(&mut self, uids: &[u32]) -> Result<Vec<Message>, SourceError> {
@@ -367,9 +374,16 @@ mod tests {
             return format!("{}{tag} OK FETCH completed\r\n", fetch_response(set, items));
         }
         if let Some(rest) = cmd.strip_prefix("UID SEARCH UID ") {
-            let start: u32 = rest.trim_end_matches(":*").parse().unwrap();
+            // A range, `a:b` or `a:*`, over the fake mailbox's UIDs 1 to 3.
+            let (lo, hi) = rest.split_once(':').unwrap();
+            let lo: u32 = lo.parse().unwrap();
+            let hi: u32 = if hi == "*" {
+                u32::MAX
+            } else {
+                hi.parse().unwrap()
+            };
             let uids: Vec<String> = (1..=3)
-                .filter(|u| *u >= start)
+                .filter(|u| (lo..=hi).contains(u))
                 .map(|u| u.to_string())
                 .collect();
             return format!(
@@ -386,7 +400,7 @@ mod tests {
                 format!("* CAPABILITY IMAP4rev1 X-GM-EXT-1 UIDPLUS\r\n{tag} OK done\r\n")
             }
             c if c.starts_with("SELECT") => format!(
-                "* 3 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 42] UIDs valid\r\n{tag} OK [READ-WRITE] SELECT completed\r\n"
+                "* 3 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 42] UIDs valid\r\n* OK [UIDNEXT 4] Predicted next UID\r\n{tag} OK [READ-WRITE] SELECT completed\r\n"
             ),
             c if c.starts_with("UID STORE") => format!("{tag} OK STORE completed\r\n"),
             c if c.starts_with("LIST") => format!(

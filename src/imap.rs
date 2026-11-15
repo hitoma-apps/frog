@@ -69,6 +69,8 @@ fn parse_bracketed_number<T: std::str::FromStr>(text: &str, key: &str) -> Option
 pub struct Selected {
     pub exists: u32,
     pub uidvalidity: u32,
+    /// `UIDNEXT`: the UID the next new message will get, if the server reports it.
+    pub uidnext: Option<u32>,
     /// `HIGHESTMODSEQ`, if the server supports CONDSTORE.
     pub highestmodseq: Option<u64>,
 }
@@ -296,10 +298,17 @@ impl<S: Read + Write> ImapConn<S> {
             .map(|line| String::from_utf8_lossy(line).into_owned())
             .chain(std::iter::once(resp.text.clone()))
             .find_map(|text| parse_bracketed_number(&text, "HIGHESTMODSEQ "));
+        let uidnext = resp
+            .untagged
+            .iter()
+            .map(|line| String::from_utf8_lossy(line).into_owned())
+            .chain(std::iter::once(resp.text.clone()))
+            .find_map(|text| parse_bracketed_number(&text, "UIDNEXT "));
         match (exists, uidvalidity) {
             (Some(exists), Some(uidvalidity)) => Ok(Selected {
                 exists,
                 uidvalidity,
+                uidnext,
                 highestmodseq,
             }),
             _ => Err(ImapError::Protocol(
@@ -311,22 +320,45 @@ impl<S: Read + Write> ImapConn<S> {
     /// UIDs in the selected mailbox that are at least `start`, ascending.
     /// IMAP always returns the highest UID for `start:*` even when it is below
     /// `start`, so callers should filter.
-    pub fn uid_search_from(&mut self, start: u32) -> Result<Vec<u32>> {
-        let resp = self.command(&format!("UID SEARCH UID {start}:*"))?;
+    /// The UIDs from `start` on. With the mailbox's `UIDNEXT`, the search is split into windows of
+    /// `SEARCH_WINDOW` UIDs, so no response line grows with the size of the mailbox. Without it,
+    /// the one search is used, and its line grows with the mailbox.
+    pub fn uid_search_from(&mut self, start: u32, uidnext: Option<u32>) -> Result<Vec<u32>> {
+        let mut uids = Vec::new();
+        let mut tail = start;
+        if let Some(next) = uidnext {
+            for (from, to) in search_windows(start, next) {
+                let cmd = format!("UID SEARCH UID {from}:{to}");
+                uids.extend(self.uid_search_ids(&cmd, from, to)?);
+            }
+            tail = tail.max(next);
+        }
+        // Mail that arrived after the mailbox was selected has a UID at or past UIDNEXT.
+        let cmd = format!("UID SEARCH UID {tail}:*");
+        uids.extend(self.uid_search_ids(&cmd, tail, u32::MAX)?);
+        uids.sort_unstable();
+        uids.dedup();
+        Ok(uids)
+    }
+
+    /// Runs one UID SEARCH and keeps the UIDs in `lo..=hi`. The server answers a range past its
+    /// largest UID with that UID, which this drops.
+    fn uid_search_ids(&mut self, cmd: &str, lo: u32, hi: u32) -> Result<Vec<u32>> {
+        let resp = self.command(cmd)?;
         let mut uids = Vec::new();
         for line in &resp.untagged {
             let text = String::from_utf8_lossy(line);
             if let Some(rest) = text.strip_prefix("* SEARCH") {
                 for tok in rest.split_whitespace() {
-                    uids.push(
-                        tok.parse()
-                            .map_err(|_| ImapError::Protocol(format!("bad UID: {tok}")))?,
-                    );
+                    let uid: u32 = tok
+                        .parse()
+                        .map_err(|_| ImapError::Protocol(format!("bad UID: {tok}")))?;
+                    if (lo..=hi).contains(&uid) {
+                        uids.push(uid);
+                    }
                 }
             }
         }
-        uids.retain(|&u| u >= start);
-        uids.sort_unstable();
         Ok(uids)
     }
 
@@ -550,6 +582,26 @@ pub fn all_mail_from_lines<I: IntoIterator<Item = String>>(lines: I) -> Option<S
             .any(|a| a.eq_ignore_ascii_case("\\All"))
             .then_some(name)
     })
+}
+
+/// UIDs asked for in one SEARCH. A window of this many UIDs gives a response line of under a
+/// megabyte, however large the mailbox is.
+pub const SEARCH_WINDOW: u32 = 100_000;
+
+/// The UID ranges, from `start` up to `uidnext`, one `SEARCH_WINDOW` at a time. The ranges don't
+/// overlap, and together they cover `start..uidnext`.
+pub fn search_windows(start: u32, uidnext: u32) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    let mut from = start;
+    while from < uidnext {
+        let to = from.saturating_add(SEARCH_WINDOW - 1).min(uidnext - 1);
+        out.push((from, to));
+        if to == u32::MAX {
+            break;
+        }
+        from = to + 1;
+    }
+    out
 }
 
 /// Parses one untagged LIST response: `* LIST (attrs) "delim" name`.
@@ -779,6 +831,20 @@ mod list_tests {
             all_mail_from_lines(["* LIST () \"/\" \"INBOX\"".to_string()]),
             None
         );
+    }
+
+    #[test]
+    fn search_windows_cover_the_range_without_overlap() {
+        assert!(search_windows(1, 1).is_empty());
+        assert_eq!(search_windows(1, 4), vec![(1, 3)]);
+        let windows = search_windows(5, 2 * SEARCH_WINDOW + 10);
+        assert_eq!(windows[0], (5, SEARCH_WINDOW + 4));
+        assert_eq!(windows[1], (SEARCH_WINDOW + 5, 2 * SEARCH_WINDOW + 4));
+        assert_eq!(windows[2], (2 * SEARCH_WINDOW + 5, 2 * SEARCH_WINDOW + 9));
+        assert_eq!(windows.len(), 3);
+        // Ends at the top of the range without overflowing.
+        let top = search_windows(u32::MAX - 2, u32::MAX);
+        assert_eq!(top, vec![(u32::MAX - 2, u32::MAX - 1)]);
     }
 
     #[test]
