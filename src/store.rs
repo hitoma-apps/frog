@@ -114,7 +114,7 @@ const THREAD_COLUMNS: &str = "t.thrid, t.count, t.unread, m.msgid, m.thrid, m.ui
                               t.attachments, m.received, t.newest_time";
 
 /// The field the thread list is sorted by.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SortKey {
     /// The newest message's date.
     Date,
@@ -125,7 +125,7 @@ pub enum SortKey {
 }
 
 /// How the thread list is sorted. Ties are broken by thread id, in the same direction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ListOrder {
     pub key: SortKey,
     pub descending: bool,

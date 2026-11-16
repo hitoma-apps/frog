@@ -34,6 +34,8 @@ pub struct Settings {
     pub body_cache_mib: u64,
     /// The view shown at startup.
     pub startup_view: StartupView,
+    /// How the thread list is sorted when the app starts, and when the default is changed.
+    pub default_sort: crate::store::ListOrder,
     /// The label last shown in the list, or empty for All Mail. Used by `StartupView::Last`.
     pub last_view: String,
     /// When a conversation is marked read after it's opened, and how long to wait for `AfterDelay`.
@@ -171,6 +173,7 @@ impl Default for Settings {
             notify_never_from: Vec::new(),
             startup_view: StartupView::Inbox,
             last_view: String::new(),
+            default_sort: crate::store::ListOrder::default(),
             read_on_open: ReadOnOpen::Immediately,
             read_delay_secs: 3,
             favorite_labels: Vec::new(),
@@ -313,6 +316,7 @@ mod tests {
             notify_never_from: Vec::new(),
             startup_view: StartupView::Inbox,
             last_view: String::new(),
+            default_sort: crate::store::ListOrder::default(),
             read_on_open: ReadOnOpen::Immediately,
             read_delay_secs: 3,
             email: Some("me@example.com".into()),

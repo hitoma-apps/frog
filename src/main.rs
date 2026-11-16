@@ -727,6 +727,7 @@ impl App {
                 (!settings.last_view.is_empty()).then(|| settings.last_view.clone())
             }
         };
+        let default_sort = settings.default_sort;
         let mut login = LoginForm {
             remember: settings.remember_password,
             ..Default::default()
@@ -794,7 +795,7 @@ impl App {
             window_total: 0,
             window_filter: None,
             sent_window: None,
-            sort: ListOrder::default(),
+            sort: default_sort,
             check_anchor: None,
             label_open: HashSet::new(),
             view_stale: false,
@@ -1834,6 +1835,27 @@ impl App {
         );
         ui.weak("The page size applies the next time the mailbox loads.");
         ui.add_space(8.0);
+        ui.add_space(8.0);
+        ui.label("Default sort for the thread list (changing it re-sorts the list now)");
+        let before = self.settings.default_sort;
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut self.settings.default_sort.key, SortKey::Date, "Date");
+            ui.radio_value(
+                &mut self.settings.default_sort.key,
+                SortKey::Sender,
+                "Sender",
+            );
+            ui.radio_value(
+                &mut self.settings.default_sort.key,
+                SortKey::Subject,
+                "Subject",
+            );
+            ui.checkbox(&mut self.settings.default_sort.descending, "Descending");
+        });
+        if self.settings.default_sort != before {
+            self.sort = self.settings.default_sort;
+            self.change_list();
+        }
         ui.add_space(8.0);
         ui.label("Start with");
         ui.horizontal(|ui| {
