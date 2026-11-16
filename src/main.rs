@@ -33,7 +33,7 @@ use gmail_imap_proto::links::gmail_thread_url;
 use gmail_imap_proto::render_plaintext;
 use gmail_imap_proto::search;
 use gmail_imap_proto::settings::{
-    self, CHECK_INTERVAL_RANGE, PAGE_SIZE_RANGE, ReadOnOpen, Settings,
+    self, CHECK_INTERVAL_RANGE, PAGE_SIZE_RANGE, ReadOnOpen, Settings, StartupView,
 };
 
 use backend::Message;
@@ -719,6 +719,14 @@ impl App {
             .as_deref()
             .map(Settings::load_from)
             .unwrap_or_default();
+        // The view shown at startup: the Inbox, All Mail, or the view last shown.
+        let startup_filter = match settings.startup_view {
+            StartupView::Inbox => Some(SystemLabel::Inbox.as_wire().to_string()),
+            StartupView::AllMail => None,
+            StartupView::Last => {
+                (!settings.last_view.is_empty()).then(|| settings.last_view.clone())
+            }
+        };
         let mut login = LoginForm {
             remember: settings.remember_password,
             ..Default::default()
@@ -800,8 +808,7 @@ impl App {
             rendered: HashMap::new(),
             pending_link: None,
             search: String::new(),
-            // The Inbox is the first view on sign-in.
-            filter: Some("\\Inbox".to_string()),
+            filter: startup_filter,
             checked: BTreeSet::new(),
             open_thread: None,
             thread_msgs: BTreeMap::new(),
@@ -1141,6 +1148,12 @@ impl App {
         // Open the label's parents, so its row is visible in the sidebar.
         if let Some(label) = &key {
             self.label_open.extend(ancestor_paths(label));
+        }
+        // Remembered for the Last view at startup.
+        let last = key.clone().unwrap_or_default();
+        if self.settings.last_view != last {
+            self.settings.last_view = last;
+            self.save_settings();
         }
         self.filter = key;
         self.search.clear();
@@ -1820,6 +1833,22 @@ impl App {
             ),
         );
         ui.weak("The page size applies the next time the mailbox loads.");
+        ui.add_space(8.0);
+        ui.add_space(8.0);
+        ui.label("Start with");
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut self.settings.startup_view, StartupView::Inbox, "Inbox");
+            ui.radio_value(
+                &mut self.settings.startup_view,
+                StartupView::AllMail,
+                "All Mail",
+            );
+            ui.radio_value(
+                &mut self.settings.startup_view,
+                StartupView::Last,
+                "Last view",
+            );
+        });
         ui.add_space(8.0);
         ui.label("Mark a conversation as read when it's opened");
         ui.horizontal(|ui| {

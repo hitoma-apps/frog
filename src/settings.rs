@@ -32,6 +32,10 @@ pub struct Settings {
     pub notifications: bool,
     /// How many megabytes of message bodies the cache keeps, least recently used removed first.
     pub body_cache_mib: u64,
+    /// The view shown at startup.
+    pub startup_view: StartupView,
+    /// The label last shown in the list, or empty for All Mail. Used by `StartupView::Last`.
+    pub last_view: String,
     /// When a conversation is marked read after it's opened, and how long to wait for `AfterDelay`.
     pub read_on_open: ReadOnOpen,
     pub read_delay_secs: u64,
@@ -81,6 +85,15 @@ impl Default for WindowLayout {
             list_height: 260.0,
         }
     }
+}
+
+/// The view shown at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StartupView {
+    Inbox,
+    AllMail,
+    /// The view last shown: `last_view`.
+    Last,
 }
 
 /// When a conversation is marked read after it's opened.
@@ -156,6 +169,8 @@ impl Default for Settings {
             quiet_end: 7,
             notify_always_from: Vec::new(),
             notify_never_from: Vec::new(),
+            startup_view: StartupView::Inbox,
+            last_view: String::new(),
             read_on_open: ReadOnOpen::Immediately,
             read_delay_secs: 3,
             favorite_labels: Vec::new(),
@@ -296,6 +311,8 @@ mod tests {
             quiet_end: 7,
             notify_always_from: Vec::new(),
             notify_never_from: Vec::new(),
+            startup_view: StartupView::Inbox,
+            last_view: String::new(),
             read_on_open: ReadOnOpen::Immediately,
             read_delay_secs: 3,
             email: Some("me@example.com".into()),
