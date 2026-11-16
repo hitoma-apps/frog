@@ -33,7 +33,7 @@ use gmail_imap_proto::links::gmail_thread_url;
 use gmail_imap_proto::render_plaintext;
 use gmail_imap_proto::search;
 use gmail_imap_proto::settings::{
-    self, CHECK_INTERVAL_RANGE, PAGE_SIZE_RANGE, ReadOnOpen, Settings, StartupView,
+    self, CHECK_INTERVAL_RANGE, PAGE_SIZE_RANGE, ReadOnOpen, Settings, StartupView, Theme,
 };
 
 use backend::Message;
@@ -728,6 +728,7 @@ impl App {
             }
         };
         let default_sort = settings.default_sort;
+        ctx.set_theme(theme_preference(settings.theme));
         let mut login = LoginForm {
             remember: settings.remember_password,
             ..Default::default()
@@ -1835,6 +1836,17 @@ impl App {
         );
         ui.weak("The page size applies the next time the mailbox loads.");
         ui.add_space(8.0);
+        ui.add_space(8.0);
+        ui.label("Theme");
+        let before_theme = self.settings.theme;
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut self.settings.theme, Theme::System, "Follow the system");
+            ui.radio_value(&mut self.settings.theme, Theme::Light, "Light");
+            ui.radio_value(&mut self.settings.theme, Theme::Dark, "Dark");
+        });
+        if self.settings.theme != before_theme {
+            self.ctx.set_theme(theme_preference(self.settings.theme));
+        }
         ui.add_space(8.0);
         ui.label("Default sort for the thread list (changing it re-sorts the list now)");
         let before = self.settings.default_sort;
@@ -3675,6 +3687,15 @@ fn draw_thread_row(ui: &mut egui::Ui, view: &RowView, checked: bool) -> RowActio
     });
     action.rect = row.response.rect;
     action
+}
+
+/// The egui theme for a theme choice.
+fn theme_preference(theme: Theme) -> egui::ThemePreference {
+    match theme {
+        Theme::System => egui::ThemePreference::System,
+        Theme::Light => egui::ThemePreference::Light,
+        Theme::Dark => egui::ThemePreference::Dark,
+    }
 }
 
 /// A list of sender addresses, with a box to add one and a button beside each to remove it.

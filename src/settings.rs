@@ -32,6 +32,8 @@ pub struct Settings {
     pub notifications: bool,
     /// How many megabytes of message bodies the cache keeps, least recently used removed first.
     pub body_cache_mib: u64,
+    /// The colour theme.
+    pub theme: Theme,
     /// The view shown at startup.
     pub startup_view: StartupView,
     /// How the thread list is sorted when the app starts, and when the default is changed.
@@ -87,6 +89,15 @@ impl Default for WindowLayout {
             list_height: 260.0,
         }
     }
+}
+
+/// The colour theme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Theme {
+    /// Whatever the system is using.
+    System,
+    Light,
+    Dark,
 }
 
 /// The view shown at startup.
@@ -171,6 +182,7 @@ impl Default for Settings {
             quiet_end: 7,
             notify_always_from: Vec::new(),
             notify_never_from: Vec::new(),
+            theme: Theme::System,
             startup_view: StartupView::Inbox,
             last_view: String::new(),
             default_sort: crate::store::ListOrder::default(),
@@ -314,6 +326,7 @@ mod tests {
             quiet_end: 7,
             notify_always_from: Vec::new(),
             notify_never_from: Vec::new(),
+            theme: Theme::System,
             startup_view: StartupView::Inbox,
             last_view: String::new(),
             default_sort: crate::store::ListOrder::default(),
