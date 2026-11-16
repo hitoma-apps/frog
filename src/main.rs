@@ -118,6 +118,7 @@ struct LabelNode {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsPane {
     General,
+    Notifications,
     Cache,
 }
 
@@ -596,6 +597,9 @@ struct App {
     click_rx: std::sync::mpsc::Receiver<u64>,
     /// Which settings pane is shown.
     settings_pane: SettingsPane,
+    /// What has been typed into the notification sender lists, before it's added.
+    notify_draft_always: String,
+    notify_draft_never: String,
     /// The result of clearing the cached bodies, once it's on its way.
     body_clear: Option<std::sync::mpsc::Receiver<Result<usize, String>>>,
     /// The cache check, from the Cache pane.
@@ -748,6 +752,8 @@ impl App {
             click_rx,
             label_cache: None,
             settings_pane: SettingsPane::General,
+            notify_draft_always: String::new(),
+            notify_draft_never: String::new(),
             body_clear: None,
             cache_check: CacheCheck::Idle,
             search_results: None,
@@ -907,9 +913,12 @@ impl App {
             }
             Event::NewArrivals(msgs) => {
                 if self.settings.notifications {
+                    // The rules (never, do not disturb, quiet hours) decide per sender, at this hour.
+                    let hour = chrono::Timelike::hour(&chrono::Local::now()) as u8;
                     let new: Vec<&Message> = msgs
                         .iter()
                         .filter(|m| !m.seen && m.labels.contains(SystemLabel::Inbox.as_wire()))
+                        .filter(|m| self.settings.notifies_for(&m.from_email, hour))
                         .collect();
                     let items: Vec<notify::NewMail> = new
                         .iter()
@@ -1717,12 +1726,18 @@ impl App {
                             SettingsPane::General,
                             "General",
                         );
+                        ui.selectable_value(
+                            &mut self.settings_pane,
+                            SettingsPane::Notifications,
+                            "Notifications",
+                        );
                         ui.selectable_value(&mut self.settings_pane, SettingsPane::Cache, "Cache");
                     });
                 egui::CentralPanel::default().show(ui, |ui| match self.settings_pane {
                     SettingsPane::General => {
                         forget = self.general_settings(ui);
                     }
+                    SettingsPane::Notifications => self.notification_settings(ui),
                     SettingsPane::Cache => {
                         (verify, clear) = self.cache_settings(ui);
                     }
@@ -1774,10 +1789,6 @@ impl App {
                 "Sign in automatically when the app starts",
             ),
         );
-        ui.checkbox(
-            &mut self.settings.notifications,
-            "Show desktop notifications for new mail",
-        );
         ui.weak("The page size applies the next time the mailbox loads.");
         ui.add_space(8.0);
         if let Some(email) = self.settings.email.clone()
@@ -1787,6 +1798,55 @@ impl App {
             self.status = credentials::forget_password(&email).err();
         }
         forget
+    }
+
+    /// The Notifications pane: whether to notify, do not disturb, quiet hours, and the sender lists.
+    fn notification_settings(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Notifications");
+        ui.checkbox(
+            &mut self.settings.notifications,
+            "Show desktop notifications for new mail",
+        );
+        ui.add_space(6.0);
+        ui.checkbox(
+            &mut self.settings.do_not_disturb,
+            "Do not disturb (until turned off)",
+        );
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.settings.quiet_hours, "Quiet hours, from");
+            ui.add_enabled(
+                self.settings.quiet_hours,
+                egui::DragValue::new(&mut self.settings.quiet_start)
+                    .range(0..=23)
+                    .suffix(":00"),
+            );
+            ui.label("to");
+            ui.add_enabled(
+                self.settings.quiet_hours,
+                egui::DragValue::new(&mut self.settings.quiet_end)
+                    .range(0..=23)
+                    .suffix(":00"),
+            );
+        });
+        ui.weak("Local time. Quiet hours can cross midnight.");
+        ui.add_space(8.0);
+        sender_list(
+            ui,
+            "Always notify from",
+            "Mail from these senders notifies even when do not disturb or quiet hours are on.",
+            "always_from",
+            &mut self.settings.notify_always_from,
+            &mut self.notify_draft_always,
+        );
+        ui.add_space(8.0);
+        sender_list(
+            ui,
+            "Never notify from",
+            "Mail from these senders never notifies.",
+            "never_from",
+            &mut self.settings.notify_never_from,
+            &mut self.notify_draft_never,
+        );
     }
 
     /// The Cache pane: where the cache is, how big, its size limit, and the verify and clear
@@ -3513,6 +3573,44 @@ fn draw_thread_row(ui: &mut egui::Ui, view: &RowView, checked: bool) -> RowActio
     });
     action.rect = row.response.rect;
     action
+}
+
+/// A list of sender addresses, with a box to add one and a button beside each to remove it.
+fn sender_list(
+    ui: &mut egui::Ui,
+    heading: &str,
+    note: &str,
+    id: &str,
+    list: &mut Vec<String>,
+    draft: &mut String,
+) {
+    ui.strong(heading);
+    ui.weak(note);
+    let mut remove: Option<usize> = None;
+    for (i, address) in list.iter().enumerate() {
+        ui.horizontal(|ui| {
+            ui.label(address);
+            if ui.small_button("Remove").clicked() {
+                remove = Some(i);
+            }
+        });
+    }
+    if let Some(i) = remove {
+        list.remove(i);
+    }
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(draft)
+                .id_salt(id)
+                .hint_text("address@example.com")
+                .desired_width(220.0),
+        );
+        let addable = !draft.trim().is_empty();
+        if ui.add_enabled(addable, egui::Button::new("Add")).clicked() {
+            list.push(draft.trim().to_string());
+            draft.clear();
+        }
+    });
 }
 
 /// Bytes as a size for people: GB with one decimal, otherwise MB.

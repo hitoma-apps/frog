@@ -32,6 +32,16 @@ pub struct Settings {
     pub notifications: bool,
     /// How many megabytes of message bodies the cache keeps, least recently used removed first.
     pub body_cache_mib: u64,
+    /// Do not disturb: no notifications, except from `notify_always_from`.
+    pub do_not_disturb: bool,
+    /// Quiet hours: notifications are held between `quiet_start` and `quiet_end` (local hours).
+    pub quiet_hours: bool,
+    pub quiet_start: u8,
+    pub quiet_end: u8,
+    /// Senders whose mail still notifies during do not disturb and quiet hours.
+    pub notify_always_from: Vec<String>,
+    /// Senders whose mail never notifies.
+    pub notify_never_from: Vec<String>,
     /// Label names pinned to the top of the sidebar, in the order they were added.
     pub favorite_labels: Vec<String>,
     /// 1 once favourites are kept decoded (see `utf7`). Older files lack it, so it reads as 0.
@@ -70,6 +80,50 @@ impl Default for WindowLayout {
     }
 }
 
+/// Addresses as they're compared: trimmed, lower-cased, without blanks or repeats.
+fn clean_addresses(list: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for address in list {
+        let address = address.trim().to_ascii_lowercase();
+        if !address.is_empty() && !out.contains(&address) {
+            out.push(address);
+        }
+    }
+    out
+}
+
+/// Whether `hour` (0 to 23) is inside the quiet hours from `start` to `end`. The span may cross
+/// midnight. Equal start and end mean no quiet hours.
+fn in_quiet_hours(start: u8, end: u8, hour: u8) -> bool {
+    match start.cmp(&end) {
+        std::cmp::Ordering::Equal => false,
+        std::cmp::Ordering::Less => hour >= start && hour < end,
+        std::cmp::Ordering::Greater => hour >= start || hour < end,
+    }
+}
+
+impl Settings {
+    /// Whether notifications are held at local `hour`, by do not disturb or quiet hours.
+    pub fn held_at(&self, hour: u8) -> bool {
+        self.do_not_disturb
+            || (self.quiet_hours && in_quiet_hours(self.quiet_start, self.quiet_end, hour))
+    }
+
+    /// Whether new mail from `from_email` should notify, at local `hour`. Mail from a sender on the
+    /// never list doesn't; mail held by do not disturb or quiet hours doesn't, unless the sender is
+    /// on the always list.
+    pub fn notifies_for(&self, from_email: &str, hour: u8) -> bool {
+        if !self.notifications {
+            return false;
+        }
+        let from = from_email.trim().to_ascii_lowercase();
+        if self.notify_never_from.contains(&from) {
+            return false;
+        }
+        !(self.held_at(hour) && !self.notify_always_from.contains(&from))
+    }
+}
+
 /// Most searches kept in the sidebar.
 pub const MAX_SAVED_SEARCHES: usize = 10;
 /// Most recent searches kept, whether or not they were saved.
@@ -85,6 +139,12 @@ impl Default for Settings {
             page_size: 500,
             notifications: true,
             body_cache_mib: 1024,
+            do_not_disturb: false,
+            quiet_hours: false,
+            quiet_start: 22,
+            quiet_end: 7,
+            notify_always_from: Vec::new(),
+            notify_never_from: Vec::new(),
             favorite_labels: Vec::new(),
             label_names: 1,
             saved_searches: Vec::new(),
@@ -112,6 +172,10 @@ impl Settings {
         }
         kept.truncate(MAX_SAVED_SEARCHES);
         self.body_cache_mib = self.body_cache_mib.clamp(64, 65_536);
+        self.quiet_start = self.quiet_start.min(23);
+        self.quiet_end = self.quiet_end.min(23);
+        self.notify_always_from = clean_addresses(&self.notify_always_from);
+        self.notify_never_from = clean_addresses(&self.notify_never_from);
         self.saved_searches = kept;
         let mut recent: Vec<String> = Vec::new();
         for search in self.recent_searches.drain(..) {
@@ -212,6 +276,12 @@ mod tests {
         let s = Settings {
             window: WindowLayout::default(),
             body_cache_mib: 1024,
+            do_not_disturb: false,
+            quiet_hours: false,
+            quiet_start: 22,
+            quiet_end: 7,
+            notify_always_from: Vec::new(),
+            notify_never_from: Vec::new(),
             email: Some("me@example.com".into()),
             remember_password: true,
             auto_login: false,
@@ -352,6 +422,51 @@ mod recent_search_tests {
         };
         let s = s.clamped();
         assert_eq!(s.recent_searches, vec!["x", "y", "z", "w", "v"]);
+    }
+}
+
+#[cfg(test)]
+mod notification_rule_tests {
+    use super::*;
+
+    #[test]
+    fn quiet_hours_can_cross_midnight() {
+        assert!(in_quiet_hours(22, 7, 23));
+        assert!(in_quiet_hours(22, 7, 3));
+        assert!(!in_quiet_hours(22, 7, 12));
+        assert!(!in_quiet_hours(9, 17, 8));
+        assert!(in_quiet_hours(9, 17, 9));
+        assert!(!in_quiet_hours(9, 17, 17));
+        assert!(!in_quiet_hours(5, 5, 5));
+    }
+
+    #[test]
+    fn never_and_always_lists_override_the_quiet_rules() {
+        let mut s = Settings {
+            notifications: true,
+            quiet_hours: true,
+            quiet_start: 22,
+            quiet_end: 7,
+            notify_always_from: vec!["Boss@Example.com".into()],
+            notify_never_from: vec!["promo@example.com".into()],
+            ..Settings::default()
+        };
+        s = s.clamped();
+        // Outside quiet hours, anything notifies except the never list.
+        assert!(s.notifies_for("friend@example.com", 12));
+        assert!(!s.notifies_for("promo@example.com", 12));
+        // During quiet hours, only the always list gets through.
+        assert!(!s.notifies_for("friend@example.com", 23));
+        assert!(s.notifies_for("boss@example.com", 23));
+        assert!(!s.notifies_for("promo@example.com", 23));
+        // Do not disturb holds everything, whatever the hour.
+        s.quiet_hours = false;
+        s.do_not_disturb = true;
+        assert!(!s.notifies_for("friend@example.com", 12));
+        assert!(s.notifies_for("boss@example.com", 12));
+        // Turning notifications off silences all of it.
+        s.notifications = false;
+        assert!(!s.notifies_for("boss@example.com", 12));
     }
 }
 
