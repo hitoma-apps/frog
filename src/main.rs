@@ -596,6 +596,8 @@ struct App {
     click_rx: std::sync::mpsc::Receiver<u64>,
     /// Which settings pane is shown.
     settings_pane: SettingsPane,
+    /// The result of clearing the cached bodies, once it's on its way.
+    body_clear: Option<std::sync::mpsc::Receiver<Result<usize, String>>>,
     /// The cache check, from the Cache pane.
     cache_check: CacheCheck,
     /// The sidebar's labels, built from the counts. `None` until they're needed again.
@@ -746,6 +748,7 @@ impl App {
             click_rx,
             label_cache: None,
             settings_pane: SettingsPane::General,
+            body_clear: None,
             cache_check: CacheCheck::Idle,
             search_results: None,
             search_asked: None,
@@ -818,7 +821,13 @@ impl App {
             self.save_settings();
         }
         self.connecting = true;
-        self.link = Some(worker::spawn_gmail(user, password, self.ctx.clone()));
+        let body_cap = self.settings.body_cache_mib * 1024 * 1024;
+        self.link = Some(worker::spawn_gmail(
+            user,
+            password,
+            self.ctx.clone(),
+            body_cap,
+        ));
     }
 
     fn send(&self, cmd: Command) {
@@ -1678,12 +1687,21 @@ impl App {
         if let Some(result) = finished {
             self.cache_check = CacheCheck::Done(result);
         }
+        let cleared = self.body_clear.as_ref().and_then(|rx| rx.try_recv().ok());
+        if let Some(result) = cleared {
+            self.body_clear = None;
+            self.status = Some(match result {
+                Ok(removed) => format!("Cleared {removed} cached message bodies."),
+                Err(e) => format!("Could not clear the cached bodies: {e}"),
+            });
+        }
         if matches!(self.cache_check, CacheCheck::Running(_)) {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
         let mut open = true;
         let mut forget = false;
         let mut verify = false;
+        let mut clear = false;
         egui::Window::new("Settings")
             .collapsible(false)
             .resizable(true)
@@ -1706,12 +1724,15 @@ impl App {
                         forget = self.general_settings(ui);
                     }
                     SettingsPane::Cache => {
-                        verify = self.cache_settings(ui);
+                        (verify, clear) = self.cache_settings(ui);
                     }
                 });
             });
         if verify {
             self.start_cache_check();
+        }
+        if clear {
+            self.start_clear_bodies();
         }
         self.settings = std::mem::take(&mut self.settings).clamped();
         if !open {
@@ -1768,9 +1789,9 @@ impl App {
         forget
     }
 
-    /// The Cache pane: where the cache is, how big, and the verify button. Returns whether verify
-    /// was clicked.
-    fn cache_settings(&mut self, ui: &mut egui::Ui) -> bool {
+    /// The Cache pane: where the cache is, how big, its size limit, and the verify and clear
+    /// buttons. Returns whether verify and clear were clicked.
+    fn cache_settings(&mut self, ui: &mut egui::Ui) -> (bool, bool) {
         ui.heading("Cache");
         match self
             .account
@@ -1785,6 +1806,27 @@ impl App {
                 ui.weak("Sign in to see the cache.");
             }
         }
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label("Keep message bodies up to (MB)");
+            ui.add(
+                egui::DragValue::new(&mut self.settings.body_cache_mib)
+                    .range(64..=65_536)
+                    .speed(16.0),
+            );
+        });
+        ui.weak(
+            "The limit applies the next time you sign in. Least recently read bodies go first.",
+        );
+        let clear_clicked = ui
+            .add_enabled(
+                self.account.is_some() && self.body_clear.is_none(),
+                egui::Button::new("Clear cache bodies"),
+            )
+            .on_hover_text(
+                "Removes the stored message bodies. Headers and the list stay, and bodies are fetched again when opened. The file may not shrink until SQLite reuses the space.",
+            )
+            .clicked();
         ui.add_space(8.0);
         ui.label(
             "Verify checks the cache's structure, and that each thread summary agrees with the \
@@ -1823,7 +1865,28 @@ impl App {
                 );
             }
         }
-        clicked
+        (clicked, clear_clicked)
+    }
+
+    /// Removes the cached message bodies, on a background thread with its own connection.
+    fn start_clear_bodies(&mut self) {
+        let Some(path) = self
+            .account
+            .as_deref()
+            .and_then(gmail_imap_proto::store::account_cache_path)
+        else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let result = gmail_imap_proto::store::Store::open(&path)
+                .and_then(|mut store| store.clear_bodies())
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+        self.body_clear = Some(rx);
     }
 
     /// Runs the cache check on a background thread, on its own read-only connection, so the

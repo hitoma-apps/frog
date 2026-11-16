@@ -30,6 +30,8 @@ pub struct Settings {
     pub page_size: usize,
     /// Show a desktop notification when new mail arrives.
     pub notifications: bool,
+    /// How many megabytes of message bodies the cache keeps, least recently used removed first.
+    pub body_cache_mib: u64,
     /// Label names pinned to the top of the sidebar, in the order they were added.
     pub favorite_labels: Vec<String>,
     /// 1 once favourites are kept decoded (see `utf7`). Older files lack it, so it reads as 0.
@@ -82,6 +84,7 @@ impl Default for Settings {
             check_interval_secs: 60,
             page_size: 500,
             notifications: true,
+            body_cache_mib: 1024,
             favorite_labels: Vec::new(),
             label_names: 1,
             saved_searches: Vec::new(),
@@ -108,6 +111,7 @@ impl Settings {
             }
         }
         kept.truncate(MAX_SAVED_SEARCHES);
+        self.body_cache_mib = self.body_cache_mib.clamp(64, 65_536);
         self.saved_searches = kept;
         let mut recent: Vec<String> = Vec::new();
         for search in self.recent_searches.drain(..) {
@@ -207,6 +211,7 @@ mod tests {
         let path = temp_file("roundtrip.json");
         let s = Settings {
             window: WindowLayout::default(),
+            body_cache_mib: 1024,
             email: Some("me@example.com".into()),
             remember_password: true,
             auto_login: false,

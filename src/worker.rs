@@ -200,9 +200,10 @@ pub fn open_cache(email: &str) -> Result<(Store, Vec<String>), String> {
 
 /// The account's cache, plus any startup errors to send once connected. If the cache
 /// file can't be used, a cache in memory keeps the list working for this session.
-fn cache_for(email: &str) -> (Option<Store>, Option<Store>, Vec<Event>) {
+fn cache_for(email: &str, body_cap: u64) -> (Option<Store>, Option<Store>, Vec<Event>) {
     match open_cache(email) {
-        Ok((store, notes)) => {
+        Ok((mut store, notes)) => {
+            store.set_body_cap(body_cap);
             // The reader opens after the writer, which has run any migrations by now.
             let reader = account_cache_path(email).and_then(|p| Store::open_reader(&p).ok());
             (
@@ -220,8 +221,9 @@ fn cache_for(email: &str) -> (Option<Store>, Option<Store>, Vec<Event>) {
 }
 
 /// Starts a worker that signs in to Gmail and uses that account's cache.
-pub fn spawn_gmail(user: String, password: String, ctx: egui::Context) -> Link {
-    let (store, reader, startup) = cache_for(&user);
+/// Starts the worker for `user`. `body_cap` is how many bytes of message bodies the cache keeps.
+pub fn spawn_gmail(user: String, password: String, ctx: egui::Context, body_cap: u64) -> Link {
+    let (store, reader, startup) = cache_for(&user, body_cap);
     spawn_with_reader(
         ctx,
         Box::new(move || live::connect_gmail(&user, &password)),

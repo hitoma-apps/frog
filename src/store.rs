@@ -1028,6 +1028,12 @@ impl Store {
     }
 
     /// An in-memory cache, for tests.
+    /// Sets how many bytes of message bodies the cache keeps. Takes effect at the next body write,
+    /// which then evicts the least recently used bodies down to the cap.
+    pub fn set_body_cap(&mut self, cap: u64) {
+        self.body_cap = cap;
+    }
+
     pub fn open_in_memory(body_cap: u64) -> Result<Self> {
         Self::init(Connection::open_in_memory()?, body_cap)
     }
@@ -2333,10 +2339,9 @@ impl Store {
         Ok(total as u64)
     }
 
-    /// Drops all cached bodies. Headers and sync state are kept.
-    pub fn clear_bodies(&mut self) -> Result<()> {
-        self.conn.execute("DELETE FROM bodies", [])?;
-        Ok(())
+    /// Drops all cached bodies. Headers and sync state are kept. Returns how many were removed.
+    pub fn clear_bodies(&mut self) -> Result<usize> {
+        Ok(self.conn.execute("DELETE FROM bodies", [])?)
     }
 }
 
@@ -2529,6 +2534,18 @@ mod tests {
             .thread_page_sorted(&ThreadFilter::All, order(SortKey::Sender, false), 1, 1)
             .unwrap();
         assert_eq!(second[0].head.from_email, "bob@example.com");
+    }
+
+    #[test]
+    fn clearing_bodies_keeps_the_headers_and_the_list() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        s.upsert_messages(&[msg(1, 1, &["Work"]), msg(2, 2, &["Work"])])
+            .unwrap();
+        s.put_body(1, b"Subject: Hello\r\n\r\nbody one").unwrap();
+        s.put_body(2, b"Subject: Hello\r\n\r\nbody two").unwrap();
+        assert_eq!(s.clear_bodies().unwrap(), 2);
+        assert!(s.get_body(1).unwrap().is_none());
+        assert_eq!(s.thread_count(&ThreadFilter::All).unwrap(), 2);
     }
 
     #[test]
