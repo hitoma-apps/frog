@@ -83,6 +83,12 @@ pub enum Command {
         query: gmail_imap_proto::search::Query,
         limit: usize,
     },
+    /// Checks the cache on the writing connection, including the search index. Problems that
+    /// can be rebuilt from the messages are rebuilt. Needs no connection to the server.
+    VerifyCache,
+    /// Lists every UID the server has and compares them with the cache. Cached messages the
+    /// server no longer has are removed, and headers the cache lacks are queued to fetch.
+    VerifyServer,
 }
 
 /// A row of the thread list: a conversation, its counts, and its newest message.
@@ -95,6 +101,19 @@ pub struct ThreadEntry {
     /// Whether any of them has an attachment.
     pub attachments: bool,
     pub head: Message,
+}
+
+/// What a comparison with the server found.
+#[derive(Debug, Clone, Copy)]
+pub struct ServerCheck {
+    /// Messages the server has in All Mail.
+    pub server: usize,
+    /// Of those, how many were already cached.
+    pub cached: usize,
+    /// Cached messages the server no longer has. These were removed.
+    pub removed: usize,
+    /// Messages the server has that the cache lacked. Their headers are being fetched.
+    pub queued: usize,
 }
 
 /// What the worker reports back. Message data goes out only when the GUI asks for it.
@@ -136,6 +155,15 @@ pub enum Event {
         threads: usize,
         unread: usize,
     },
+    /// The result of `Command::VerifyCache`. `problems` is what was found, `repaired` says
+    /// whether it was rebuilt, and `remaining` is what's still wrong afterwards.
+    CacheVerified {
+        problems: Vec<String>,
+        repaired: bool,
+        remaining: Vec<String>,
+    },
+    /// The result of `Command::VerifyServer`.
+    ServerChecked(ServerCheck),
     /// The threads in a range of the list, for a shift-click. `checked` is the state to apply.
     ThreadRange {
         filter: ThreadFilter,
@@ -528,6 +556,10 @@ impl Worker {
             answer_read(self.store.as_ref(), &self.emit, &cmd, None);
             return;
         }
+        if let Command::VerifyCache = cmd {
+            self.op_verify_cache();
+            return;
+        }
         let mut retried = false;
         loop {
             if self.source.is_none() && !self.reconnect() {
@@ -569,6 +601,7 @@ impl Worker {
                 }
             }
             Command::SetSeen { thrids, seen } => self.op_set_seen(src, thrids, *seen),
+            Command::VerifyServer => self.op_verify_server(src),
             // Cache reads are answered in `dispatch`, before a connection is needed.
             Command::Window { .. }
             | Command::Thread { .. }
@@ -576,7 +609,8 @@ impl Worker {
             | Command::Largest { .. }
             | Command::Senders { .. }
             | Command::Waiting { .. }
-            | Command::Search { .. } => Ok(()),
+            | Command::Search { .. }
+            | Command::VerifyCache => Ok(()),
         }
     }
 
@@ -1037,6 +1071,85 @@ impl Worker {
             });
         }
         Ok(())
+    }
+
+    /// Compares the cache with the server's full UID list. Cached messages the server no
+    /// longer has are removed, and the headers the cache lacks are queued for the background.
+    fn op_verify_server(&mut self, src: &mut dyn MailSource) -> Result<(), SourceError> {
+        let info = src.select()?;
+        if self.begin_mailbox(info) {
+            return self.op_load(src, self.state.limit);
+        }
+        let all = src.search_from(1)?;
+        let server: UidSet = all.iter().copied().collect();
+        let cached = self.cached_uid_set();
+        let stale: Vec<u32> = cached.iter().filter(|&u| !server.contains(u)).collect();
+        // Newest first, the same order the background uses.
+        let missing: VecDeque<u32> = all
+            .iter()
+            .rev()
+            .filter(|&&u| !cached.contains(u))
+            .copied()
+            .collect();
+        let report = ServerCheck {
+            server: all.len(),
+            cached: all.len() - missing.len(),
+            removed: stale.len(),
+            queued: missing.len(),
+        };
+
+        self.remove_cached(&stale);
+        if !stale.is_empty() {
+            self.emit.send(Event::Removed(stale));
+        }
+        self.state.cached = report.cached;
+        self.state.highest = all.last().copied();
+        self.state.prefetch.retain(|&u| server.contains(u));
+        self.state.pending_headers = missing;
+        self.emit_progress();
+        self.emit.send(Event::ServerChecked(report));
+        Ok(())
+    }
+
+    /// Checks the cache on the writing connection. If the summaries or the search index
+    /// disagree with the messages, they're rebuilt. Physical damage is only reported, since
+    /// rebuilding can't fix it.
+    fn op_verify_cache(&mut self) {
+        let Some(store) = self.store.as_mut() else {
+            self.emit.send(Event::Error(
+                "The cache isn't open, so it can't be checked.".into(),
+            ));
+            return;
+        };
+        let result = (|| -> Result<Event, gmail_imap_proto::store::StoreError> {
+            let first = store.check()?;
+            let problems: Vec<String> = first
+                .physical
+                .iter()
+                .chain(&first.logical)
+                .cloned()
+                .collect();
+            if problems.is_empty() || !first.physical.is_empty() {
+                return Ok(Event::CacheVerified {
+                    problems,
+                    repaired: false,
+                    remaining: first.physical,
+                });
+            }
+            store.repair()?;
+            let after = store.check()?;
+            Ok(Event::CacheVerified {
+                problems,
+                repaired: true,
+                remaining: after.physical.into_iter().chain(after.logical).collect(),
+            })
+        })();
+        match result {
+            Ok(event) => self.emit.send(event),
+            Err(e) => self
+                .emit
+                .send(Event::Error(format!("Could not verify the cache: {e}"))),
+        }
     }
 
     /// After an expunge: drops cached messages the server no longer has.
@@ -2301,6 +2414,8 @@ mod sync_tests {
             Event::LabelList(_) => "LabelList",
             Event::LabelCounts { .. } => "LabelCounts",
             Event::Removed(_) => "Removed",
+            Event::CacheVerified { .. } => "CacheVerified",
+            Event::ServerChecked(_) => "ServerChecked",
             Event::IdleState(_) => "IdleState",
             Event::Error(_) => "Error",
             Event::Crashed(_) => "Crashed",
@@ -2536,6 +2651,73 @@ mod sync_tests {
             }
         }
         panic!("the deleted message was never removed");
+    }
+
+    #[test]
+    fn server_check_removes_what_the_server_lost_and_queues_what_the_cache_lacks() {
+        let source = MockSource::demo();
+        let handle = source.handle();
+        let script = Arc::new(Mutex::new(VecDeque::new()));
+        let link = loaded(&source, script);
+        // Message 3 is gone from the server, and a new one has arrived that the cache lacks.
+        handle.expunge(3);
+        handle.deliver("new@example.com", "Arrived unseen", &["\\Inbox"]);
+        link.commands.send(Command::VerifyServer).unwrap();
+        let mut removed = Vec::new();
+        loop {
+            match next(&link) {
+                Event::Removed(uids) => removed.extend(uids),
+                Event::ServerChecked(check) => {
+                    assert_eq!(removed, vec![3]);
+                    assert_eq!(check.removed, 1);
+                    assert_eq!(check.queued, 1);
+                    assert_eq!(check.cached + check.queued, check.server);
+                    return;
+                }
+                Event::Progress { .. }
+                | Event::LabelList(_)
+                | Event::LabelCounts { .. }
+                | Event::Labels { .. }
+                | Event::Body { .. }
+                | Event::IdleState(_)
+                | Event::CheckFinished
+                | Event::LoadFinished => {}
+                Event::Error(e) => panic!("error event: {e}"),
+                other => panic!("unexpected event: {}", name(&other)),
+            }
+        }
+    }
+
+    #[test]
+    fn verify_and_repair_reports_a_consistent_cache() {
+        let source = MockSource::demo();
+        let script = Arc::new(Mutex::new(VecDeque::new()));
+        let link = loaded(&source, script);
+        link.commands.send(Command::VerifyCache).unwrap();
+        loop {
+            match next(&link) {
+                Event::CacheVerified {
+                    problems,
+                    repaired,
+                    remaining,
+                } => {
+                    assert!(problems.is_empty(), "{problems:?}");
+                    assert!(!repaired);
+                    assert!(remaining.is_empty());
+                    return;
+                }
+                Event::Progress { .. }
+                | Event::LabelList(_)
+                | Event::LabelCounts { .. }
+                | Event::Labels { .. }
+                | Event::Body { .. }
+                | Event::IdleState(_)
+                | Event::CheckFinished
+                | Event::LoadFinished => {}
+                Event::Error(e) => panic!("error event: {e}"),
+                other => panic!("unexpected event: {}", name(&other)),
+            }
+        }
     }
 
     #[test]

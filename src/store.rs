@@ -2946,6 +2946,22 @@ mod tests {
     }
 
     #[test]
+    fn repair_rebuilds_summaries_that_disagree_with_the_messages() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        s.upsert_messages(&[msg(1, 1, &["Work"]), msg(2, 2, &["Work"])])
+            .unwrap();
+        // Damage the summary table directly, as an interrupted write might.
+        s.conn.execute("DELETE FROM threads", []).unwrap();
+        let before = s.check().unwrap();
+        assert!(!before.logical.is_empty());
+        assert!(before.physical.is_empty());
+        s.repair().unwrap();
+        let after = s.check().unwrap();
+        assert!(after.logical.is_empty(), "{:?}", after.logical);
+        assert_eq!(s.thread_totals().unwrap(), (2, 2));
+    }
+
+    #[test]
     fn reader_check_runs_without_writing() {
         let dir = std::env::temp_dir().join(format!("reader-check-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

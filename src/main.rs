@@ -39,7 +39,7 @@ use gmail_imap_proto::settings::{
 use backend::Message;
 use gmail_imap_proto::store::{ListOrder, SortKey, StorageView, ThreadFilter};
 use reader::{Block, Segment};
-use worker::{Command, Event, Link, ThreadEntry};
+use worker::{Command, Event, Link, ServerCheck, ThreadEntry};
 
 /// The help window's text. Plain text: `== Heading ==` lines, `- ` bullets and paragraphs.
 const HELP_TEXT: &str = include_str!("help.txt");
@@ -129,6 +129,22 @@ enum CacheCheck {
     Idle,
     Running(std::sync::mpsc::Receiver<Result<gmail_imap_proto::store::CheckReport, String>>),
     Done(Result<gmail_imap_proto::store::CheckReport, String>),
+}
+
+/// What the worker's writing check found, and whether it rebuilt anything.
+struct WriterCheck {
+    problems: Vec<String>,
+    repaired: bool,
+    remaining: Vec<String>,
+}
+
+/// The buttons clicked in the Cache pane this frame.
+#[derive(Default)]
+struct CacheActions {
+    verify: bool,
+    repair: bool,
+    server: bool,
+    clear: bool,
 }
 
 struct LabelCache {
@@ -606,6 +622,12 @@ struct App {
     body_clear: Option<std::sync::mpsc::Receiver<Result<usize, String>>>,
     /// The cache check, from the Cache pane.
     cache_check: CacheCheck,
+    /// The last "Verify and repair" result, and whether one is running.
+    writer_check: Option<WriterCheck>,
+    writer_checking: bool,
+    /// The last server comparison, and whether one is running.
+    server_check: Option<ServerCheck>,
+    server_checking: bool,
     /// The sidebar's labels, built from the counts. `None` until they're needed again.
     label_cache: Option<LabelCache>,
     /// The last search the cache answered, and the messages it found.
@@ -770,6 +792,10 @@ impl App {
             notify_draft_never: String::new(),
             body_clear: None,
             cache_check: CacheCheck::Idle,
+            writer_check: None,
+            writer_checking: false,
+            server_check: None,
+            server_checking: false,
             search_results: None,
             search_asked: None,
             search_typed: None,
@@ -971,6 +997,22 @@ impl App {
                 }
                 self.log.push(command);
                 self.view_stale = true;
+            }
+            Event::CacheVerified {
+                problems,
+                repaired,
+                remaining,
+            } => {
+                self.writer_checking = false;
+                self.writer_check = Some(WriterCheck {
+                    problems,
+                    repaired,
+                    remaining,
+                });
+            }
+            Event::ServerChecked(check) => {
+                self.server_checking = false;
+                self.server_check = Some(check);
             }
             Event::Removed(uids) => {
                 for uid in uids {
@@ -1754,8 +1796,7 @@ impl App {
         }
         let mut open = true;
         let mut forget = false;
-        let mut verify = false;
-        let mut clear = false;
+        let mut actions = CacheActions::default();
         egui::Window::new("Settings")
             .collapsible(false)
             .resizable(true)
@@ -1784,14 +1825,24 @@ impl App {
                     }
                     SettingsPane::Notifications => self.notification_settings(ui),
                     SettingsPane::Cache => {
-                        (verify, clear) = self.cache_settings(ui);
+                        actions = self.cache_settings(ui);
                     }
                 });
             });
-        if verify {
+        if actions.verify {
             self.start_cache_check();
         }
-        if clear {
+        if actions.repair {
+            self.writer_checking = true;
+            self.writer_check = None;
+            self.send(Command::VerifyCache);
+        }
+        if actions.server {
+            self.server_checking = true;
+            self.server_check = None;
+            self.send(Command::VerifyServer);
+        }
+        if actions.clear {
             self.start_clear_bodies();
         }
         self.settings = std::mem::take(&mut self.settings).clamped();
@@ -1965,7 +2016,7 @@ impl App {
 
     /// The Cache pane: where the cache is, how big, its size limit, and the verify and clear
     /// buttons. Returns whether verify and clear were clicked.
-    fn cache_settings(&mut self, ui: &mut egui::Ui) -> (bool, bool) {
+    fn cache_settings(&mut self, ui: &mut egui::Ui) -> CacheActions {
         ui.heading("Cache");
         match self
             .account
@@ -2007,7 +2058,7 @@ impl App {
              messages it's built from. It only reads the cache.",
         );
         let running = matches!(self.cache_check, CacheCheck::Running(_));
-        let clicked = ui
+        let verify = ui
             .add_enabled(
                 !running && self.account.is_some(),
                 egui::Button::new("Verify cache"),
@@ -2039,7 +2090,88 @@ impl App {
                 );
             }
         }
-        (clicked, clear_clicked)
+        let mut actions = CacheActions {
+            verify,
+            clear: clear_clicked,
+            ..CacheActions::default()
+        };
+
+        ui.add_space(8.0);
+        ui.label(
+            "Verify and repair also checks the search index, which Verify can't. Anything that \
+             disagrees with the messages is rebuilt from them. Message data is not changed.",
+        );
+        let busy = self.writer_checking || self.account.is_none() || !self.connected;
+        actions.repair = ui
+            .add_enabled(!busy, egui::Button::new("Verify and repair"))
+            .on_disabled_hover_text("Connect to your account first.")
+            .clicked();
+        if self.writer_checking {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Checking…");
+            });
+        } else if let Some(result) = &self.writer_check {
+            if result.problems.is_empty() {
+                ui.label("The cache is consistent.");
+            } else {
+                ui.colored_label(egui::Color32::LIGHT_RED, "Found:");
+                for problem in &result.problems {
+                    ui.label(format!("• {problem}"));
+                }
+                if result.repaired {
+                    ui.label("Rebuilt the summaries and the search index from the messages.");
+                }
+            }
+            if !result.remaining.is_empty() {
+                ui.colored_label(egui::Color32::LIGHT_RED, "Still wrong:");
+                for problem in &result.remaining {
+                    ui.label(format!("• {problem}"));
+                }
+            }
+        }
+
+        ui.add_space(8.0);
+        ui.label(
+            "Check against server lists every message the server has, and compares that with \
+             the cache. Messages the server no longer has are removed from the cache. Messages \
+             the cache lacks are fetched in the background.",
+        );
+        actions.server = ui
+            .add_enabled(!busy, egui::Button::new("Check against server"))
+            .on_disabled_hover_text("Connect to your account first.")
+            .clicked();
+        if self.server_checking {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Comparing with the server…");
+            });
+        } else if let Some(check) = &self.server_check {
+            if check.removed == 0 && check.queued == 0 {
+                ui.label(format!(
+                    "In sync: the server and the cache both have {} messages.",
+                    check.server
+                ));
+            } else {
+                ui.label(format!(
+                    "The server has {} messages, and the cache had {} of them.",
+                    check.server, check.cached
+                ));
+                if check.removed > 0 {
+                    ui.label(format!(
+                        "Removed {} messages the server no longer has.",
+                        check.removed
+                    ));
+                }
+                if check.queued > 0 {
+                    ui.label(format!(
+                        "Fetching the headers of {} messages the cache lacked.",
+                        check.queued
+                    ));
+                }
+            }
+        }
+        actions
     }
 
     /// Removes the cached message bodies, on a background thread with its own connection.
