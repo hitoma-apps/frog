@@ -32,7 +32,9 @@ use gmail_imap_proto::linkcheck::{self, LinkInfo};
 use gmail_imap_proto::links::gmail_thread_url;
 use gmail_imap_proto::render_plaintext;
 use gmail_imap_proto::search;
-use gmail_imap_proto::settings::{self, CHECK_INTERVAL_RANGE, PAGE_SIZE_RANGE, Settings};
+use gmail_imap_proto::settings::{
+    self, CHECK_INTERVAL_RANGE, PAGE_SIZE_RANGE, ReadOnOpen, Settings,
+};
 
 use backend::Message;
 use gmail_imap_proto::store::{ListOrder, SortKey, StorageView, ThreadFilter};
@@ -702,6 +704,8 @@ struct App {
     /// The conversation was just opened, so its first load marks it read. Later loads don't,
     /// so a manual "Mark unread" sticks.
     mark_read_on_open: bool,
+    /// A conversation waiting to be marked read after a delay: its thread, and when it opened.
+    read_timer: Option<(u64, Instant)>,
     label_input: String,
     /// IMAP commands issued this session, newest last.
     log: Vec<String>,
@@ -804,6 +808,7 @@ impl App {
             original: None,
             attachments: HashMap::new(),
             mark_read_on_open: false,
+            read_timer: None,
             label_input: String::new(),
             log: Vec::new(),
             status: None,
@@ -1070,7 +1075,13 @@ impl App {
                     if std::mem::take(&mut self.mark_read_on_open)
                         && self.thread_msgs.values().any(|m| !m.seen)
                     {
-                        self.set_read_state(vec![thrid], true);
+                        match self.settings.read_on_open {
+                            ReadOnOpen::Immediately => self.set_read_state(vec![thrid], true),
+                            ReadOnOpen::AfterDelay => {
+                                self.read_timer = Some((thrid, Instant::now()));
+                            }
+                            ReadOnOpen::Never => {}
+                        }
                     }
                 }
             }
@@ -1321,6 +1332,24 @@ impl App {
         }
     }
 
+    /// Marks the open conversation read once its delay has passed. Opening another one cancels it.
+    fn run_read_timer(&mut self, ctx: &egui::Context) {
+        let Some((thrid, since)) = self.read_timer else {
+            return;
+        };
+        if self.open_thread != Some(thrid) {
+            self.read_timer = None;
+            return;
+        }
+        let delay = Duration::from_secs(self.settings.read_delay_secs);
+        if since.elapsed() >= delay {
+            self.read_timer = None;
+            self.set_read_state(vec![thrid], true);
+        } else {
+            ctx.request_repaint_after(delay - since.elapsed());
+        }
+    }
+
     /// Opens the thread of each notification the user clicked, and brings the window forward.
     fn open_clicked_notifications(&mut self, ctx: &egui::Context) {
         while let Ok(thrid) = self.click_rx.try_recv() {
@@ -1549,6 +1578,7 @@ impl App {
     fn open_conversation(&mut self, thrid: u64) {
         self.open_thread = Some(thrid);
         self.mark_read_on_open = true;
+        self.read_timer = None;
         self.thread_msgs.clear();
         self.rendered.clear();
         self.requested_bodies.clear();
@@ -1790,6 +1820,27 @@ impl App {
             ),
         );
         ui.weak("The page size applies the next time the mailbox loads.");
+        ui.add_space(8.0);
+        ui.label("Mark a conversation as read when it's opened");
+        ui.horizontal(|ui| {
+            ui.radio_value(
+                &mut self.settings.read_on_open,
+                ReadOnOpen::Immediately,
+                "Immediately",
+            );
+            ui.radio_value(
+                &mut self.settings.read_on_open,
+                ReadOnOpen::AfterDelay,
+                "After",
+            );
+            ui.add_enabled(
+                self.settings.read_on_open == ReadOnOpen::AfterDelay,
+                egui::DragValue::new(&mut self.settings.read_delay_secs)
+                    .range(1..=60)
+                    .suffix(" s"),
+            );
+            ui.radio_value(&mut self.settings.read_on_open, ReadOnOpen::Never, "Never");
+        });
         ui.add_space(8.0);
         if let Some(email) = self.settings.email.clone()
             && ui.button("Forget saved password").clicked()
@@ -3652,6 +3703,7 @@ impl eframe::App for App {
         self.remember_window_position(ui.ctx());
         self.refresh_storage(ui.ctx());
         self.refresh_search(ui.ctx());
+        self.run_read_timer(ui.ctx());
 
         if !self.connected {
             egui::CentralPanel::default().show(ui, |ui| {

@@ -32,6 +32,9 @@ pub struct Settings {
     pub notifications: bool,
     /// How many megabytes of message bodies the cache keeps, least recently used removed first.
     pub body_cache_mib: u64,
+    /// When a conversation is marked read after it's opened, and how long to wait for `AfterDelay`.
+    pub read_on_open: ReadOnOpen,
+    pub read_delay_secs: u64,
     /// Do not disturb: no notifications, except from `notify_always_from`.
     pub do_not_disturb: bool,
     /// Quiet hours: notifications are held between `quiet_start` and `quiet_end` (local hours).
@@ -78,6 +81,14 @@ impl Default for WindowLayout {
             list_height: 260.0,
         }
     }
+}
+
+/// When a conversation is marked read after it's opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReadOnOpen {
+    Immediately,
+    AfterDelay,
+    Never,
 }
 
 /// Addresses as they're compared: trimmed, lower-cased, without blanks or repeats.
@@ -145,6 +156,8 @@ impl Default for Settings {
             quiet_end: 7,
             notify_always_from: Vec::new(),
             notify_never_from: Vec::new(),
+            read_on_open: ReadOnOpen::Immediately,
+            read_delay_secs: 3,
             favorite_labels: Vec::new(),
             label_names: 1,
             saved_searches: Vec::new(),
@@ -172,6 +185,7 @@ impl Settings {
         }
         kept.truncate(MAX_SAVED_SEARCHES);
         self.body_cache_mib = self.body_cache_mib.clamp(64, 65_536);
+        self.read_delay_secs = self.read_delay_secs.clamp(1, 60);
         self.quiet_start = self.quiet_start.min(23);
         self.quiet_end = self.quiet_end.min(23);
         self.notify_always_from = clean_addresses(&self.notify_always_from);
@@ -282,6 +296,8 @@ mod tests {
             quiet_end: 7,
             notify_always_from: Vec::new(),
             notify_never_from: Vec::new(),
+            read_on_open: ReadOnOpen::Immediately,
+            read_delay_secs: 3,
             email: Some("me@example.com".into()),
             remember_password: true,
             auto_login: false,
