@@ -114,6 +114,20 @@ struct LabelNode {
 }
 
 /// The sidebar's label tree and the counts it shows, kept until the labels or counts change.
+/// Which pane of the settings window is shown.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsPane {
+    General,
+    Cache,
+}
+
+/// The state of the cache check: not run, running (with the channel its result comes on), or done.
+enum CacheCheck {
+    Idle,
+    Running(std::sync::mpsc::Receiver<Result<gmail_imap_proto::store::CheckReport, String>>),
+    Done(Result<gmail_imap_proto::store::CheckReport, String>),
+}
+
 struct LabelCache {
     tree: LabelNode,
     counts: BTreeMap<String, (usize, usize)>,
@@ -580,6 +594,10 @@ struct App {
     /// Threads whose notifications were clicked, sent from the notification threads.
     click_tx: std::sync::mpsc::Sender<u64>,
     click_rx: std::sync::mpsc::Receiver<u64>,
+    /// Which settings pane is shown.
+    settings_pane: SettingsPane,
+    /// The cache check, from the Cache pane.
+    cache_check: CacheCheck,
     /// The sidebar's labels, built from the counts. `None` until they're needed again.
     label_cache: Option<LabelCache>,
     /// The last search the cache answered, and the messages it found.
@@ -727,6 +745,8 @@ impl App {
             click_tx,
             click_rx,
             label_cache: None,
+            settings_pane: SettingsPane::General,
+            cache_check: CacheCheck::Idle,
             search_results: None,
             search_asked: None,
             search_typed: None,
@@ -1645,62 +1665,53 @@ impl App {
         self.save_settings();
     }
 
+    /// Settings, in two panes: the controls, and the cache with its check.
     fn settings_window(&mut self, ctx: &egui::Context) {
         if !self.settings_open {
             return;
         }
+        // A check that has finished is taken here, so its result shows as soon as it's ready.
+        let finished = match &self.cache_check {
+            CacheCheck::Running(rx) => rx.try_recv().ok(),
+            _ => None,
+        };
+        if let Some(result) = finished {
+            self.cache_check = CacheCheck::Done(result);
+        }
+        if matches!(self.cache_check, CacheCheck::Running(_)) {
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
         let mut open = true;
         let mut forget = false;
+        let mut verify = false;
         egui::Window::new("Settings")
             .collapsible(false)
-            .resizable(false)
+            .resizable(true)
+            .default_size([620.0, 420.0])
             .open(&mut open)
             .show(ctx, |ui| {
-                egui::Grid::new("settings_grid")
-                    .num_columns(2)
+                egui::Panel::left("settings_panes")
+                    .resizable(false)
+                    .default_size(150.0)
                     .show(ui, |ui| {
-                        ui.label("Check for new mail every (seconds)");
-                        ui.add(
-                            egui::DragValue::new(&mut self.settings.check_interval_secs)
-                                .range(*CHECK_INTERVAL_RANGE.start()..=*CHECK_INTERVAL_RANGE.end()),
+                        ui.selectable_value(
+                            &mut self.settings_pane,
+                            SettingsPane::General,
+                            "General",
                         );
-                        ui.end_row();
-
-                        ui.label("Messages per page");
-                        ui.add(
-                            egui::DragValue::new(&mut self.settings.page_size)
-                                .range(*PAGE_SIZE_RANGE.start()..=*PAGE_SIZE_RANGE.end()),
-                        );
-                        ui.end_row();
+                        ui.selectable_value(&mut self.settings_pane, SettingsPane::Cache, "Cache");
                     });
-                ui.add_space(8.0);
-                ui.checkbox(
-                    &mut self.settings.remember_password,
-                    "Remember password on this computer",
-                );
-                ui.add_enabled(
-                    self.settings.remember_password,
-                    egui::Checkbox::new(
-                        &mut self.settings.auto_login,
-                        "Sign in automatically when the app starts",
-                    ),
-                );
-                ui.checkbox(
-                    &mut self.settings.notifications,
-                    "Show desktop notifications for new mail",
-                );
-                ui.weak("The page size applies the next time the mailbox loads.");
-                ui.add_space(8.0);
-                if let Some(email) = self.settings.email.clone()
-                    && ui.button("Forget saved password").clicked()
-                {
-                    forget = true;
-                    self.status = credentials::forget_password(&email).err();
-                }
+                egui::CentralPanel::default().show(ui, |ui| match self.settings_pane {
+                    SettingsPane::General => {
+                        forget = self.general_settings(ui);
+                    }
+                    SettingsPane::Cache => {
+                        verify = self.cache_settings(ui);
+                    }
+                });
             });
-        if forget {
-            self.settings.remember_password = false;
-            self.login.remember = false;
+        if verify {
+            self.start_cache_check();
         }
         self.settings = std::mem::take(&mut self.settings).clamped();
         if !open {
@@ -1708,6 +1719,133 @@ impl App {
             self.login.remember = self.settings.remember_password;
             self.save_settings();
         }
+    }
+
+    /// The General pane. Returns whether "Forget saved password" was clicked.
+    fn general_settings(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut forget = false;
+        egui::Grid::new("settings_grid")
+            .num_columns(2)
+            .show(ui, |ui| {
+                ui.label("Check for new mail every (seconds)");
+                ui.add(
+                    egui::DragValue::new(&mut self.settings.check_interval_secs)
+                        .range(*CHECK_INTERVAL_RANGE.start()..=*CHECK_INTERVAL_RANGE.end()),
+                );
+                ui.end_row();
+
+                ui.label("Messages per page");
+                ui.add(
+                    egui::DragValue::new(&mut self.settings.page_size)
+                        .range(*PAGE_SIZE_RANGE.start()..=*PAGE_SIZE_RANGE.end()),
+                );
+                ui.end_row();
+            });
+        ui.add_space(8.0);
+        ui.checkbox(
+            &mut self.settings.remember_password,
+            "Remember password on this computer",
+        );
+        ui.add_enabled(
+            self.settings.remember_password,
+            egui::Checkbox::new(
+                &mut self.settings.auto_login,
+                "Sign in automatically when the app starts",
+            ),
+        );
+        ui.checkbox(
+            &mut self.settings.notifications,
+            "Show desktop notifications for new mail",
+        );
+        ui.weak("The page size applies the next time the mailbox loads.");
+        ui.add_space(8.0);
+        if let Some(email) = self.settings.email.clone()
+            && ui.button("Forget saved password").clicked()
+        {
+            forget = true;
+            self.status = credentials::forget_password(&email).err();
+        }
+        forget
+    }
+
+    /// The Cache pane: where the cache is, how big, and the verify button. Returns whether verify
+    /// was clicked.
+    fn cache_settings(&mut self, ui: &mut egui::Ui) -> bool {
+        ui.heading("Cache");
+        match self
+            .account
+            .as_deref()
+            .and_then(gmail_imap_proto::store::account_cache_path)
+        {
+            Some(path) => {
+                ui.label(format!("File: {}", path.display()));
+                ui.label(format!("Size: {}", fmt_bytes(cache_file_bytes(&path))));
+            }
+            None => {
+                ui.weak("Sign in to see the cache.");
+            }
+        }
+        ui.add_space(8.0);
+        ui.label(
+            "Verify checks the cache's structure, and that each thread summary agrees with the \
+             messages it's built from. It only reads the cache.",
+        );
+        let running = matches!(self.cache_check, CacheCheck::Running(_));
+        let clicked = ui
+            .add_enabled(
+                !running && self.account.is_some(),
+                egui::Button::new("Verify cache"),
+            )
+            .clicked();
+        ui.add_space(6.0);
+        match &self.cache_check {
+            CacheCheck::Idle => {}
+            CacheCheck::Running(_) => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Checking…");
+                });
+            }
+            CacheCheck::Done(Ok(report)) => {
+                if report.physical.is_empty() && report.logical.is_empty() {
+                    ui.label("The cache is consistent.");
+                } else {
+                    ui.colored_label(egui::Color32::LIGHT_RED, "Problems found:");
+                    for problem in report.physical.iter().chain(&report.logical) {
+                        ui.label(format!("• {problem}"));
+                    }
+                }
+            }
+            CacheCheck::Done(Err(e)) => {
+                ui.colored_label(
+                    egui::Color32::LIGHT_RED,
+                    format!("Could not check the cache: {e}"),
+                );
+            }
+        }
+        clicked
+    }
+
+    /// Runs the cache check on a background thread, on its own read-only connection, so the
+    /// window and the list stay responsive while it runs.
+    fn start_cache_check(&mut self) {
+        let Some(path) = self
+            .account
+            .as_deref()
+            .and_then(gmail_imap_proto::store::account_cache_path)
+        else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let result = gmail_imap_proto::store::Store::open_reader(&path)
+                .and_then(|store| store.check())
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+        self.cache_check = CacheCheck::Running(rx);
     }
 
     fn login_dialog(&mut self, ui: &mut egui::Ui) {
