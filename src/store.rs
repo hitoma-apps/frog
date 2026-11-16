@@ -948,7 +948,22 @@ impl Store {
         }
 
         let mut logical = self.derived_mismatches()?;
-        if let Err(e) = self.conn.execute(
+        if self.read_only {
+            // FTS5's integrity-check is written as an INSERT, which a read-only connection
+            // can't run. The reader compares how many documents the index holds with how
+            // many messages there are instead.
+            let (indexed, messages): (i64, i64) = self.conn.query_row(
+                "SELECT (SELECT COUNT(*) FROM messages_fts_docsize),
+                        (SELECT COUNT(*) FROM messages)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            if indexed != messages {
+                logical.push(format!(
+                    "search index: {indexed} indexed messages, but {messages} messages"
+                ));
+            }
+        } else if let Err(e) = self.conn.execute(
             "INSERT INTO messages_fts (messages_fts) VALUES ('integrity-check')",
             [],
         ) {
@@ -2928,6 +2943,22 @@ mod tests {
             vec![Some(1)]
         );
         assert!(s.list_page(last.last().unwrap().uid, 2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reader_check_runs_without_writing() {
+        let dir = std::env::temp_dir().join(format!("reader-check-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("reader.sqlite");
+        let _ = std::fs::remove_file(&path);
+        let mut writer = Store::open(&path).unwrap();
+        writer
+            .upsert_messages(&[msg(1, 1, &["Work"]), msg(2, 2, &["Work"])])
+            .unwrap();
+        let reader = Store::open_reader(&path).unwrap();
+        let report = reader.check().unwrap();
+        assert!(report.physical.is_empty());
+        assert!(report.logical.is_empty(), "{:?}", report.logical);
     }
 
     #[test]
