@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <!-- Gentle shading: a lighter top, a slightly darker underside. -->
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4FD07E"/>
+      <stop offset="1" stop-color="#2E9E5B"/>
+    </linearGradient>
+    <!-- The trail: red at the top, yellow in the middle, blue at the bottom. -->
+    <linearGradient id="trail" gradientUnits="userSpaceOnUse" x1="0" y1="78" x2="0" y2="182">
+      <stop offset="0" stop-color="#EA4335"/>
+      <stop offset="0.5" stop-color="#FBBC05"/>
+      <stop offset="1" stop-color="#4285F4"/>
+    </linearGradient>
+    <!-- The trail fades out towards its tail. -->
+    <linearGradient id="fadeGrad" gradientUnits="userSpaceOnUse" x1="-14" y1="0" x2="50" y2="0">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0"/>
+      <stop offset="1" stop-color="#FFFFFF"/>
+    </linearGradient>
+    <mask id="fade" maskUnits="userSpaceOnUse" x="-100" y="-100" width="456" height="456">
+      <rect x="-100" y="-100" width="456" height="456" fill="url(#fadeGrad)"/>
+    </mask>
+  </defs>
+
+  <rect width="256" height="256" rx="56" fill="#17221D"/>
+
+  <!-- Drawn in the frog's direction of travel, so the speed lines trail straight behind it. -->
+  <!-- The whole scene is scaled down a little, to leave room behind the frog for the trail. -->
+  <g transform="translate(128 128) scale(0.76) translate(-128 -128)">
+  <g transform="rotate(-16 128 128)">
+    <!-- one continuous trail, tapering to a point behind the frog -->
+    <path d="M70 78 H-14 V182 H70 Z" fill="url(#trail)" mask="url(#fade)"/>
+
+    <!-- the top of the trail runs forward behind the frog, in the same gradient -->
+    <path d="M40 78 H160 V112 H40 Z" fill="url(#trail)" mask="url(#fade)"/>
+    <!-- back legs, kicked out -->
+    <path d="M92 152 L52 186" fill="none" stroke="url(#body)" stroke-width="26" stroke-linecap="round"/>
+    <ellipse cx="44" cy="191" rx="21" ry="12" fill="url(#body)" transform="rotate(-30 44 191)"/>
+
+    <!-- body and head -->
+    <ellipse cx="120" cy="136" rx="66" ry="46" fill="url(#body)"/>
+    <ellipse cx="170" cy="114" rx="48" ry="36" fill="url(#body)"/>
+
+    <!-- front legs, reaching forward -->
+    <path d="M148 160 L184 176 L210 164" fill="none" stroke="url(#body)" stroke-width="24" stroke-linecap="round" stroke-linejoin="round"/>
+    <ellipse cx="217" cy="160" rx="18" ry="11" fill="url(#body)" transform="rotate(-24 217 160)"/>
+
+    <!-- grin -->
+    <path d="M170 134 Q187 146 204 131" fill="none" stroke="#17221D" stroke-width="7" stroke-linecap="round"/>
+
+    <!-- two matching eyes on top of the head -->
+    <circle cx="156" cy="88" r="16" fill="#FFFFFF"/>
+    <circle cx="186" cy="88" r="16" fill="#FFFFFF"/>
+    <circle cx="160" cy="90" r="7.5" fill="#17221D"/>
+    <circle cx="190" cy="90" r="7.5" fill="#17221D"/>
+  </g>
+  </g>
+</svg>

@@ -68,6 +68,15 @@ const SENDER_ROWS: usize = 500;
 /// How many threads the waiting-for-reply view lists.
 const WAITING_ROWS: usize = 500;
 
+/// The window icon, from assets/frog-64.rgba (64 by 64 RGBA pixels, made from assets/frog.svg).
+fn app_icon() -> egui::IconData {
+    egui::IconData {
+        rgba: include_bytes!("../assets/frog-64.rgba").to_vec(),
+        width: 64,
+        height: 64,
+    }
+}
+
 fn main() -> eframe::Result {
     let creds = match (
         std::env::var("GMAIL_USER"),
@@ -85,6 +94,7 @@ fn main() -> eframe::Result {
         .clamped();
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("FROG")
+        .with_icon(app_icon())
         .with_inner_size(settings.window.size);
     if let Some(position) = settings.window.position {
         viewport = viewport.with_position(position);
@@ -3493,6 +3503,7 @@ impl App {
     fn login_window(&mut self, ctx: &egui::Context) {
         let builder = egui::ViewportBuilder::default()
             .with_title("Sign in")
+            .with_icon(app_icon())
             .with_inner_size([440.0, 330.0]);
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("sign-in"),

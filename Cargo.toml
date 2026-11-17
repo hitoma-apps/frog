@@ -33,3 +33,6 @@ zstd = "0.14.4"
 strip = true
 lto = "fat"
 codegen-units = 1
+
+[build-dependencies]
+winres = "0.1"
