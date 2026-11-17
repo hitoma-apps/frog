@@ -1,3 +1,4 @@
+#![cfg_attr(feature = "demo", allow(dead_code))]
 //! Message model and the `MailSource` trait that the worker thread drives.
 //!
 //! A `MailSource` owns one connection. The worker calls it from a background
@@ -315,7 +316,7 @@ pub fn label_refs(labels: &[String]) -> Vec<LabelRef<'_>> {
 }
 
 /// The header block of a raw message: everything up to and including the first blank line.
-#[cfg(test)]
+#[cfg(any(test, feature = "demo"))]
 pub fn header_block(raw: &[u8]) -> Vec<u8> {
     match raw.windows(4).position(|w| w == b"\r\n\r\n") {
         Some(i) => raw[..i + 4].to_vec(),
@@ -325,20 +326,20 @@ pub fn header_block(raw: &[u8]) -> Vec<u8> {
 
 /// In-memory mailbox for tests. Clones share the same state, so a test can
 /// change messages through a [`MockHandle`] while the worker is running.
-#[cfg(test)]
+#[cfg(any(test, feature = "demo"))]
 #[derive(Clone)]
 pub struct MockSource {
     state: std::sync::Arc<std::sync::Mutex<MockState>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "demo"))]
 #[derive(Default)]
 struct MockState {
     entries: Vec<MockEntry>,
     highest_modseq: u64,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "demo"))]
 struct MockEntry {
     msgid: u64,
     thrid: u64,
@@ -350,13 +351,13 @@ struct MockEntry {
 }
 
 /// Changes the mock mailbox the way another client would.
-#[cfg(test)]
+#[cfg(any(test, feature = "demo"))]
 #[derive(Clone)]
 pub struct MockHandle {
     state: std::sync::Arc<std::sync::Mutex<MockState>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "demo"))]
 impl MockHandle {
     /// Replaces a message's labels, as another client would.
     pub fn set_labels(&self, uid: u32, labels: &[&str]) {
@@ -406,7 +407,7 @@ impl MockHandle {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "demo"))]
 impl MockSource {
     /// Six messages, UIDs 1 to 6.
     pub fn demo() -> Self {
@@ -535,7 +536,7 @@ impl MockSource {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "demo"))]
 impl MailSource for MockSource {
     fn select(&mut self) -> Result<MailboxInfo, SourceError> {
         let st = self.state.lock().unwrap();

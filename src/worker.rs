@@ -22,6 +22,7 @@ use gmail_imap_proto::store::{
 use gmail_imap_proto::uidset::UidSet;
 
 use crate::backend::{IdleNotice, MailSource, MailboxInfo, Message, MessageUpdate, SourceError};
+#[cfg_attr(feature = "demo", allow(unused_imports))]
 use crate::live;
 
 /// How long one IDLE wait lasts before checking for commands.
@@ -252,15 +253,18 @@ fn cache_for(email: &str, body_cap: u64) -> (Option<Store>, Option<Store>, Vec<E
 /// Starts the worker for `user`. `body_cap` is how many bytes of message bodies the cache keeps.
 pub fn spawn_gmail(user: String, password: String, ctx: egui::Context, body_cap: u64) -> Link {
     let (store, reader, startup) = cache_for(&user, body_cap);
-    spawn_with_reader(
-        ctx,
-        Box::new(move || live::connect_gmail(&user, &password)),
-        KEEPALIVE,
-        RETRY_BASE,
-        store,
-        reader,
-        startup,
-    )
+    // With the `demo` feature, the built-in demo mailbox stands in for Gmail, so the app can
+    // be run and screenshotted without an account.
+    #[cfg(feature = "demo")]
+    let connect: Connector = {
+        let demo = crate::backend::MockSource::demo();
+        Box::new(move || Ok(Box::new(demo.clone()) as Box<dyn MailSource>))
+    };
+    #[cfg(not(feature = "demo"))]
+    let connect: Connector = Box::new(move || live::connect_gmail(&user, &password));
+    #[cfg(feature = "demo")]
+    let _ = password;
+    spawn_with_reader(ctx, connect, KEEPALIVE, RETRY_BASE, store, reader, startup)
 }
 
 #[cfg(test)]

@@ -1,3 +1,4 @@
+#![cfg_attr(feature = "demo", allow(dead_code))]
 //! Gmail session: implements `MailSource` over IMAP.
 
 use std::io::{Read, Write};

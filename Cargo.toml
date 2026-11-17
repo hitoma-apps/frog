@@ -8,6 +8,10 @@ edition = "2024"
 name = "frog"
 path = "src/main.rs"
 
+[features]
+# Runs against a built-in demo mailbox instead of Gmail, for screenshots and manual checks.
+demo = ["eframe/glow"]
+
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 directories = "6.0.0"

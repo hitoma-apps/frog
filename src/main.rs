@@ -91,6 +91,9 @@ fn main() -> eframe::Result {
     }
     let options = eframe::NativeOptions {
         viewport,
+        // The demo build draws with OpenGL, which works on a virtual display without a GPU.
+        #[cfg(feature = "demo")]
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
     eframe::run_native(
@@ -751,6 +754,7 @@ impl App {
         };
         let default_sort = settings.default_sort;
         ctx.set_theme(theme_preference(settings.theme));
+        apply_accent(&ctx);
         let mut login = LoginForm {
             remember: settings.remember_password,
             ..Default::default()
@@ -3822,6 +3826,61 @@ fn draw_thread_row(ui: &mut egui::Ui, view: &RowView, checked: bool) -> RowActio
 }
 
 /// The egui theme for a theme choice.
+/// FROG's accent colours for one theme. The fill is the background of a selected row or
+/// item. egui draws the text of a selected item in `selection_text`, so that's a readable
+/// colour rather than the accent itself. The link colour is used for hyperlinks.
+#[derive(Clone, Copy)]
+struct Accent {
+    selection_fill: egui::Color32,
+    selection_text: egui::Color32,
+    hyperlink: egui::Color32,
+}
+
+fn accent(theme: egui::Theme) -> Accent {
+    match theme {
+        egui::Theme::Dark => Accent {
+            selection_fill: egui::Color32::from_rgb(0x1F, 0x5C, 0x3A),
+            selection_text: egui::Color32::from_rgb(0xF0, 0xF7, 0xF2),
+            hyperlink: egui::Color32::from_rgb(0x5B, 0xD2, 0x8A),
+        },
+        egui::Theme::Light => Accent {
+            selection_fill: egui::Color32::from_rgb(0xCD, 0xEB, 0xD8),
+            selection_text: egui::Color32::from_rgb(0x0F, 0x24, 0x18),
+            hyperlink: egui::Color32::from_rgb(0x1E, 0x7A, 0x43),
+        },
+    }
+}
+
+/// Sets the accent colours for both themes, so they apply whichever theme is in use.
+fn apply_accent(ctx: &egui::Context) {
+    for theme in [egui::Theme::Dark, egui::Theme::Light] {
+        let colours = accent(theme);
+        ctx.style_mut_of(theme, |style| {
+            style.visuals.selection.bg_fill = colours.selection_fill;
+            style.visuals.selection.stroke = egui::Stroke::new(1.0, colours.selection_text);
+            style.visuals.hyperlink_color = colours.hyperlink;
+        });
+    }
+}
+
+/// The WCAG contrast ratio between two colours, from 1 to 21. Used by the tests.
+#[cfg(test)]
+fn contrast(a: egui::Color32, b: egui::Color32) -> f32 {
+    fn luminance(c: egui::Color32) -> f32 {
+        let lin = |v: u8| {
+            let v = f32::from(v) / 255.0;
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+    }
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
 fn theme_preference(theme: Theme) -> egui::ThemePreference {
     match theme {
         Theme::System => egui::ThemePreference::System,
@@ -3929,9 +3988,7 @@ impl eframe::App for App {
             && self.title_for.as_deref() != Some(account.as_str())
         {
             ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::Title(format!(
-                    "FROG — {account}"
-                )));
+                .send_viewport_cmd(egui::ViewportCommand::Title(format!("FROG — {account}")));
             self.title_for = Some(account.clone());
         }
         // The cache file's size, checked every few seconds.
@@ -4003,6 +4060,20 @@ impl eframe::App for App {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn accent_colours_meet_contrast_on_both_themes() {
+        for (theme, visuals) in [
+            (egui::Theme::Dark, egui::Visuals::dark()),
+            (egui::Theme::Light, egui::Visuals::light()),
+        ] {
+            let colours = accent(theme);
+            // Links are text on the panel background.
+            assert!(contrast(colours.hyperlink, visuals.panel_fill) >= 4.5);
+            // The text of a selected row is drawn on the selection fill.
+            assert!(contrast(colours.selection_text, colours.selection_fill) >= 4.5);
+        }
+    }
+
     use super::*;
 
     fn message_with(labels: &[&str]) -> Message {
