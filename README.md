@@ -1,6 +1,6 @@
 # FROG
 
-**FROG** (Fast Read Only Gmail) is a small, fast, read-only Gmail client for Windows and Linux. It talks to Gmail over IMAP, keeps a local SQLite cache, and shows Gmail labels as they are.
+**FROG** (Fast Read-Oriented Gmail) is a small, fast Gmail client built for reading for Windows and Linux. It talks to Gmail over IMAP, keeps a local SQLite cache, and shows Gmail labels as they are.
 
 ## Building
 
