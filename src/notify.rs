@@ -27,7 +27,7 @@ pub fn new_mail(items: &[NewMail], on_click: impl FnOnce() + Send + 'static) -> 
         ),
     };
     let handle = notify_rust::Notification::new()
-        .appname("Gmail Labels Prototype")
+        .appname("FROG")
         .summary(&summary)
         .body(&body)
         .action("default", "Open")

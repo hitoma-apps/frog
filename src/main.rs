@@ -84,7 +84,7 @@ fn main() -> eframe::Result {
         .unwrap_or_default()
         .clamped();
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("Gmail Labels Prototype")
+        .with_title("FROG")
         .with_inner_size(settings.window.size);
     if let Some(position) = settings.window.position {
         viewport = viewport.with_position(position);
@@ -94,7 +94,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "Gmail Labels Prototype",
+        "FROG",
         options,
         Box::new(move |cc| Ok(Box::new(App::new(cc.egui_ctx.clone(), creds)))),
     )
@@ -3930,7 +3930,7 @@ impl eframe::App for App {
         {
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::Title(format!(
-                    "Gmail Labels Prototype — {account}"
+                    "FROG — {account}"
                 )));
             self.title_for = Some(account.clone());
         }

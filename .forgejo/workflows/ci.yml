@@ -37,9 +37,9 @@ jobs:
       - name: Upload release build
         uses: actions/upload-artifact@v3
         with:
-          name: gmail-imap-proto-linux-x86_64
+          name: frog-linux-x86_64
           path: |
-            target/release/gmail-imap-proto
+            target/release/frog
             target/release/libgmail_imap_proto.rlib
           if-no-files-found: error
           retention-days: 14
@@ -72,7 +72,7 @@ jobs:
           CODESIGN_PASSWORD: ${{ secrets.CODESIGN_PASSWORD }}
         run: |
           set -euo pipefail
-          exe=target/x86_64-pc-windows-gnu/release/gmail-imap-proto.exe
+          exe=target/x86_64-pc-windows-gnu/release/frog.exe
           if [ -z "$CODESIGN_PFX_B64" ]; then
             echo "::warning::CODESIGN_PFX_B64 is not set; the Windows binary is unsigned"
             exit 0
@@ -85,7 +85,7 @@ jobs:
           printf '%s' "$CODESIGN_PASSWORD" > "$work/pass.txt"
           osslsigncode sign \
             -pkcs12 "$work/codesign.pfx" -readpass "$work/pass.txt" \
-            -n "Gmail Labels Prototype" -h sha256 \
+            -n "FROG" -h sha256 \
             -in "$exe" -out "$work/signed.exe"
           mv "$work/signed.exe" "$exe"
           rm -rf "$work"
@@ -94,9 +94,9 @@ jobs:
       - name: Upload Windows build
         uses: actions/upload-artifact@v3
         with:
-          name: gmail-imap-proto-windows-x86_64
+          name: frog-windows-x86_64
           path: |
-            target/x86_64-pc-windows-gnu/release/gmail-imap-proto.exe
+            target/x86_64-pc-windows-gnu/release/frog.exe
             signing/gmail-labels-test-signing.cer
           if-no-files-found: error
           retention-days: 14

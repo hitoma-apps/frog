@@ -1,4 +1,4 @@
-Gmail Labels Prototype: help
+FROG: help
 
 == Search ==
 

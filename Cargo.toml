@@ -3,6 +3,11 @@ name = "gmail-imap-proto"
 version = "0.1.0"
 edition = "2024"
 
+# The app is called FROG. The package name stays, since the library and its tests use it.
+[[bin]]
+name = "frog"
+path = "src/main.rs"
+
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 directories = "6.0.0"
