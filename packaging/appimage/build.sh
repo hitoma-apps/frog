@@ -15,7 +15,14 @@ if ! command -v "$tool" >/dev/null 2>&1; then
     exit 1
 fi
 
-cargo build --release --locked
+# CI builds the binary in an earlier job and sets SKIP_BUILD, so it isn't built twice.
+if [ -z "${SKIP_BUILD:-}" ]; then
+    cargo build --release --locked
+fi
+if [ ! -x target/release/frog ]; then
+    echo "target/release/frog is missing; build it first, or unset SKIP_BUILD." >&2
+    exit 1
+fi
 
 appdir="$root/target/AppDir"
 rm -rf "$appdir"

@@ -44,6 +44,53 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  appimage:
+    name: AppImage (reuses the Linux release build)
+    needs: build
+    runs-on: docker
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the Linux release build
+        uses: actions/download-artifact@v3
+        with:
+          name: frog-linux-x86_64
+          path: target/release
+
+      - name: Get appimagetool
+        id: tool
+        env:
+          APPIMAGETOOL_URL: ${{ vars.APPIMAGETOOL_URL }}
+          APPIMAGETOOL_SHA256: ${{ vars.APPIMAGETOOL_SHA256 }}
+        run: |
+          if [ -z "$APPIMAGETOOL_URL" ] || [ -z "$APPIMAGETOOL_SHA256" ]; then
+            echo "::warning::APPIMAGETOOL_URL and APPIMAGETOOL_SHA256 are not set; no AppImage is built"
+            echo "have=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          curl --proto '=https' --tlsv1.2 -sSfL -o "$HOME/appimagetool" "$APPIMAGETOOL_URL"
+          echo "$APPIMAGETOOL_SHA256  $HOME/appimagetool" | sha256sum -c -
+          chmod +x "$HOME/appimagetool"
+          echo "have=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build the AppImage
+        if: steps.tool.outputs.have == 'true'
+        env:
+          SKIP_BUILD: "1"
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          chmod +x target/release/frog
+          APPIMAGETOOL="$HOME/appimagetool" sh packaging/appimage/build.sh
+
+      - name: Upload the AppImage
+        if: steps.tool.outputs.have == 'true'
+        uses: actions/upload-artifact@v3
+        with:
+          name: FROG-x86_64.AppImage
+          path: target/FROG-x86_64.AppImage
+          if-no-files-found: error
+          retention-days: 14
+
   windows:
     name: Windows build (cross-compiled)
     runs-on: docker
