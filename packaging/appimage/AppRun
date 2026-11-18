@@ -1,0 +1,4 @@
+#!/bin/sh
+# Starts FROG from inside the AppImage, passing along any arguments.
+here=$(dirname "$(readlink -f "$0")")
+exec "$here/usr/bin/frog" "$@"
