@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=FROG
+GenericName=Email client
+Comment=Fast Read-Oriented Gmail
+Exec=frog
+Icon=frog
+Terminal=false
+Categories=Network;Email;
+StartupWMClass=frog

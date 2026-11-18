@@ -68,6 +68,9 @@ const SENDER_ROWS: usize = 500;
 /// How many threads the waiting-for-reply view lists.
 const WAITING_ROWS: usize = 500;
 
+/// The app ID that Wayland desktops match to packaging/linux/frog.desktop, which names the icon.
+const APP_ID: &str = "frog";
+
 /// The window icon, from assets/frog-64.rgba (64 by 64 RGBA pixels, made from assets/frog.svg).
 fn app_icon() -> egui::IconData {
     egui::IconData {
@@ -94,6 +97,7 @@ fn main() -> eframe::Result {
         .clamped();
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("FROG")
+        .with_app_id(APP_ID)
         .with_icon(app_icon())
         .with_inner_size(settings.window.size);
     if let Some(position) = settings.window.position {
@@ -3503,6 +3507,7 @@ impl App {
     fn login_window(&mut self, ctx: &egui::Context) {
         let builder = egui::ViewportBuilder::default()
             .with_title("Sign in")
+            .with_app_id(APP_ID)
             .with_icon(app_icon())
             .with_inner_size([440.0, 330.0]);
         ctx.show_viewport_immediate(
