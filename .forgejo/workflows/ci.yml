@@ -58,23 +58,28 @@ jobs:
           path: target/release
 
       - name: Get appimagetool
-        id: tool
-        env:
-          APPIMAGETOOL_URL: ${{ vars.APPIMAGETOOL_URL }}
-          APPIMAGETOOL_SHA256: ${{ vars.APPIMAGETOOL_SHA256 }}
         run: |
-          if [ -z "$APPIMAGETOOL_URL" ] || [ -z "$APPIMAGETOOL_SHA256" ]; then
-            echo "::warning::APPIMAGETOOL_URL and APPIMAGETOOL_SHA256 are not set; no AppImage is built"
-            echo "have=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          curl --proto '=https' --tlsv1.2 -sSfL -o "$HOME/appimagetool" "$APPIMAGETOOL_URL"
-          echo "$APPIMAGETOOL_SHA256  $HOME/appimagetool" | sha256sum -c -
+          set -eu
+          asset=appimagetool-x86_64.AppImage
+          release=https://api.github.com/repos/AppImage/appimagetool/releases/tags/continuous
+          url=https://github.com/AppImage/appimagetool/releases/download/continuous/$asset
+          # The checksum comes from the release metadata, not from the download itself. The job
+          # fails if GitHub doesn't publish one, rather than running an unchecked tool.
+          curl --proto '=https' --tlsv1.2 -sSfL -o "$HOME/release.json" "$release"
+          digest=$(python3 -c '
+          import json, sys
+          asset = sys.argv[2]
+          release = json.load(open(sys.argv[1]))
+          match = [a.get("digest", "") for a in release.get("assets", []) if a.get("name") == asset]
+          if not match or not match[0].startswith("sha256:"):
+              sys.exit("no sha256 digest published for " + asset)
+          print(match[0][len("sha256:"):])
+          ' "$HOME/release.json" "$asset")
+          curl --proto '=https' --tlsv1.2 -sSfL -o "$HOME/appimagetool" "$url"
+          echo "$digest  $HOME/appimagetool" | sha256sum -c -
           chmod +x "$HOME/appimagetool"
-          echo "have=true" >> "$GITHUB_OUTPUT"
 
       - name: Build the AppImage
-        if: steps.tool.outputs.have == 'true'
         env:
           SKIP_BUILD: "1"
           APPIMAGE_EXTRACT_AND_RUN: "1"
@@ -83,7 +88,6 @@ jobs:
           APPIMAGETOOL="$HOME/appimagetool" sh packaging/appimage/build.sh
 
       - name: Upload the AppImage
-        if: steps.tool.outputs.have == 'true'
         uses: actions/upload-artifact@v3
         with:
           name: FROG-x86_64.AppImage
