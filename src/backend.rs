@@ -4,12 +4,12 @@
 //! A `MailSource` owns one connection. The worker calls it from a background
 //! thread, so the GUI never blocks on the network.
 
-use gmail_imap_proto::auth::AuthCheck;
+use frog::auth::AuthCheck;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use gmail_imap_proto::labels::{LabelAction, LabelRef, SystemLabel};
-use gmail_imap_proto::store::CachedMessage;
+use frog::labels::{LabelAction, LabelRef, SystemLabel};
+use frog::store::CachedMessage;
 use mail_parser::MessageParser;
 
 /// Why a mail operation failed.
@@ -129,7 +129,7 @@ impl Message {
         headers: Vec<u8>,
     ) -> Self {
         let parsed = MessageParser::default().parse(&headers);
-        let auth = gmail_imap_proto::auth::checks(&headers);
+        let auth = frog::auth::checks(&headers);
         let sent = parsed
             .as_ref()
             .and_then(|m| m.date())
@@ -213,7 +213,7 @@ impl Message {
             subject: c.subject,
             date: c.date,
             sent: c.sent,
-            auth: gmail_imap_proto::auth::checks(&c.headers),
+            auth: frog::auth::checks(&c.headers),
             headers: c.headers,
             body: None,
         })
@@ -605,9 +605,8 @@ impl MailSource for MockSource {
         if found.is_empty() {
             return Err("no messages selected".into());
         }
-        let command =
-            gmail_imap_proto::labels::uid_store_labels(&found, action, &label_refs(labels))
-                .ok_or_else(|| "nothing to change".to_string())?;
+        let command = frog::labels::uid_store_labels(&found, action, &label_refs(labels))
+            .ok_or_else(|| "nothing to change".to_string())?;
 
         st.highest_modseq += 1;
         let modseq = st.highest_modseq;
@@ -660,7 +659,7 @@ impl MailSource for MockSource {
             return Err("no messages selected".into());
         }
         let mut set = String::new();
-        gmail_imap_proto::labels::push_uid_set(&mut set, &found);
+        frog::labels::push_uid_set(&mut set, &found);
         let command = format!(
             "UID STORE {set} {}FLAGS.SILENT (\\Seen)",
             if seen { "+" } else { "-" }

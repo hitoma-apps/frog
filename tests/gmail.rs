@@ -1,5 +1,5 @@
-use gmail_imap_proto::labels::{self, Label, LabelAction, LabelRef, SystemLabel};
-use gmail_imap_proto::{parse_gmail_fetch, render_plaintext, uid_store_labels};
+use frog::labels::{self, Label, LabelAction, LabelRef, SystemLabel};
+use frog::{parse_gmail_fetch, render_plaintext, uid_store_labels};
 
 /// Builds a FETCH response with a literal body. The body deliberately contains
 /// `)`, `"` and CRLF so the literal skipping is exercised.

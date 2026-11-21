@@ -21,16 +21,16 @@ Each step has a ticket. Steps are in dependency order.
 - **Branches:** the Forgejo hostname appears once, in a deleted probe workflow on the parked `workflows-split` branch. Only `main` moves.
 - **Issues:** numbered from 1 with no gaps and no pull requests. No labels or milestones. Searching issue text and comments found nothing sensitive.
 
-A text search isn't a guarantee, so step 1 includes a gitleaks scan before the first push.
+A text search isn't a guarantee, so step 1 included a gitleaks scan of every branch's history. It found no leaks.
 
 ## Steps
 
 ### 1. Prepare the repo for public release (#70)
 
-- Add a `LICENSE` and update the README.
+- Add an MIT `LICENSE` and a license section in the README.
 - Delete the test certificate and the `.forgejo` workflows.
-- Optionally rename the package from `gmail-imap-proto` to `frog`. The data folder and keyring name stay the same, so existing caches and saved sign-ins still work.
-- Run gitleaks over the full history.
+- Rename the package from `gmail-imap-proto` to `frog`; the library is now `frog`. The data folder and keyring name stay the same, so existing caches and saved sign-ins still work.
+- Run gitleaks over the full history: no leaks found.
 
 ### 2. Create `hitoma-apps/frog` and push `main` (#71)
 
@@ -74,12 +74,14 @@ In CI: Azure login over OIDC, then signing on the Windows runner. Velopack may b
 
 Versioned tags build GitHub Releases, and Velopack packages each platform and publishes to the release. The app downloads updates in the background and offers "Restart to update". The full plan is in [`auto-update.md`](auto-update.md). Smart App Control blocks unsigned Windows updates, so step 6 comes first.
 
-## Decisions pending
+## Decisions
+
+Made: the license is MIT, and the package is renamed to `frog`.
+
+Pending:
 
 1. History: keep it (recommended, since the scans were clean), or start from a fresh commit?
-2. License: for example MIT, Apache-2.0, or both.
-3. Rename the package and crate to `frog`?
-4. Forgejo afterwards: archive, mirror or delete? And the earlier stray GitHub copy, `shawngmc/gmail-imap-labels-experiment`: delete it?
-5. Windows: build natively with MSVC (recommended), or keep cross-compiling?
-6. macOS: Apple Silicon only, or universal?
-7. Artifact Signing: does hitoma-apps qualify for identity validation?
+2. Forgejo afterwards: archive, mirror or delete? And the earlier stray GitHub copy, `shawngmc/gmail-imap-labels-experiment`: delete it?
+3. Windows: build natively with MSVC (recommended), or keep cross-compiling?
+4. macOS: Apple Silicon only, or universal?
+5. Artifact Signing: does hitoma-apps qualify for identity validation?

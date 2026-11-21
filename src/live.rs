@@ -4,9 +4,9 @@
 use std::io::{Read, Write};
 use std::time::Duration;
 
-use gmail_imap_proto::imap::{ImapConn, ImapError, SetReadTimeout, connect_tls};
-use gmail_imap_proto::labels::LabelAction;
-use gmail_imap_proto::parse_gmail_fetch;
+use frog::imap::{ImapConn, ImapError, SetReadTimeout, connect_tls};
+use frog::labels::LabelAction;
+use frog::parse_gmail_fetch;
 
 use crate::backend::{
     IdleNotice, MailSource, MailboxInfo, Message, MessageUpdate, SourceError, StructureInfo,
@@ -37,7 +37,7 @@ pub struct LiveSession<S: Read + Write> {
 impl<S: Read + Write> LiveSession<S> {
     /// Logs in and checks that the server is Gmail.
     pub fn open(mut conn: ImapConn<S>, user: &str, password: &str) -> Result<Self, String> {
-        let err = |e: gmail_imap_proto::imap::ImapError| e.to_string();
+        let err = |e: frog::imap::ImapError| e.to_string();
         conn.login(user, password).map_err(err)?;
         let caps = conn.capabilities().map_err(err)?;
         if !caps.iter().any(|c| c.eq_ignore_ascii_case("X-GM-EXT-1")) {

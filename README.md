@@ -23,3 +23,7 @@ It copies `frog.desktop` and the icon into your user folders. It doesn't need ro
 ## Where data is kept
 
 FROG stores its cache and settings under the platform's data directory, in a folder named `gmail-labels-proto`. Passwords go in the system keyring under the same name. These names are kept so existing caches and saved sign-ins still work.
+
+## License
+
+FROG is released under the [MIT License](LICENSE).

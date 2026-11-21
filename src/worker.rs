@@ -14,12 +14,12 @@ use std::thread;
 use std::time::Duration;
 
 use eframe::egui;
-use gmail_imap_proto::labels::LabelAction;
-use gmail_imap_proto::store::{
+use frog::labels::LabelAction;
+use frog::store::{
     DEFAULT_BODY_CAP, ListOrder, MailboxState, PageCursor, SAMPLE_STRIDE, Store, ThreadFilter,
     account_cache_path,
 };
-use gmail_imap_proto::uidset::UidSet;
+use frog::uidset::UidSet;
 
 use crate::backend::{IdleNotice, MailSource, MailboxInfo, Message, MessageUpdate, SourceError};
 #[cfg_attr(feature = "demo", allow(unused_imports))]
@@ -81,7 +81,7 @@ pub enum Command {
     Waiting { account: String, limit: usize },
     /// Searches the cached messages for a query.
     Search {
-        query: gmail_imap_proto::search::Query,
+        query: frog::search::Query,
         limit: usize,
     },
     /// Checks the cache on the writing connection, including the search index. Problems that
@@ -180,15 +180,15 @@ pub enum Event {
         total: usize,
     },
     /// The largest cached messages, and how many messages have a known size.
-    Largest(gmail_imap_proto::store::StorageView),
+    Largest(frog::store::StorageView),
     /// The senders with the most cached messages.
-    Senders(Vec<gmail_imap_proto::store::SenderStat>),
+    Senders(Vec<frog::store::SenderStat>),
     /// Threads waiting for a reply, with each thread's message count.
-    Waiting(Vec<(gmail_imap_proto::store::CachedMessage, usize)>),
+    Waiting(Vec<(frog::store::CachedMessage, usize)>),
     /// The messages matching a search. `query` says which search this answers.
     Search {
-        query: gmail_imap_proto::search::Query,
-        hits: Vec<gmail_imap_proto::store::CachedMessage>,
+        query: frog::search::Query,
+        hits: Vec<frog::store::CachedMessage>,
     },
     /// Every cached message of one thread, newest first.
     Thread {
@@ -1125,7 +1125,7 @@ impl Worker {
             ));
             return;
         };
-        let result = (|| -> Result<Event, gmail_imap_proto::store::StoreError> {
+        let result = (|| -> Result<Event, frog::store::StoreError> {
             let first = store.check()?;
             let problems: Vec<String> = first
                 .physical
@@ -1536,7 +1536,7 @@ fn read_senders(store: Option<&Store>, emit: &Emitter, limit: usize) {
 
 /// Answers the storage view with the largest cached messages.
 fn read_largest(store: Option<&Store>, emit: &Emitter, limit: usize) {
-    use gmail_imap_proto::store::StorageView;
+    use frog::store::StorageView;
     let view = match store {
         Some(store) => store.storage_view(limit),
         None => Ok(StorageView::default()),
@@ -1548,12 +1548,7 @@ fn read_largest(store: Option<&Store>, emit: &Emitter, limit: usize) {
 }
 
 /// Answers a search with the matching cached messages.
-fn read_search(
-    store: Option<&Store>,
-    emit: &Emitter,
-    query: &gmail_imap_proto::search::Query,
-    limit: usize,
-) {
+fn read_search(store: Option<&Store>, emit: &Emitter, query: &frog::search::Query, limit: usize) {
     let hits = match store {
         Some(store) => store.search_messages(query, limit),
         None => Ok(Vec::new()),
@@ -1581,7 +1576,7 @@ fn read_loop(store: Store, requests: Receiver<Command>, emit: Emitter) {
 mod tests {
     use super::*;
     use crate::backend::MockSource;
-    use gmail_imap_proto::store::DEFAULT_BODY_CAP;
+    use frog::store::DEFAULT_BODY_CAP;
     use std::collections::HashSet;
 
     /// Wraps the demo mailbox and fails with a dropped connection while `fail` is set.
@@ -1755,16 +1750,15 @@ mod tests {
         .into_bytes();
 
         let start = rss_mb();
-        let sent = gmail_imap_proto::store::sent_timestamp(&headers);
+        let sent = frog::store::sent_timestamp(&headers);
         let write_started = std::time::Instant::now();
         {
             let mut store = Store::open(&path).unwrap();
             let labels: std::collections::BTreeSet<String> =
                 ["\\Inbox".to_string(), "Work".to_string()].into();
             for first in (1..=N).step_by(200) {
-                let batch: Vec<gmail_imap_proto::store::CachedMessage> = (first
-                    ..(first + 200).min(N + 1))
-                    .map(|uid| gmail_imap_proto::store::CachedMessage {
+                let batch: Vec<frog::store::CachedMessage> = (first..(first + 200).min(N + 1))
+                    .map(|uid| frog::store::CachedMessage {
                         msgid: 1_000_000_000_000 + u64::from(uid),
                         attachment: None,
                         received: None,
@@ -2329,7 +2323,7 @@ mod tests {
 mod sync_tests {
     use super::*;
     use crate::backend::MockSource;
-    use gmail_imap_proto::store::DEFAULT_BODY_CAP;
+    use frog::store::DEFAULT_BODY_CAP;
     use std::collections::{BTreeSet, VecDeque};
     use std::sync::{Arc, Mutex};
 

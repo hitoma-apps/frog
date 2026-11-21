@@ -22,22 +22,22 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use gmail_imap_proto::attachments::{self, AttachmentInfo};
-use gmail_imap_proto::auth::AuthCheck;
-use gmail_imap_proto::export;
-use gmail_imap_proto::impersonation;
-use gmail_imap_proto::importance;
-use gmail_imap_proto::labels::{LabelAction, SystemLabel};
-use gmail_imap_proto::linkcheck::{self, LinkInfo};
-use gmail_imap_proto::links::gmail_thread_url;
-use gmail_imap_proto::render_plaintext;
-use gmail_imap_proto::search;
-use gmail_imap_proto::settings::{
+use frog::attachments::{self, AttachmentInfo};
+use frog::auth::AuthCheck;
+use frog::export;
+use frog::impersonation;
+use frog::importance;
+use frog::labels::{LabelAction, SystemLabel};
+use frog::linkcheck::{self, LinkInfo};
+use frog::links::gmail_thread_url;
+use frog::render_plaintext;
+use frog::search;
+use frog::settings::{
     self, CHECK_INTERVAL_RANGE, PAGE_SIZE_RANGE, ReadOnOpen, Settings, StartupView, Theme,
 };
 
 use backend::Message;
-use gmail_imap_proto::store::{ListOrder, SortKey, StorageView, ThreadFilter};
+use frog::store::{ListOrder, SortKey, StorageView, ThreadFilter};
 use reader::{Block, Segment};
 use worker::{Command, Event, Link, ServerCheck, ThreadEntry};
 
@@ -144,8 +144,8 @@ enum SettingsPane {
 /// The state of the cache check: not run, running (with the channel its result comes on), or done.
 enum CacheCheck {
     Idle,
-    Running(std::sync::mpsc::Receiver<Result<gmail_imap_proto::store::CheckReport, String>>),
-    Done(Result<gmail_imap_proto::store::CheckReport, String>),
+    Running(std::sync::mpsc::Receiver<Result<frog::store::CheckReport, String>>),
+    Done(Result<frog::store::CheckReport, String>),
 }
 
 /// What the worker's writing check found, and whether it rebuilt anything.
@@ -626,7 +626,7 @@ struct App {
     /// The threads waiting for a reply, once the view has asked for them.
     waiting: Option<Arc<Vec<SearchRow>>>,
     /// The senders with the most cached messages, once the view has asked for them.
-    senders: Option<Arc<Vec<gmail_imap_proto::store::SenderStat>>>,
+    senders: Option<Arc<Vec<frog::store::SenderStat>>>,
     /// Threads whose notifications were clicked, sent from the notification threads.
     click_tx: std::sync::mpsc::Sender<u64>,
     click_rx: std::sync::mpsc::Receiver<u64>,
@@ -2039,7 +2039,7 @@ impl App {
         match self
             .account
             .as_deref()
-            .and_then(gmail_imap_proto::store::account_cache_path)
+            .and_then(frog::store::account_cache_path)
         {
             Some(path) => {
                 ui.label(format!("File: {}", path.display()));
@@ -2197,14 +2197,14 @@ impl App {
         let Some(path) = self
             .account
             .as_deref()
-            .and_then(gmail_imap_proto::store::account_cache_path)
+            .and_then(frog::store::account_cache_path)
         else {
             return;
         };
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
-            let result = gmail_imap_proto::store::Store::open(&path)
+            let result = frog::store::Store::open(&path)
                 .and_then(|mut store| store.clear_bodies())
                 .map_err(|e| e.to_string());
             let _ = tx.send(result);
@@ -2219,14 +2219,14 @@ impl App {
         let Some(path) = self
             .account
             .as_deref()
-            .and_then(gmail_imap_proto::store::account_cache_path)
+            .and_then(frog::store::account_cache_path)
         else {
             return;
         };
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
-            let result = gmail_imap_proto::store::Store::open_reader(&path)
+            let result = frog::store::Store::open_reader(&path)
                 .and_then(|store| store.check())
                 .map_err(|e| e.to_string());
             let _ = tx.send(result);
@@ -2301,7 +2301,7 @@ impl App {
     fn cache_path(&self) -> Option<PathBuf> {
         self.account
             .as_deref()
-            .and_then(gmail_imap_proto::store::account_cache_path)
+            .and_then(frog::store::account_cache_path)
     }
 
     /// Starts a new worker after the old one crashed. The cache is checked on the way in,
@@ -3453,7 +3453,7 @@ impl App {
                             ui.label(format_time(ts));
                             ui.end_row();
                         }
-                        for (name, value) in gmail_imap_proto::original::summary(&m.headers) {
+                        for (name, value) in frog::original::summary(&m.headers) {
                             ui.strong(name);
                             ui.label(value);
                             ui.end_row();

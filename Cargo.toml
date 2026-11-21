@@ -1,12 +1,10 @@
 [package]
-name = "gmail-imap-proto"
+name = "frog"
 version = "0.1.0"
 edition = "2024"
-
-# The app is called FROG. The package name stays, since the library and its tests use it.
-[[bin]]
-name = "frog"
-path = "src/main.rs"
+description = "FROG (Fast Read-Oriented Gmail): a small, fast Gmail client built for reading"
+license = "MIT"
+repository = "https://github.com/hitoma-apps/frog"
 
 [features]
 # Runs against a built-in demo mailbox instead of Gmail, for screenshots and manual checks.
