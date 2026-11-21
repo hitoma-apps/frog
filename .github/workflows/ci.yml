@@ -43,11 +43,11 @@ jobs:
       - name: Release build
         run: cargo build --release --locked
 
-      # Uploaded unzipped, so the binary keeps its executable bit.
+      # Uploaded unzipped, so the binary keeps its executable bit. An unzipped artifact takes its
+      # file's name, so this one is called "frog".
       - name: Upload the Linux binary
         uses: actions/upload-artifact@v7
         with:
-          name: frog-linux-x86_64
           path: target/release/frog
           archive: false
           if-no-files-found: error
@@ -63,7 +63,7 @@ jobs:
       - name: Download the Linux binary
         uses: actions/download-artifact@v8
         with:
-          name: frog-linux-x86_64
+          name: frog
           path: target/release
 
       - name: Get appimagetool
@@ -103,7 +103,6 @@ jobs:
       - name: Upload the AppImage
         uses: actions/upload-artifact@v7
         with:
-          name: FROG-x86_64.AppImage
           path: target/FROG-x86_64.AppImage
           archive: false
           if-no-files-found: error
@@ -127,7 +126,6 @@ jobs:
       - name: Upload the Windows binary
         uses: actions/upload-artifact@v7
         with:
-          name: frog-windows-x86_64.exe
           path: target/release/frog.exe
           archive: false
           if-no-files-found: error
