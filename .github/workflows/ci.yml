@@ -155,7 +155,6 @@ jobs:
       - name: Upload the macOS app
         uses: actions/upload-artifact@v7
         with:
-          name: FROG-macos-universal.zip
           path: target/FROG-macos-universal.zip
           archive: false
           if-no-files-found: error
