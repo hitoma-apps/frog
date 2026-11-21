@@ -1,0 +1,134 @@
+name: CI
+
+# Every branch push runs CI, so a branch is checked before it's merged.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch or pull request cancels the run in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux build, lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --all-targets
+
+      - name: Release build
+        run: cargo build --release --locked
+
+      # Uploaded unzipped, so the binary keeps its executable bit.
+      - name: Upload the Linux binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: frog-linux-x86_64
+          path: target/release/frog
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
+
+  appimage:
+    name: AppImage (reuses the Linux build)
+    needs: linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the Linux binary
+        uses: actions/download-artifact@v8
+        with:
+          name: frog-linux-x86_64
+          path: target/release
+
+      - name: Get appimagetool
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          asset=appimagetool-x86_64.AppImage
+          release=https://api.github.com/repos/AppImage/appimagetool/releases/tags/continuous
+          url=https://github.com/AppImage/appimagetool/releases/download/continuous/$asset
+          # The checksum comes from the release metadata, not from the download itself. The job
+          # fails if GitHub doesn't publish one, rather than running an unchecked tool. The token
+          # only raises the API rate limit.
+          curl --proto '=https' --tlsv1.2 -sSfL -H "Authorization: Bearer $GH_TOKEN" \
+            -o "$RUNNER_TEMP/release.json" "$release"
+          digest=$(python3 -c '
+          import json, sys
+          asset = sys.argv[2]
+          release = json.load(open(sys.argv[1]))
+          match = [a.get("digest", "") for a in release.get("assets", []) if a.get("name") == asset]
+          if not match or not match[0].startswith("sha256:"):
+              sys.exit("no sha256 digest published for " + asset)
+          print(match[0][len("sha256:"):])
+          ' "$RUNNER_TEMP/release.json" "$asset")
+          curl --proto '=https' --tlsv1.2 -sSfL -o "$RUNNER_TEMP/appimagetool" "$url"
+          echo "$digest  $RUNNER_TEMP/appimagetool" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/appimagetool"
+
+      - name: Build the AppImage
+        env:
+          SKIP_BUILD: "1"
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          chmod +x target/release/frog
+          APPIMAGETOOL="$RUNNER_TEMP/appimagetool" sh packaging/appimage/build.sh
+
+      - name: Upload the AppImage
+        uses: actions/upload-artifact@v7
+        with:
+          name: FROG-x86_64.AppImage
+          path: target/FROG-x86_64.AppImage
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
+
+  windows:
+    name: Windows build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Built natively with the MSVC toolchain. build.rs embeds the icon with the Windows SDK's
+      # resource compiler.
+      - name: Release build
+        run: cargo build --release --locked
+
+      - name: Upload the Windows binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: frog-windows-x86_64.exe
+          path: target/release/frog.exe
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
