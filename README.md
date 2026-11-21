@@ -20,6 +20,16 @@ packaging/linux/install.sh
 
 It copies `frog.desktop` and the icon into your user folders. It doesn't need root.
 
+## Installing on macOS
+
+The macOS build is a universal app (Apple Silicon and Intel) for macOS 11 or later. Unzip `FROG-macos-universal.zip` and move `FROG.app` to Applications.
+
+The app isn't signed with an Apple Developer ID yet, so macOS blocks it the first time. To open it, try once, then go to **System Settings → Privacy & Security** and click **Open Anyway**. Or clear the download flag in Terminal:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/FROG.app
+```
+
 ## Where data is kept
 
 FROG stores its cache and settings under the platform's data directory, in a folder named `gmail-labels-proto`. Passwords go in the system keyring under the same name. These names are kept so existing caches and saved sign-ins still work.

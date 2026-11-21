@@ -132,3 +132,33 @@ jobs:
           archive: false
           if-no-files-found: error
           retention-days: 14
+
+  macos:
+    name: macOS build (universal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The tests run natively on Apple Silicon, to catch anything that only breaks on macOS.
+      - name: Test
+        run: cargo test --locked --all-targets
+
+      - name: Build the app bundle
+        run: sh packaging/macos/build.sh
+
+      # A zip of FROG.app, made with ditto so the bundle's metadata survives. Uploaded as is,
+      # so the download is the zip itself.
+      - name: Upload the macOS app
+        uses: actions/upload-artifact@v7
+        with:
+          name: FROG-macos-universal.zip
+          path: target/FROG-macos-universal.zip
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
