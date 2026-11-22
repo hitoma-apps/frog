@@ -111,6 +111,14 @@ jobs:
   windows:
     name: Windows build
     runs-on: windows-latest
+    # id-token lets azure/login sign in to Azure over OIDC, with no stored secret.
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      # Signing runs only for pushes to main in this repository, and only once the Azure
+      # variables are set. Other builds, including pull requests, stay unsigned.
+      SIGN: ${{ github.repository == 'hitoma-apps/frog' && github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.AZURE_CLIENT_ID != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -122,6 +130,41 @@ jobs:
       # resource compiler.
       - name: Release build
         run: cargo build --release --locked
+
+      - name: Azure login
+        if: env.SIGN == 'true'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Signs with Azure Artifact Signing, using the Azure CLI login from the step above.
+      - name: Sign the Windows binary
+        if: env.SIGN == 'true'
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+          files: ${{ github.workspace }}\target\release\frog.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          description: FROG
+          description-url: https://github.com/hitoma-apps/frog
+
+      - name: Check the signature
+        if: env.SIGN == 'true'
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature target\release\frog.exe
+          "Status: $($sig.Status); signer: $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { exit 1 }
+
+      - name: Note an unsigned build
+        if: env.SIGN != 'true'
+        run: echo "::notice::This Windows build is unsigned. Only pushes to main are signed, once the Azure variables are set."
 
       - name: Upload the Windows binary
         uses: actions/upload-artifact@v7
