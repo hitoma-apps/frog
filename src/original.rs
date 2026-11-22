@@ -1,6 +1,6 @@
 //! The summary that Gmail's "Show original" view puts above a message's source.
 
-use mail_parser::{Address, MessageParser};
+use mail_parser::{AddressList, MessageParser};
 
 /// The summary fields, in display order, from a message's header block. A field the
 /// message doesn't have is left out.
@@ -16,10 +16,10 @@ pub fn summary(headers: &[u8]) -> Vec<(&'static str, String)> {
         out.push(("Date", date.to_rfc822()));
     }
     if let Some(from) = m.from() {
-        out.push(("From", addresses(from)));
+        out.push(("From", addresses(&from)));
     }
     if let Some(to) = m.to() {
-        out.push(("To", addresses(to)));
+        out.push(("To", addresses(&to)));
     }
     if let Some(subject) = m.subject() {
         out.push(("Subject", subject.to_string()));
@@ -28,8 +28,9 @@ pub fn summary(headers: &[u8]) -> Vec<(&'static str, String)> {
 }
 
 /// "Name <address>" for each address, joined with commas.
-fn addresses(list: &Address) -> String {
-    list.iter()
+fn addresses(list: &AddressList) -> String {
+    crate::render::mailboxes(list)
+        .into_iter()
         .filter_map(|a| match (a.name(), a.address()) {
             (Some(name), Some(email)) => Some(format!("{name} <{email}>")),
             (None, Some(email)) => Some(email.to_string()),

@@ -1,6 +1,6 @@
 //! Attachments in a message: listing them, and reading one's decoded contents.
 
-use mail_parser::{MessageParser, MimeHeaders};
+use mail_parser::MessageParser;
 
 /// One attachment, as the message lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,7 +32,7 @@ pub fn list(raw: &[u8]) -> Vec<AttachmentInfo> {
                     None => ct.ctype().to_string(),
                 })
                 .unwrap_or_else(|| "application/octet-stream".into()),
-            size: part.contents().len(),
+            size: part.decoded().len(),
         })
         .collect()
 }
@@ -42,7 +42,7 @@ pub fn contents(raw: &[u8], index: usize) -> Option<Vec<u8>> {
     let m = MessageParser::default().parse(raw)?;
     m.attachments()
         .nth(index)
-        .map(|part| part.contents().to_vec())
+        .map(|part| part.decoded().into_owned())
 }
 
 /// A file name safe to write: no folders, no control characters, no leading dots.
