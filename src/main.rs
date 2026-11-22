@@ -3,6 +3,13 @@
 //! With `GMAIL_USER` and `GMAIL_APP_PASSWORD` set, it signs in at startup.
 //! Otherwise it shows a sign-in dialog.
 //! Mail access runs on a worker thread (see `worker.rs`).
+
+// A GUI app on Windows: release builds don't open a console window. Debug builds keep it, so
+// their println! output and panics still show in a terminal.
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
 //!
 //! The thread list is read from the cache a window at a time, so only the rows
 //! near the screen are held in memory. Labels and search are answered by the
