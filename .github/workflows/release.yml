@@ -151,6 +151,8 @@ jobs:
             --outputDir "$RUNNER_TEMP/velopack" \
             --repoUrl "https://github.com/$GITHUB_REPOSITORY" \
             --token "$GH_TOKEN" --channel linux --publish --merge \
-            --tag "$tag" --releaseName "FROG $version" \
-            --releaseNotes "packaging/release/notes-$version.md"
+            --tag "$tag" --releaseName "FROG $version"
+          # The upload doesn't take notes, so they're set on the release afterwards.
+          gh release edit "$tag" --title "FROG $version" \
+            --notes-file "packaging/release/notes-$version.md"
           gh release upload "$tag" "$RUNNER_TEMP/extra/"* --clobber
