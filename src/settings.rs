@@ -45,6 +45,8 @@ pub struct Settings {
     pub read_delay_secs: u64,
     /// What a new-mail notification shows.
     pub notification_detail: NotificationDetail,
+    /// Check GitHub for a newer FROG on a schedule. Installed builds only.
+    pub auto_update: bool,
     /// Do not disturb: no notifications, except from `notify_always_from`.
     pub do_not_disturb: bool,
     /// Quiet hours: notifications are held between `quiet_start` and `quiet_end` (local hours).
@@ -203,6 +205,7 @@ impl Default for Settings {
             read_on_open: ReadOnOpen::Immediately,
             read_delay_secs: 3,
             notification_detail: NotificationDetail::Full,
+            auto_update: true,
             favorite_labels: Vec::new(),
             label_names: 1,
             saved_searches: Vec::new(),
@@ -348,6 +351,7 @@ mod tests {
             read_on_open: ReadOnOpen::Immediately,
             read_delay_secs: 3,
             notification_detail: NotificationDetail::Full,
+            auto_update: true,
             email: Some("me@example.com".into()),
             remember_password: true,
             auto_login: false,

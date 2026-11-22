@@ -23,6 +23,12 @@ Alternatives considered:
 - `cargo-packager` with `cargo-packager-updater`: all Rust, with minisign signatures, but version 0.2.
 - `self_update`: replaces only the binary. The AppImage and macOS bundle would be ours to handle.
 
+## Status
+
+- **In progress (branch `auto-update`):** the Velopack crate, a background update thread (`src/updates.rs`) that checks GitHub Releases every six hours and downloads what it finds, a status-bar notice with "Restart to update", and an Updates section in Settings → General.
+- **Not yet:** a published release to update from; the Linux trial in phase 2; Windows updates, which wait on code signing (see `docs/windows-signing.md`).
+- Builds that weren't installed by Velopack, such as `cargo run`, report that updates don't apply.
+
 ## Phases
 
 1. **Versioning and releases.** The app is always `0.1.0` now. Bump the version in `Cargo.toml` for each release, tag it, and build the release in CI from the tag.

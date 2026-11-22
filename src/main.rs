@@ -21,6 +21,7 @@ mod credentials;
 mod live;
 mod notify;
 mod reader;
+mod updates;
 mod worker;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -89,6 +90,10 @@ fn app_icon() -> egui::IconData {
 }
 
 fn main() -> eframe::Result {
+    // Velopack handles its install and update hooks here. In an installed build it can exit the
+    // process, so this runs before anything else.
+    velopack::VelopackApp::build().run();
+
     let creds = match (
         std::env::var("GMAIL_USER"),
         std::env::var("GMAIL_APP_PASSWORD"),
@@ -612,6 +617,20 @@ struct LoginForm {
     error: Option<String>,
 }
 
+/// What the app last heard about updates.
+#[derive(Clone)]
+enum UpdateState {
+    /// Nothing has happened yet.
+    Unknown,
+    /// This build wasn't installed by Velopack, so updates don't apply.
+    NotInstalled,
+    Checking,
+    UpToDate,
+    /// The named version is downloaded, and can be applied.
+    Ready(String),
+    Failed(String),
+}
+
 struct App {
     ctx: egui::Context,
     settings: Settings,
@@ -657,6 +676,9 @@ struct App {
     label_cache: Option<LabelCache>,
     /// The last search the cache answered, and the messages it found.
     search_results: Option<(search::Query, Arc<Vec<SearchRow>>)>,
+    /// The update thread, and what the app last heard from it.
+    updates: updates::Updates,
+    update_state: UpdateState,
     /// How many matching messages the search has asked for, and how many match in all.
     search_limit: usize,
     search_total: usize,
@@ -763,6 +785,21 @@ struct App {
 }
 
 impl App {
+    /// Takes what the update thread has reported since the last frame.
+    fn poll_updates(&mut self) {
+        while let Ok(event) = self.updates.events.try_recv() {
+            self.update_state = match event {
+                updates::Event::NotInstalled => UpdateState::NotInstalled,
+                updates::Event::Checked { available: None } => UpdateState::UpToDate,
+                updates::Event::Checked {
+                    available: Some(version),
+                } => UpdateState::Ready(version),
+                updates::Event::Ready(version) => UpdateState::Ready(version),
+                updates::Event::Failed(why) => UpdateState::Failed(why),
+            };
+        }
+    }
+
     fn new(ctx: egui::Context, creds: Option<(String, String)>) -> Self {
         let settings_path = settings::default_path();
         let settings = settings_path
@@ -778,6 +815,10 @@ impl App {
             }
         };
         let default_sort = settings.default_sort;
+        let updates = {
+            let ctx = ctx.clone();
+            updates::start(settings.auto_update, move || ctx.request_repaint())
+        };
         ctx.set_theme(theme_preference(settings.theme));
         apply_accent(&ctx);
         let mut login = LoginForm {
@@ -821,6 +862,8 @@ impl App {
             notify_draft_never: String::new(),
             body_clear: None,
             cache_check: CacheCheck::Idle,
+            updates,
+            update_state: UpdateState::Unknown,
             writer_check: None,
             writer_checking: false,
             server_check: None,
@@ -2053,6 +2096,48 @@ impl App {
             forget = true;
             self.status = credentials::forget_password(&email).err();
         }
+        ui.add_space(8.0);
+        ui.label("Updates");
+        let before_auto = self.settings.auto_update;
+        ui.checkbox(
+            &mut self.settings.auto_update,
+            "Check for updates automatically (every six hours)",
+        );
+        if self.settings.auto_update != before_auto {
+            let _ = self
+                .updates
+                .commands
+                .send(updates::Command::SetAutomatic(self.settings.auto_update));
+        }
+        ui.horizontal(|ui| {
+            let busy = matches!(self.update_state, UpdateState::Checking);
+            if ui
+                .add_enabled(!busy, egui::Button::new("Check now"))
+                .clicked()
+            {
+                self.update_state = UpdateState::Checking;
+                let _ = self.updates.commands.send(updates::Command::CheckNow);
+            }
+            match &self.update_state {
+                UpdateState::Unknown => {}
+                UpdateState::NotInstalled => {
+                    ui.weak("Updates come with the installed app, not with this build.");
+                }
+                UpdateState::Checking => {
+                    ui.spinner();
+                    ui.label("Checking…");
+                }
+                UpdateState::UpToDate => {
+                    ui.weak("FROG is up to date.");
+                }
+                UpdateState::Ready(version) => {
+                    ui.weak(format!("Version {version} is downloaded."));
+                }
+                UpdateState::Failed(why) => {
+                    ui.colored_label(egui::Color32::LIGHT_RED, why);
+                }
+            }
+        });
         forget
     }
 
@@ -2434,6 +2519,22 @@ impl App {
         }
         if restart {
             self.restart_worker();
+        }
+        if let UpdateState::Ready(version) = &self.update_state {
+            let version = version.clone();
+            ui.horizontal(|ui| {
+                ui.colored_label(
+                    ui.visuals().hyperlink_color,
+                    format!("FROG {version} is ready."),
+                );
+                if ui
+                    .button("Restart to update")
+                    .on_hover_text("Closes FROG, installs the update, and starts it again.")
+                    .clicked()
+                {
+                    let _ = self.updates.commands.send(updates::Command::ApplyNow);
+                }
+            });
         }
         ui.horizontal(|ui| {
             if self.reconnecting {
@@ -4073,6 +4174,7 @@ impl Drop for App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_events();
+        self.poll_updates();
         self.open_clicked_notifications(ui.ctx());
         self.remember_window_position(ui.ctx());
         self.refresh_storage(ui.ctx());
