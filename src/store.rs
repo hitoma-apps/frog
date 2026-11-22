@@ -236,6 +236,49 @@ impl Drop for Store {
     }
 }
 
+/// The conditions a search adds to a query on `messages m`, as SQL (each starts with " AND ")
+/// and the values they bind, in order.
+fn search_filter(query: &Query) -> (String, Vec<rusqlite::types::Value>) {
+    use rusqlite::types::Value;
+    let mut sql = String::new();
+    let mut args: Vec<Value> = Vec::new();
+    for word in &query.words {
+        sql.push_str(" AND m.msgid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)");
+        args.push(Value::Text(format!("\"{word}\"*")));
+    }
+    for word in &query.from {
+        sql.push_str(" AND m.msgid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)");
+        args.push(Value::Text(format!(
+            "{{from_addr from_email}} : \"{word}\"*"
+        )));
+    }
+    for word in &query.subject {
+        sql.push_str(" AND m.msgid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)");
+        args.push(Value::Text(format!("subject : \"{word}\"*")));
+    }
+    for label in &query.labels {
+        sql.push_str(" AND m.msgid IN (SELECT msgid FROM message_labels WHERE label = ?)");
+        args.push(Value::Text(label.clone()));
+    }
+    match query.unread {
+        Some(true) => sql.push_str(" AND m.seen = 0"),
+        Some(false) => sql.push_str(" AND m.seen = 1"),
+        None => {}
+    }
+    if query.attachment == Some(true) {
+        sql.push_str(" AND m.attachment = 1");
+    }
+    if let Some(after) = query.after {
+        sql.push_str(" AND COALESCE(m.received, m.sent) >= ?");
+        args.push(Value::Integer(after));
+    }
+    if let Some(before) = query.before {
+        sql.push_str(" AND COALESCE(m.received, m.sent) < ?");
+        args.push(Value::Integer(before));
+    }
+    (sql, args)
+}
+
 /// Where an account's cache file lives: `<data dir>/accounts/<sanitized email>.sqlite`.
 /// Returns `None` if the platform has no data directory.
 pub fn account_cache_path(email: &str) -> Option<PathBuf> {
@@ -1956,53 +1999,13 @@ impl Store {
         if query.is_empty() {
             return Ok(Vec::new());
         }
-        let mut sql = String::from(
+        let (filter, mut args) = search_filter(query);
+        let sql = format!(
             "SELECT m.uid, m.msgid, m.thrid, m.from_addr, m.subject, m.date, m.seen,
                     m.sent, m.from_email, m.attachment, m.received
-             FROM messages m WHERE m.uid IS NOT NULL",
+             FROM messages m WHERE m.uid IS NOT NULL{filter}
+             ORDER BY COALESCE(m.received, m.sent) DESC, m.uid DESC LIMIT ?"
         );
-        let mut args: Vec<Value> = Vec::new();
-        for word in &query.words {
-            sql.push_str(
-                " AND m.msgid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)",
-            );
-            args.push(Value::Text(format!("\"{word}\"*")));
-        }
-        for word in &query.from {
-            sql.push_str(
-                " AND m.msgid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)",
-            );
-            args.push(Value::Text(format!(
-                "{{from_addr from_email}} : \"{word}\"*"
-            )));
-        }
-        for word in &query.subject {
-            sql.push_str(
-                " AND m.msgid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)",
-            );
-            args.push(Value::Text(format!("subject : \"{word}\"*")));
-        }
-        for label in &query.labels {
-            sql.push_str(" AND m.msgid IN (SELECT msgid FROM message_labels WHERE label = ?)");
-            args.push(Value::Text(label.clone()));
-        }
-        match query.unread {
-            Some(true) => sql.push_str(" AND m.seen = 0"),
-            Some(false) => sql.push_str(" AND m.seen = 1"),
-            None => {}
-        }
-        if query.attachment == Some(true) {
-            sql.push_str(" AND m.attachment = 1");
-        }
-        if let Some(after) = query.after {
-            sql.push_str(" AND COALESCE(m.received, m.sent) >= ?");
-            args.push(Value::Integer(after));
-        }
-        if let Some(before) = query.before {
-            sql.push_str(" AND COALESCE(m.received, m.sent) < ?");
-            args.push(Value::Integer(before));
-        }
-        sql.push_str(" ORDER BY COALESCE(m.received, m.sent) DESC, m.uid DESC LIMIT ?");
         args.push(Value::Integer(limit as i64));
 
         let mut hits = {
@@ -2028,6 +2031,20 @@ impl Store {
         };
         self.attach_labels(&mut hits)?;
         Ok(hits)
+    }
+
+    /// How many cached messages match a search, however many `search_messages` returns.
+    pub fn count_search(&self, query: &Query) -> Result<usize> {
+        if query.is_empty() {
+            return Ok(0);
+        }
+        let (filter, args) = search_filter(query);
+        let n: i64 = self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM messages m WHERE m.uid IS NOT NULL{filter}"),
+            rusqlite::params_from_iter(args.iter()),
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
     }
 
     /// Threads whose newest cached message is from `account`, so no one has answered it, newest
@@ -3165,6 +3182,24 @@ mod tests {
             .collect();
         assert_eq!(order, vec![100, 500]);
         assert!(s.check().unwrap().logical.is_empty());
+    }
+
+    #[test]
+    fn search_count_is_every_match_not_just_the_rows_returned() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        let messages: Vec<CachedMessage> = (1..=12u32)
+            .map(|i| msg(u64::from(i), i, &["Work"]))
+            .chain([msg(100, 100, &["Home"])])
+            .collect();
+        s.upsert_messages(&messages).unwrap();
+        let query = crate::search::Query {
+            labels: vec!["Work".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(s.count_search(&query).unwrap(), 12);
+        assert_eq!(s.search_messages(&query, 5).unwrap().len(), 5);
+        assert_eq!(s.search_messages(&query, 500).unwrap().len(), 12);
+        assert_eq!(s.count_search(&crate::search::Query::default()).unwrap(), 0);
     }
 
     #[test]

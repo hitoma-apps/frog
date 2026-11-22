@@ -656,6 +656,9 @@ struct App {
     label_cache: Option<LabelCache>,
     /// The last search the cache answered, and the messages it found.
     search_results: Option<(search::Query, Arc<Vec<SearchRow>>)>,
+    /// How many matching messages the search has asked for, and how many match in all.
+    search_limit: usize,
+    search_total: usize,
     /// The search last sent to the cache, so each one is sent once.
     search_asked: Option<search::Query>,
     /// When the search box last changed, so a search waits until typing pauses.
@@ -822,6 +825,8 @@ impl App {
             server_check: None,
             server_checking: false,
             search_results: None,
+            search_limit: SEARCH_ROWS,
+            search_total: 0,
             search_asked: None,
             search_typed: None,
             search_now: false,
@@ -1103,7 +1108,8 @@ impl App {
                     .collect();
                 self.waiting = Some(Arc::new(rows));
             }
-            Event::Search { query, hits } => {
+            Event::Search { query, hits, total } => {
+                self.search_total = total;
                 let rows: Vec<SearchRow> = hits
                     .into_iter()
                     .filter_map(|c| {
@@ -1327,10 +1333,13 @@ impl App {
         }
         self.search_typed = None;
         self.search_now = false;
+        if self.search_asked.as_ref() != Some(&query) {
+            self.search_limit = SEARCH_ROWS;
+        }
         self.search_asked = Some(query.clone());
         self.send(Command::Search {
             query,
-            limit: SEARCH_ROWS,
+            limit: self.search_limit,
         });
     }
 
@@ -1338,7 +1347,18 @@ impl App {
     /// list. Clicking a title opens its conversation.
     fn search_list(&mut self, ui: &mut egui::Ui) {
         let parsed = search::parse(&self.search);
-        ui.heading(format!("Search: {}", self.search.trim()));
+        let mut copy = false;
+        ui.horizontal(|ui| {
+            ui.heading(format!("Search: {}", self.search.trim()));
+            copy = ui
+                .button("Copy")
+                .on_hover_text("Copy this search, to paste into Gmail's web search")
+                .clicked();
+        });
+        if copy {
+            ui.ctx().copy_text(self.search.trim().to_string());
+            self.status = Some("Copied the search to the clipboard.".to_string());
+        }
         for warning in &parsed.warnings {
             ui.weak(format!("Ignored: {warning}"));
         }
@@ -1353,10 +1373,31 @@ impl App {
                 return;
             }
         };
-        ui.weak(format!(
-            "{} messages, newest first. Only cached messages are searched.",
-            results.len()
-        ));
+        let mut load_more = false;
+        ui.horizontal(|ui| {
+            ui.weak(format!(
+                "{} of {} messages, newest first. Only cached messages are searched.",
+                results.len(),
+                self.search_total.max(results.len())
+            ));
+            if self.search_total > results.len()
+                && ui
+                    .button(format!(
+                        "Show {} more",
+                        SEARCH_ROWS.min(self.search_total - results.len())
+                    ))
+                    .clicked()
+            {
+                load_more = true;
+            }
+        });
+        if load_more {
+            self.search_limit += SEARCH_ROWS;
+            self.send(Command::Search {
+                query: parsed.query.clone(),
+                limit: self.search_limit,
+            });
+        }
         ui.separator();
         let row_height = ui.spacing().interact_size.y;
         let mut opened: Option<u64> = None;
@@ -1554,7 +1595,11 @@ impl App {
             .auto_shrink([false, false])
             .show_rows(ui, row_height, senders.len(), |ui, range| {
                 for sender in &senders[range] {
-                    ui.horizontal(|ui| {
+                    // The row's background goes first, so it can be filled in once the row's size
+                    // is known. The whole row is the click target.
+                    let background = ui.painter().add(egui::Shape::Noop);
+                    let row = ui.horizontal(|ui| {
+                        ui.set_min_width(ui.available_width());
                         ui.add_sized(
                             [64.0, row_height],
                             egui::Label::new(format!("{}", sender.messages)),
@@ -1568,10 +1613,28 @@ impl App {
                         } else {
                             format!("{} <{}>", sender.display, sender.address)
                         };
-                        if ui.selectable_label(false, name).clicked() {
-                            search_for = Some(sender.address.clone());
-                        }
+                        ui.label(name);
                     });
+                    let response = ui.interact(
+                        row.response.rect,
+                        ui.scope_id().with(("sender", &sender.address)),
+                        egui::Sense::click(),
+                    );
+                    let selected = self.search == format!("from:{}", sender.address);
+                    let fill = if selected {
+                        ui.visuals().selection.bg_fill
+                    } else if response.hovered() {
+                        ui.visuals().widgets.hovered.weak_bg_fill
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    };
+                    ui.painter().set(
+                        background,
+                        egui::Shape::rect_filled(row.response.rect, 4.0, fill),
+                    );
+                    if response.clicked() {
+                        search_for = Some(sender.address.clone());
+                    }
                 }
             });
         if let Some(address) = search_for {
@@ -4056,6 +4119,9 @@ impl eframe::App for App {
                 .resizable(true)
                 .default_size(self.settings.window.list_height)
                 .show(ui, |ui| {
+                    // Keeps the pane at its height even when a view has only a few rows, so the
+                    // list doesn't shrink on every view change. Each view's list fills the rest.
+                    ui.set_min_height(ui.available_height());
                     if !self.search.trim().is_empty() {
                         self.search_list(ui);
                     } else if self.storage_open {

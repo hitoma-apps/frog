@@ -189,6 +189,8 @@ pub enum Event {
     Search {
         query: frog::search::Query,
         hits: Vec<frog::store::CachedMessage>,
+        /// How many cached messages match, not only the `hits` returned.
+        total: usize,
     },
     /// Every cached message of one thread, newest first.
     Thread {
@@ -1549,14 +1551,17 @@ fn read_largest(store: Option<&Store>, emit: &Emitter, limit: usize) {
 
 /// Answers a search with the matching cached messages.
 fn read_search(store: Option<&Store>, emit: &Emitter, query: &frog::search::Query, limit: usize) {
-    let hits = match store {
-        Some(store) => store.search_messages(query, limit),
-        None => Ok(Vec::new()),
+    let result = match store {
+        Some(store) => store
+            .search_messages(query, limit)
+            .and_then(|hits| Ok((hits, store.count_search(query)?))),
+        None => Ok((Vec::new(), 0)),
     };
-    match hits {
-        Ok(hits) => emit.send(Event::Search {
+    match result {
+        Ok((hits, total)) => emit.send(Event::Search {
             query: query.clone(),
             hits,
+            total,
         }),
         Err(e) => emit.send(Event::Error(format!("cache read failed: {e}"))),
     }
