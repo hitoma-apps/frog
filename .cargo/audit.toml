@@ -1,0 +1,19 @@
+# Advisories we've accepted for now. Each entry needs a reason, and is removed when the fix ships.
+#
+# zip 8.x (RUSTSEC-2026-0367, -0368, -0369, -0429, -0545, -0546, -0547, -0548) is pulled in by
+# velopack 1.2.x, the auto-update library. Every stable Velopack release still requires zip 8.
+# The fixes are in zip 9.x, which only a development Velopack build uses. The advisories concern
+# extracting archives: path escapes, symlinks and file permissions. Update packages come from our
+# own GitHub release over HTTPS, so the risk needs someone to control those release assets.
+# Tracked in a Forgejo ticket. Remove these entries once Velopack releases a zip 9 build.
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
+    "RUSTSEC-2026-0429",
+    "RUSTSEC-2026-0545",
+    "RUSTSEC-2026-0546",
+    "RUSTSEC-2026-0547",
+    "RUSTSEC-2026-0548",
+]
