@@ -25,7 +25,7 @@ pub fn downloads_dir() -> Option<PathBuf> {
 /// Makes a name safe to use as a file or folder name on any system: path separators and
 /// characters Windows refuses are replaced, and the result is short.
 pub fn safe_file_name(name: &str) -> String {
-    let cleaned: String = name
+    let cleaned: String = crate::text::strip_hidden(name)
         .chars()
         .map(|c| match c {
             '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',

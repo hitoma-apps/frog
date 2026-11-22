@@ -16,6 +16,7 @@ pub mod response;
 pub mod search;
 pub mod settings;
 pub mod store;
+pub mod text;
 pub mod uidset;
 pub mod utf7;
 

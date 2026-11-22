@@ -1,5 +1,7 @@
 name: CI
 
+# Actions are pinned to commit SHAs. Dependabot proposes updates; the tag is kept in a comment.
+
 # Every branch push runs CI, so a branch is checked before it's merged.
 on:
   push:
@@ -23,13 +25,13 @@ jobs:
     name: Linux build, lint and test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -46,7 +48,7 @@ jobs:
       # Uploaded unzipped, so the binary keeps its executable bit. An unzipped artifact takes its
       # file's name, so this one is called "frog".
       - name: Upload the Linux binary
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           path: target/release/frog
           archive: false
@@ -58,10 +60,10 @@ jobs:
     needs: linux
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Download the Linux binary
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: frog
           path: target/release
@@ -101,7 +103,7 @@ jobs:
           APPIMAGETOOL="$RUNNER_TEMP/appimagetool" sh packaging/appimage/build.sh
 
       - name: Upload the AppImage
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           path: target/FROG-x86_64.AppImage
           archive: false
@@ -112,11 +114,11 @@ jobs:
     name: Windows build
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       # Built natively with the MSVC toolchain. build.rs embeds the icon with the Windows SDK's
       # resource compiler.
@@ -124,7 +126,7 @@ jobs:
         run: cargo build --release --locked
 
       - name: Upload the Windows binary
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           path: target/release/frog.exe
           archive: false
@@ -135,13 +137,13 @@ jobs:
     name: macOS build (universal)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       # The tests run natively on Apple Silicon, to catch anything that only breaks on macOS.
       - name: Test
@@ -153,7 +155,7 @@ jobs:
       # A zip of FROG.app, made with ditto so the bundle's metadata survives. Uploaded as is,
       # so the download is the zip itself.
       - name: Upload the macOS app
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           path: target/FROG-macos-universal.zip
           archive: false

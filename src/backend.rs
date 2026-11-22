@@ -143,12 +143,15 @@ impl Message {
             .unwrap_or_default();
         let (from, subject, date) = match &parsed {
             Some(m) => (
-                m.from()
-                    .and_then(|a| a.first())
-                    .and_then(|a| a.name().or(a.address()))
-                    .unwrap_or("(unknown)")
-                    .to_string(),
-                m.subject().unwrap_or("(no subject)").to_string(),
+                // Names and subjects are cleaned here, so a right-to-left override can't make
+                // them read differently from what they are.
+                frog::text::strip_hidden(
+                    m.from()
+                        .and_then(|a| a.first())
+                        .and_then(|a| a.name().or(a.address()))
+                        .unwrap_or("(unknown)"),
+                ),
+                frog::text::strip_hidden(m.subject().unwrap_or("(no subject)")),
                 m.date().map(|d| d.to_rfc822()).unwrap_or_default(),
             ),
             None => (

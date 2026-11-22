@@ -48,7 +48,7 @@ pub fn contents(raw: &[u8], index: usize) -> Option<Vec<u8>> {
 /// A file name safe to write: no folders, no control characters, no leading dots.
 pub fn safe_name(name: &str) -> String {
     let last = name.rsplit(['/', '\\']).next().unwrap_or("");
-    let cleaned: String = last
+    let cleaned: String = crate::text::strip_hidden(last)
         .chars()
         .map(|c| {
             if c.is_control() || matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|') {
@@ -68,11 +68,77 @@ pub fn safe_name(name: &str) -> String {
 
 /// Whether a file name is a program or script, which can run code when opened.
 pub fn is_program(name: &str) -> bool {
-    const PROGRAMS: [&str; 16] = [
-        "exe", "bat", "cmd", "com", "scr", "msi", "vbs", "vbe", "js", "jse", "wsf", "ps1", "lnk",
-        "hta", "jar", "dll",
+    // Checked on the cleaned name, so a hidden override can't hide the real extension.
+    const PROGRAMS: &[&str] = &[
+        // Windows programs, scripts, shortcuts and settings that run code when opened.
+        "exe",
+        "com",
+        "scr",
+        "pif",
+        "bat",
+        "cmd",
+        "msi",
+        "msp",
+        "msc",
+        "cpl",
+        "dll",
+        "ocx",
+        "sys",
+        "drv",
+        "vbs",
+        "vbe",
+        "js",
+        "jse",
+        "wsf",
+        "wsh",
+        "wsc",
+        "sct",
+        "ps1",
+        "psm1",
+        "psc1",
+        "lnk",
+        "url",
+        "scf",
+        "reg",
+        "inf",
+        "hta",
+        "chm",
+        "application",
+        "appref-ms",
+        "gadget",
+        "jar",
+        "xll",
+        "iso",
+        "img",
+        "vhd",
+        "vhdx",
+        // Office files that can carry macros.
+        "docm",
+        "dotm",
+        "xlsm",
+        "xltm",
+        "xlam",
+        "pptm",
+        "potm",
+        "ppam",
+        "ppsm",
+        // Linux and macOS programs and packages.
+        "sh",
+        "run",
+        "bin",
+        "elf",
+        "appimage",
+        "desktop",
+        "py",
+        "pl",
+        "rb",
+        "command",
+        "app",
+        "pkg",
+        "dmg",
     ];
-    name.rsplit_once('.')
+    crate::text::strip_hidden(name)
+        .rsplit_once('.')
         .is_some_and(|(_, ext)| PROGRAMS.iter().any(|p| ext.eq_ignore_ascii_case(p)))
 }
 
@@ -101,6 +167,17 @@ mod tests {
     #[test]
     fn a_message_without_attachments_lists_none() {
         assert!(list(b"From: a@example.com\r\n\r\nJust text.\r\n").is_empty());
+    }
+
+    #[test]
+    fn a_hidden_override_does_not_hide_a_program() {
+        // "invoice" + RLO + "fdp.exe" would display as "invoiceexe.pdf".
+        assert!(is_program("invoice\u{202E}fdp.exe"));
+        assert!(is_program("installer.PIF"));
+        assert!(is_program("update.sh"));
+        assert!(is_program("macro.docm"));
+        assert!(!is_program("report.pdf"));
+        assert!(!is_program("photo.jpeg"));
     }
 
     #[test]

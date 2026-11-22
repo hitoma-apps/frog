@@ -81,7 +81,7 @@ Made: the license is MIT, and the package is renamed to `frog`.
 Pending:
 
 1. History: keep it (recommended, since the scans were clean), or start from a fresh commit?
-2. Forgejo afterwards: archive, mirror or delete? And the earlier stray GitHub copy, `shawngmc/gmail-imap-labels-experiment`: delete it?
+2. Forgejo afterwards: archive, mirror or delete? And the earlier stray GitHub copy under the personal account: delete it?
 3. Windows: build natively with MSVC (recommended), or keep cross-compiling?
 4. macOS: Apple Silicon only, or universal?
 5. Artifact Signing: does hitoma-apps qualify for identity validation?

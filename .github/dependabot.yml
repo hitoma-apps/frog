@@ -1,0 +1,16 @@
+version: 2
+updates:
+  # Rust crates. Pull requests for updates are checked by CI like any other change.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+
+  # Pinned action SHAs in the workflows.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly

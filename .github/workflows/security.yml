@@ -1,0 +1,27 @@
+name: Security
+
+on:
+  push:
+    branches: ['**']
+    paths: ['Cargo.lock', 'Cargo.toml', '.github/workflows/security.yml']
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: Dependency advisories (cargo audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      # Fails on a known vulnerability in a locked dependency. "Unmaintained" warnings are listed
+      # but don't fail the job: several come from the GUI toolkit, which we can't change directly.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit Cargo.lock
+        run: cargo audit
