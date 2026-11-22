@@ -1448,6 +1448,7 @@ impl App {
         let row_height = ui.spacing().interact_size.y;
         let mut opened: Option<u64> = None;
         let mut clicked_label: Option<String> = None;
+        let mut sender_search: Option<String> = None;
         let mut star_clicks: Vec<(u64, bool)> = Vec::new();
         egui::ScrollArea::vertical()
             .id_salt("search")
@@ -1486,6 +1487,9 @@ impl App {
                     if let Some(label) = action.label {
                         clicked_label = Some(label);
                     }
+                    if action.search_sender.is_some() {
+                        sender_search = action.search_sender;
+                    }
                     ui.painter()
                         .set(highlight, egui::Shape::rect_filled(action.rect, 4.0, band));
                 }
@@ -1498,6 +1502,9 @@ impl App {
         }
         if let Some(label) = clicked_label {
             self.set_label_filter(Some(label));
+        }
+        if let Some(address) = sender_search {
+            self.search_from(&address);
         }
     }
 
@@ -1558,6 +1565,7 @@ impl App {
         let row_height = ui.spacing().interact_size.y;
         let mut opened: Option<u64> = None;
         let mut clicked_label: Option<String> = None;
+        let mut sender_search: Option<String> = None;
         let mut star_clicks: Vec<(u64, bool)> = Vec::new();
         egui::ScrollArea::vertical()
             .id_salt("waiting")
@@ -1596,6 +1604,9 @@ impl App {
                     if let Some(label) = action.label {
                         clicked_label = Some(label);
                     }
+                    if action.search_sender.is_some() {
+                        sender_search = action.search_sender;
+                    }
                     ui.painter()
                         .set(highlight, egui::Shape::rect_filled(action.rect, 4.0, band));
                 }
@@ -1609,6 +1620,9 @@ impl App {
         if let Some(label) = clicked_label {
             self.set_label_filter(Some(label));
         }
+        if let Some(address) = sender_search {
+            self.search_from(&address);
+        }
     }
 
     /// Opens the sender statistics: the senders with the most cached messages.
@@ -1621,6 +1635,14 @@ impl App {
 
     /// The sender statistics: one row per sender, most messages first. A row searches for that
     /// sender's mail.
+    /// Searches for every cached message from `address`, as the sender statistics do.
+    fn search_from(&mut self, address: &str) {
+        self.search = format!("from:{address}");
+        self.settings.note_search(&self.search);
+        self.save_settings();
+        self.change_list();
+    }
+
     fn senders_list(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("Sender Statistics");
@@ -3108,6 +3130,7 @@ impl App {
         let rows = std::mem::take(&mut self.window_rows);
         let mut wanted: Option<(usize, usize)> = None;
         let mut clicked_label: Option<String> = None;
+        let mut sender_search: Option<String> = None;
         let mut opened: Option<u64> = None;
         let mut star_clicks: Vec<(u64, bool)> = Vec::new();
         // Checkbox clicks in this frame: row, the state it was set to, and whether shift was held.
@@ -3164,6 +3187,9 @@ impl App {
                     if let Some(label) = action.label {
                         clicked_label = Some(label);
                     }
+                    if action.search_sender.is_some() {
+                        sender_search = action.search_sender;
+                    }
                     ui.painter().set(
                         highlight,
                         egui::Shape::rect_filled(action.rect, 4.0, row_band),
@@ -3193,6 +3219,9 @@ impl App {
         // rows on screen if they aren't held yet.
         if let Some(label) = clicked_label {
             self.set_label_filter(Some(label));
+        }
+        if let Some(address) = sender_search {
+            self.search_from(&address);
         } else if let Some((first, len)) = wanted {
             let covered = first >= self.window_start
                 && first + len <= self.window_start + self.window_rows.len();
@@ -3893,6 +3922,8 @@ struct RowAction {
     rect: egui::Rect,
     /// The star was clicked: the thread should now be starred (`true`) or unstarred.
     star: Option<bool>,
+    /// The context menu asked for every message from this sender (their address).
+    search_sender: Option<String>,
 }
 
 /// Draws a row: checkbox, unread dot and title, attachment, label chips, date. Lists and search
@@ -3903,6 +3934,7 @@ fn draw_thread_row(ui: &mut egui::Ui, view: &RowView, checked: bool) -> RowActio
     let mut action = RowAction {
         checked: None,
         opened: false,
+        search_sender: None,
         label: None,
         rect: egui::Rect::NOTHING,
         star: None,
@@ -4003,11 +4035,17 @@ fn draw_thread_row(ui: &mut egui::Ui, view: &RowView, checked: bool) -> RowActio
                 .inner
             })
             .inner;
-        if title
-            .on_hover_text(format!("{}\nthread {}", sender_line(m), view.thrid))
-            .clicked()
-        {
+        let title = title.on_hover_text(format!("{}\nthread {}", sender_line(m), view.thrid));
+        if title.clicked() {
             action.opened = true;
+        }
+        if !m.from_email.is_empty() {
+            title.context_menu(|ui| {
+                if ui.button("Search for mail from this sender").clicked() {
+                    action.search_sender = Some(m.from_email.clone());
+                    ui.close();
+                }
+            });
         }
 
         // The attachment column: a paperclip for a thread with an attachment.
@@ -4276,6 +4314,14 @@ impl eframe::App for App {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_sender_search_finds_that_address() {
+        // The text the row's menu builds must parse as a search for that sender.
+        let query = search::parse(&format!("from:{}", "ana@example.com")).query;
+        assert_eq!(query.from, vec!["ana@example.com".to_string()]);
+        assert!(query.words.is_empty() && query.subject.is_empty());
+    }
+
     #[test]
     fn accent_colours_meet_contrast_on_both_themes() {
         for (theme, visuals) in [
