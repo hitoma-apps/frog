@@ -43,6 +43,8 @@ pub struct Settings {
     /// When a conversation is marked read after it's opened, and how long to wait for `AfterDelay`.
     pub read_on_open: ReadOnOpen,
     pub read_delay_secs: u64,
+    /// What a new-mail notification shows.
+    pub notification_detail: NotificationDetail,
     /// Do not disturb: no notifications, except from `notify_always_from`.
     pub do_not_disturb: bool,
     /// Quiet hours: notifications are held between `quiet_start` and `quiet_end` (local hours).
@@ -107,6 +109,18 @@ pub enum StartupView {
     AllMail,
     /// The view last shown: `last_view`.
     Last,
+}
+
+/// How much of a new message a desktop notification shows. Notifications can appear on a locked
+/// screen, where others can see them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotificationDetail {
+    /// The sender and the subject.
+    Full,
+    /// The sender only.
+    SenderOnly,
+    /// Only that new mail arrived, with no sender or subject.
+    Hidden,
 }
 
 /// When a conversation is marked read after it's opened.
@@ -188,6 +202,7 @@ impl Default for Settings {
             default_sort: crate::store::ListOrder::default(),
             read_on_open: ReadOnOpen::Immediately,
             read_delay_secs: 3,
+            notification_detail: NotificationDetail::Full,
             favorite_labels: Vec::new(),
             label_names: 1,
             saved_searches: Vec::new(),
@@ -332,6 +347,7 @@ mod tests {
             default_sort: crate::store::ListOrder::default(),
             read_on_open: ReadOnOpen::Immediately,
             read_delay_secs: 3,
+            notification_detail: NotificationDetail::Full,
             email: Some("me@example.com".into()),
             remember_password: true,
             auto_login: false,

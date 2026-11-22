@@ -40,7 +40,8 @@ use frog::links::gmail_thread_url;
 use frog::render_plaintext;
 use frog::search;
 use frog::settings::{
-    self, CHECK_INTERVAL_RANGE, PAGE_SIZE_RANGE, ReadOnOpen, Settings, StartupView, Theme,
+    self, CHECK_INTERVAL_RANGE, NotificationDetail, PAGE_SIZE_RANGE, ReadOnOpen, Settings,
+    StartupView, Theme,
 };
 
 use backend::Message;
@@ -1007,7 +1008,9 @@ impl App {
                         }
                         ctx.request_repaint();
                     };
-                    if let Err(e) = notify::new_mail(&items, on_click) {
+                    if let Err(e) =
+                        notify::new_mail(&items, self.settings.notification_detail, on_click)
+                    {
                         eprintln!("Could not show a notification: {e}");
                     }
                 }
@@ -2082,6 +2085,28 @@ impl App {
             );
         });
         ui.weak("Local time. Quiet hours can cross midnight.");
+        ui.add_space(8.0);
+        ui.label("What a notification shows");
+        ui.horizontal(|ui| {
+            ui.radio_value(
+                &mut self.settings.notification_detail,
+                NotificationDetail::Full,
+                "Sender and subject",
+            );
+            ui.radio_value(
+                &mut self.settings.notification_detail,
+                NotificationDetail::SenderOnly,
+                "Sender only",
+            );
+            ui.radio_value(
+                &mut self.settings.notification_detail,
+                NotificationDetail::Hidden,
+                "Only that mail arrived",
+            );
+        });
+        ui.weak(
+            "Notifications can show on a locked screen. Choose a level that suits where you are.",
+        );
         ui.add_space(8.0);
         sender_list(
             ui,
