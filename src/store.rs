@@ -782,7 +782,6 @@ fn adjust_label_threads(tx: &Transaction, label: &str, threads: i64, unread: i64
              threads = threads + excluded.threads, unread = unread + excluded.unread",
         params![label, threads, unread],
     )?;
-    tx.execute("DELETE FROM label_threads WHERE threads <= 0", [])?;
     Ok(())
 }
 
@@ -830,6 +829,8 @@ fn refresh_threads(tx: &Transaction, thrids: &BTreeSet<u64>) -> Result<()> {
         let after = thread_contribution(tx, thrid)?;
         apply_contribution_delta(tx, &before, &after)?;
     }
+    // Drops labels whose last thread went away. Done once for the batch, not after each change.
+    tx.execute("DELETE FROM label_threads WHERE threads <= 0", [])?;
     Ok(())
 }
 
