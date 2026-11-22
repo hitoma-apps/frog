@@ -1,0 +1,153 @@
+name: Release
+
+# Publishes a release when a version tag is pushed, such as v0.1.0. The tag must match the
+# version in Cargo.toml.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-version:
+    name: Check the tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Compare
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "$tag" != "$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+          if [ ! -f "packaging/release/notes-$tag.md" ]; then
+            echo "::error::No release notes at packaging/release/notes-$tag.md"
+            exit 1
+          fi
+
+  linux:
+    name: Linux release (AppImage and update package)
+    needs: check-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install vpk and squashfs
+        run: |
+          sudo apt-get install -y -q squashfs-tools
+          dotnet tool install vpk --tool-path "$RUNNER_TEMP/tools"
+      - name: Release build
+        run: cargo build --release --locked
+      - name: Pack with Velopack
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          app="$RUNNER_TEMP/app"
+          mkdir -p "$app" "$RUNNER_TEMP/velopack"
+          cp target/release/frog "$app/frog"
+          cp packaging/linux/frog.png "$app/frog.png"
+          "$RUNNER_TEMP/tools/vpk" pack -u frog -v "$version" -p "$app" -e frog \
+            -o "$RUNNER_TEMP/velopack" --packTitle FROG --packAuthors hitoma-apps \
+            --icon "$app/frog.png"
+      - name: Upload the Linux packages
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: velopack-linux
+          path: ${{ runner.temp }}/velopack
+          if-no-files-found: error
+          retention-days: 14
+
+  macos:
+    name: macOS release (universal app)
+    needs: check-version
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Build the app bundle
+        run: sh packaging/macos/build.sh
+      - name: Upload the macOS app
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: frog-macos
+          path: target/FROG-macos-universal.zip
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
+
+  windows:
+    name: Windows release (unsigned)
+    needs: check-version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Release build
+        run: cargo build --release --locked
+      - name: Upload the Windows binary
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: frog-windows
+          path: target/release/frog.exe
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish the release
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install vpk
+        run: dotnet tool install vpk --tool-path "$RUNNER_TEMP/tools"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: ${{ runner.temp }}/downloads
+      - name: Gather the files
+        run: |
+          set -eu
+          # Find each file by name, wherever the download action put it.
+          find_one() {
+            found=$(find "$RUNNER_TEMP/downloads" -name "$1" -type f | head -n 1)
+            if [ -z "$found" ]; then echo "::error::Missing $1"; exit 1; fi
+            echo "$found"
+          }
+          mkdir -p "$RUNNER_TEMP/extra" "$RUNNER_TEMP/velopack"
+          cp "$(find_one FROG-macos-universal.zip)" "$RUNNER_TEMP/extra/"
+          cp "$(find_one frog.exe)" "$RUNNER_TEMP/extra/frog-windows-x86_64.exe"
+          feed=$(find_one releases.linux.json)
+          cp "$(dirname "$feed")"/* "$RUNNER_TEMP/velopack/"
+      - name: Create the release with the Linux update packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tag="$GITHUB_REF_NAME"
+          version="${tag#v}"
+          # Velopack uploads the update packages and the feed. Its channel file for Linux is what
+          # the app reads, so the release must carry it.
+          "$RUNNER_TEMP/tools/vpk" upload github \
+            --outputDir "$RUNNER_TEMP/velopack" \
+            --repoUrl "https://github.com/$GITHUB_REPOSITORY" \
+            --token "$GH_TOKEN" --channel linux --publish \
+            --tag "$tag" --releaseName "FROG $version" \
+            --releaseNotes "packaging/release/notes-$version.md"
+          gh release upload "$tag" "$RUNNER_TEMP/extra/"* --clobber
