@@ -94,6 +94,13 @@ fn main() -> eframe::Result {
     // process, so this runs before anything else.
     velopack::VelopackApp::build().run();
 
+    if let Some(path) = frog::store::log_file_path() {
+        frog::log::write_to(&path);
+    }
+    frog::log::log(
+        "APP",
+        format!("FROG {} starting", env!("CARGO_PKG_VERSION")),
+    );
     let creds = match (
         std::env::var("GMAIL_USER"),
         std::env::var("GMAIL_APP_PASSWORD"),
@@ -780,7 +787,6 @@ struct App {
     read_timer: Option<(u64, Instant)>,
     label_input: String,
     /// IMAP commands issued this session, newest last.
-    log: Vec<String>,
     status: Option<String>,
 }
 
@@ -919,7 +925,6 @@ impl App {
             mark_read_on_open: false,
             read_timer: None,
             label_input: String::new(),
-            log: Vec::new(),
             status: None,
         };
         // Environment variables take precedence over a remembered password.
@@ -1071,7 +1076,7 @@ impl App {
                         m.seen = u.seen;
                     }
                 }
-                self.log.push(command);
+                frog::log::log("IMAP", &command);
                 self.view_stale = true;
             }
             Event::CacheVerified {
@@ -3866,7 +3871,7 @@ impl App {
             return;
         }
         let mut open = true;
-        egui::Window::new("IMAP log")
+        egui::Window::new("Log")
             .default_size([720.0, 420.0])
             .resizable(true)
             .open(&mut open)
@@ -3876,7 +3881,7 @@ impl App {
                     .auto_shrink([false, false])
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
-                        for line in &self.log {
+                        for line in frog::log::snapshot() {
                             ui.monospace(line);
                         }
                     });

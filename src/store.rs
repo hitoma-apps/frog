@@ -279,6 +279,13 @@ fn search_filter(query: &Query) -> (String, Vec<rusqlite::types::Value>) {
     (sql, args)
 }
 
+/// Where the app's log file lives: `<data dir>/frog.log`. Returns `None` if the platform has no
+/// data directory.
+pub fn log_file_path() -> Option<PathBuf> {
+    let dirs = ProjectDirs::from("", "", "gmail-labels-proto")?;
+    Some(dirs.data_dir().join("frog.log"))
+}
+
 /// Where an account's cache file lives: `<data dir>/accounts/<sanitized email>.sqlite`.
 /// Returns `None` if the platform has no data directory.
 pub fn account_cache_path(email: &str) -> Option<PathBuf> {
@@ -926,7 +933,10 @@ impl Store {
     /// (renamed, not deleted) and a new one started. Returns what was done, for the user.
     pub fn open_checked(path: &Path) -> Result<(Self, Vec<String>)> {
         let mut notes = Vec::new();
-        let store = match Self::open(path) {
+        crate::log::log("CACHE", "open: opening the cache file");
+        let store = match crate::timed_log("CACHE", "open: opening and upgrading the cache", || {
+            Self::open(path)
+        }) {
             Ok(store) => store,
             Err(e) => {
                 set_aside(path)?;

@@ -921,11 +921,19 @@ impl Worker {
     /// background. The GUI reads the cache itself, so only progress is sent.
     fn op_load(&mut self, src: &mut dyn MailSource, limit: usize) -> Result<(), SourceError> {
         self.state.limit = limit;
+        frog::log::log("WORKER", "load: selecting the mailbox");
         let info = src.select()?;
+        frog::log::log(
+            "WORKER",
+            format!("load: mailbox has {} messages", info.exists),
+        );
         self.begin_mailbox(info);
         self.report_labels(src)?;
 
-        let all = src.search_from(1)?;
+        let all = frog::log::timed("IMAP", "load: listing every UID on the server", || {
+            src.search_from(1)
+        })?;
+        frog::log::log("WORKER", format!("load: the server has {} UIDs", all.len()));
         self.state.highest = all.last().copied();
         let server: UidSet = all.iter().copied().collect();
 
@@ -1044,7 +1052,14 @@ impl Worker {
     /// Applies changes made since `modseq`: labels and read state for messages
     /// we have, and full headers for messages we don't.
     fn sync_changes(&mut self, src: &mut dyn MailSource, modseq: u64) -> Result<(), SourceError> {
-        let changes = match src.changed_since(modseq) {
+        frog::log::log(
+            "WORKER",
+            format!("sync: asking for changes since modseq {modseq}"),
+        );
+        let changes = frog::log::timed("IMAP", "sync: changes since the last sync", || {
+            src.changed_since(modseq)
+        });
+        let changes = match changes {
             Ok(changes) => changes,
             Err(e @ SourceError::Disconnected(_)) => return Err(e),
             Err(e) => {
@@ -1053,6 +1068,10 @@ impl Worker {
                 return Ok(());
             }
         };
+        frog::log::log(
+            "WORKER",
+            format!("sync: {} messages changed", changes.len()),
+        );
         // Nothing changed (the usual case for a periodic check): nothing to look up.
         if changes.is_empty() {
             return Ok(());
@@ -1061,13 +1080,23 @@ impl Worker {
         let (known, unknown): (Vec<MessageUpdate>, Vec<MessageUpdate>) =
             changes.into_iter().partition(|c| cached.contains(c.uid));
 
+        // Headers for messages we don't have, in batches, so the window can show progress
+        // between them. A long sync used to fetch them in one go, with nothing to show.
         if !unknown.is_empty() {
+            frog::log::log(
+                "WORKER",
+                format!("sync: fetching headers for {} new messages", unknown.len()),
+            );
             let uids: Vec<u32> = unknown.iter().map(|c| c.uid).collect();
-            let fetched = src.fetch_headers(&uids)?;
-            self.cache_upsert(&fetched);
-            self.state.cached += fetched.len();
+            for chunk in uids.chunks(BATCH) {
+                let fetched = src.fetch_headers(chunk)?;
+                self.cache_upsert(&fetched);
+                self.state.cached += fetched.len();
+                self.emit_progress();
+            }
             // Those messages are no longer waiting for a background header fetch.
             self.state.pending_headers.retain(|u| !uids.contains(u));
+            frog::log::log("WORKER", "sync: new headers are cached");
         }
         self.cache_updates(&known);
         if !known.is_empty() {

@@ -306,10 +306,14 @@ impl<S: Read + Write> Drop for LiveSession<S> {
 
 /// Connects to Gmail over TLS and signs in.
 pub fn connect_gmail(user: &str, password: &str) -> Result<Box<dyn MailSource>, String> {
-    let conn = connect_tls("imap.gmail.com", 993)
-        .map_err(|e| format!("Could not connect to imap.gmail.com: {e}"))?;
-    let session = LiveSession::open(conn, user, password)
-        .map_err(|e| format!("Gmail sign-in failed: {e}"))?;
+    let conn = frog::log::timed("IMAP", "connect: TCP and TLS to imap.gmail.com", || {
+        connect_tls("imap.gmail.com", 993)
+    })
+    .map_err(|e| format!("Could not connect to imap.gmail.com: {e}"))?;
+    let session = frog::log::timed("IMAP", "connect: sign-in and mailbox select", || {
+        LiveSession::open(conn, user, password)
+    })
+    .map_err(|e| format!("Gmail sign-in failed: {e}"))?;
     Ok(Box::new(session))
 }
 

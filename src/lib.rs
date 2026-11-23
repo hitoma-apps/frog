@@ -10,6 +10,7 @@ pub mod importance;
 pub mod labels;
 pub mod linkcheck;
 pub mod links;
+pub mod log;
 pub mod original;
 pub mod render;
 pub mod response;
@@ -23,3 +24,8 @@ pub mod utf7;
 pub use labels::{Label, LabelAction, LabelRef, SystemLabel, uid_store_labels};
 pub use render::render_plaintext;
 pub use response::{GmailFetch, ParseError, parse_gmail_fetch};
+
+/// Runs `f` and logs how long it took, under `subsystem`.
+pub fn timed_log<T>(subsystem: &str, what: &str, f: impl FnOnce() -> T) -> T {
+    log::timed(subsystem, what, f)
+}
