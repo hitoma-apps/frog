@@ -64,11 +64,22 @@ pub fn start(automatic: bool, wake: impl Fn() + Send + 'static) -> Updates {
 fn run(commands: Receiver<Command>, mut automatic: bool, report: impl Fn(Event)) {
     let manager = match UpdateManager::new(GithubSource::new(REPO_URL, None, false), None, None) {
         Ok(manager) => manager,
-        Err(_) => {
+        Err(e) => {
+            frog::log::log(
+                "UPDATE",
+                format!("not installed by Velopack, so no updates: {e}"),
+            );
             report(Event::NotInstalled);
             return;
         }
     };
+    frog::log::log(
+        "UPDATE",
+        format!(
+            "installed; this is version {}",
+            manager.get_current_version_as_string()
+        ),
+    );
     let mut pending: Option<UpdateInfo> = None;
     // The first check happens at startup, if automatic checks are on.
     let mut next_check = Instant::now();
@@ -109,16 +120,36 @@ fn run(commands: Receiver<Command>, mut automatic: bool, report: impl Fn(Event))
 /// Checks for a newer release, and downloads it if there is one.
 fn check(manager: &UpdateManager, pending: &mut Option<UpdateInfo>, report: &impl Fn(Event)) {
     match manager.check_for_updates() {
-        Ok(UpdateCheck::UpdateAvailable(info)) => match manager.download_updates(&info, None) {
-            Ok(()) => {
-                let version = info.TargetFullRelease.Version.clone();
-                *pending = Some(*info);
-                report(Event::Ready(version));
+        Ok(UpdateCheck::UpdateAvailable(info)) => {
+            let version = info.TargetFullRelease.Version.clone();
+            frog::log::log(
+                "UPDATE",
+                format!("version {version} is available; downloading"),
+            );
+            match manager.download_updates(&info, None) {
+                Ok(()) => {
+                    frog::log::log("UPDATE", format!("version {version} is downloaded"));
+                    *pending = Some(*info);
+                    report(Event::Ready(version));
+                }
+                Err(e) => {
+                    frog::log::log("UPDATE", format!("download failed: {e}"));
+                    report(Event::Failed(format!("Could not download the update: {e}")));
+                }
             }
-            Err(e) => report(Event::Failed(format!("Could not download the update: {e}"))),
-        },
-        Ok(_) => report(Event::Checked { available: None }),
-        Err(e) => report(Event::Failed(format!("Could not check for updates: {e}"))),
+        }
+        Ok(UpdateCheck::NoUpdateAvailable) => {
+            frog::log::log("UPDATE", "check: no newer version");
+            report(Event::Checked { available: None });
+        }
+        Ok(UpdateCheck::RemoteIsEmpty) => {
+            frog::log::log("UPDATE", "check: the release feed is empty");
+            report(Event::Checked { available: None });
+        }
+        Err(e) => {
+            frog::log::log("UPDATE", format!("check failed: {e}"));
+            report(Event::Failed(format!("Could not check for updates: {e}")));
+        }
     }
 }
 
