@@ -1,33 +1,58 @@
 name: Release
 
-# Publishes a release when a version tag is pushed, such as v0.1.0. The tag must match the
-# version in Cargo.toml.
+# Publishes a release in one of two ways:
+# - Pushing a version tag such as v0.1.0. The tag must match the version in Cargo.toml.
+# - Running it by hand from the Actions tab. Enter the version (it must match Cargo.toml). The
+#   release is created at the commit the run uses, so it doesn't need a pushed tag. Leave
+#   "publish" off for a dry run, which builds and packs everything without publishing.
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, such as 0.1.6. Must match Cargo.toml.'
+        required: true
+        type: string
+      publish:
+        description: 'Publish the release (off means a dry run)'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
   check-version:
-    name: Check the tag matches Cargo.toml
+    name: Check the version matches Cargo.toml
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Compare
+        id: version
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          tag="${GITHUB_REF_NAME#v}"
-          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
-          if [ "$tag" != "$version" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+          set -eu
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            version="$INPUT_VERSION"
+          else
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          cargo_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "$version" != "$cargo_version" ]; then
+            echo "::error::Version $version does not match Cargo.toml version $cargo_version"
             exit 1
           fi
-          if [ ! -f "packaging/release/notes-$tag.md" ]; then
-            echo "::error::No release notes at packaging/release/notes-$tag.md"
+          if [ ! -f "packaging/release/notes-$version.md" ]; then
+            echo "::error::No release notes at packaging/release/notes-$version.md"
             exit 1
           fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
   linux:
     name: Linux release (AppImage and update package)
@@ -47,9 +72,11 @@ jobs:
       - name: Release build
         run: cargo build --release --locked
       - name: Pack with Velopack
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
         run: |
           set -eu
-          version="${GITHUB_REF_NAME#v}"
+          version="$VERSION"
           app="$RUNNER_TEMP/app"
           mkdir -p "$app" "$RUNNER_TEMP/velopack"
           cp target/release/frog "$app/frog"
@@ -106,7 +133,9 @@ jobs:
 
   publish:
     name: Publish the release
-    needs: [linux, macos, windows]
+    needs: [check-version, linux, macos, windows]
+    # Runs for a pushed tag, or for a manual run with "publish" on. Otherwise it's a dry run.
+    if: github.event_name == 'push' || inputs.publish
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -141,17 +170,18 @@ jobs:
       - name: Create the release with the Linux update packages
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check-version.outputs.version }}
         run: |
           set -eu
-          tag="$GITHUB_REF_NAME"
-          version="${tag#v}"
+          version="$VERSION"
+          tag="v$version"
           # Velopack uploads the update packages and the feed. Its channel file for Linux is what
           # the app reads, so the release must carry it.
           "$RUNNER_TEMP/tools/vpk" upload github \
             --outputDir "$RUNNER_TEMP/velopack" \
             --repoUrl "https://github.com/$GITHUB_REPOSITORY" \
             --token "$GH_TOKEN" --channel linux --publish --merge \
-            --tag "$tag" --releaseName "FROG $version"
+            --tag "$tag" --targetCommitish "$GITHUB_SHA" --releaseName "FROG $version"
           # The upload doesn't take notes, so they're set on the release afterwards.
           gh release edit "$tag" --title "FROG $version" \
             --notes-file "packaging/release/notes-$version.md"
