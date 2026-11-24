@@ -79,6 +79,8 @@ pub enum Command {
     Senders { limit: usize },
     /// Threads whose newest cached message is from `account`.
     Waiting { account: String, limit: usize },
+    /// Cached messages whose subject reads like a one-time code email.
+    CodeMail { limit: usize },
     /// Searches the cached messages for a query.
     Search {
         query: frog::search::Query,
@@ -185,6 +187,8 @@ pub enum Event {
     Senders(Vec<frog::store::SenderStat>),
     /// Threads waiting for a reply, with each thread's message count.
     Waiting(Vec<(frog::store::CachedMessage, usize)>),
+    /// The one-time code emails, newest first.
+    CodeMail(Vec<frog::store::CachedMessage>),
     /// The messages matching a search. `query` says which search this answers.
     Search {
         query: frog::search::Query,
@@ -615,6 +619,7 @@ impl Worker {
             | Command::Largest { .. }
             | Command::Senders { .. }
             | Command::Waiting { .. }
+            | Command::CodeMail { .. }
             | Command::Search { .. }
             | Command::VerifyCache => Ok(()),
         }
@@ -1515,6 +1520,7 @@ fn answer_read(
         Command::Largest { limit } => read_largest(store, emit, *limit),
         Command::Senders { limit } => read_senders(store, emit, *limit),
         Command::Waiting { account, limit } => read_waiting(store, emit, account, *limit),
+        Command::CodeMail { limit } => read_code_mail(store, emit, *limit),
         Command::Search { query, limit } => read_search(store, emit, query, *limit),
         Command::ThreadRange {
             filter,
@@ -1537,11 +1543,23 @@ pub fn is_cache_read(cmd: &Command) -> bool {
             | Command::Largest { .. }
             | Command::Senders { .. }
             | Command::Waiting { .. }
+            | Command::CodeMail { .. }
             | Command::Search { .. }
     )
 }
 
 /// Answers the waiting-for-reply view.
+fn read_code_mail(store: Option<&Store>, emit: &Emitter, limit: usize) {
+    let messages = match store {
+        Some(store) => store.code_mail(limit),
+        None => Ok(Vec::new()),
+    };
+    match messages {
+        Ok(messages) => emit.send(Event::CodeMail(messages)),
+        Err(e) => emit.send(Event::Error(format!("cache read failed: {e}"))),
+    }
+}
+
 fn read_waiting(store: Option<&Store>, emit: &Emitter, account: &str, limit: usize) {
     let threads = match store {
         Some(store) => store.waiting_for_reply(account, limit),
@@ -2436,6 +2454,7 @@ mod sync_tests {
             Event::Largest(_) => "Largest",
             Event::Senders(_) => "Senders",
             Event::Waiting(_) => "Waiting",
+            Event::CodeMail(_) => "CodeMail",
             Event::Search { .. } => "Search",
             Event::ThreadRange { .. } => "ThreadRange",
             Event::Thread { .. } => "Thread",

@@ -2060,6 +2060,54 @@ impl Store {
 
     /// Threads whose newest cached message is from `account`, so no one has answered it, newest
     /// first, with each thread's message count. Drafts don't count.
+    /// Cached messages whose subject reads like a one-time code email, newest first, at most
+    /// `limit`. The subject decides, so a code only in the body isn't found. A broad first match
+    /// in SQL is narrowed in Rust by `otp::is_code_subject`.
+    pub fn code_mail(&self, limit: usize) -> Result<Vec<CachedMessage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.uid, m.msgid, m.thrid, m.from_addr, m.subject, m.date, m.seen,
+                    m.sent, m.from_email, m.attachment, m.received
+             FROM messages m
+             WHERE m.uid IS NOT NULL
+               AND (m.subject LIKE '%code%' OR m.subject LIKE '%verif%'
+                    OR m.subject LIKE '%otp%' OR m.subject LIKE '%passcode%'
+                    OR m.subject LIKE '%2fa%' OR m.subject LIKE '%one-time%'
+                    OR m.subject LIKE '%one time%' OR m.subject LIKE '%sign-in%'
+                    OR m.subject LIKE '%sign in%' OR m.subject LIKE '%login%'
+                    OR m.subject LIKE '%authenticat%' OR m.subject LIKE '%two-factor%')
+             ORDER BY COALESCE(m.received, m.sent) DESC, m.uid DESC
+             LIMIT 5000",
+        )?;
+        let mut out = Vec::new();
+        let rows = stmt.query_map([], |r| {
+            Ok(CachedMessage {
+                uid: r.get(0)?,
+                msgid: r.get::<_, i64>(1)? as u64,
+                thrid: r.get::<_, i64>(2)? as u64,
+                labels: BTreeSet::new(),
+                from: r.get(3)?,
+                from_email: r.get(8)?,
+                attachment: r.get(9)?,
+                received: r.get(10)?,
+                subject: r.get(4)?,
+                date: r.get(5)?,
+                headers: Vec::new(),
+                seen: r.get(6)?,
+                sent: r.get(7)?,
+            })
+        })?;
+        for row in rows {
+            let message = row?;
+            if crate::otp::is_code_subject(&message.subject) {
+                out.push(message);
+                if out.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub fn waiting_for_reply(
         &self,
         account: &str,
@@ -3193,6 +3241,36 @@ mod tests {
             .collect();
         assert_eq!(order, vec![100, 500]);
         assert!(s.check().unwrap().logical.is_empty());
+    }
+
+    #[test]
+    fn code_mail_lists_only_messages_whose_subjects_read_like_codes() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        let subjects = [
+            "482913 is your sign-in code",
+            "Your verification code",
+            "Lunch on Friday?",
+            "Code review for the parser",
+        ];
+        let messages: Vec<CachedMessage> = subjects
+            .iter()
+            .enumerate()
+            .map(|(i, subject)| {
+                let mut m = msg(i as u64 + 1, i as u32 + 1, &["\\Inbox"]);
+                m.subject = subject.to_string();
+                m
+            })
+            .collect();
+        s.upsert_messages(&messages).unwrap();
+        let found: Vec<String> = s
+            .code_mail(10)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.subject)
+            .collect();
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found.iter().all(|subject| !subject.contains("Lunch")));
+        assert!(!found.iter().any(|subject| subject.contains("review")));
     }
 
     #[test]

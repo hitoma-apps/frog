@@ -12,6 +12,7 @@ pub mod linkcheck;
 pub mod links;
 pub mod log;
 pub mod original;
+pub mod otp;
 pub mod render;
 pub mod response;
 pub mod search;

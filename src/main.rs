@@ -659,11 +659,19 @@ struct App {
     waiting_open: bool,
     /// The threads waiting for a reply, once the view has asked for them.
     waiting: Option<Arc<Vec<SearchRow>>>,
+    /// The verification-code view, and its rows.
+    codes_open: bool,
+    codes: Option<Arc<Vec<SearchRow>>>,
     /// The senders with the most cached messages, once the view has asked for them.
     senders: Option<Arc<Vec<frog::store::SenderStat>>>,
     /// Threads whose notifications were clicked, sent from the notification threads.
     click_tx: std::sync::mpsc::Sender<u64>,
     click_rx: std::sync::mpsc::Receiver<u64>,
+    /// Codes to copy, sent from a notification's Copy action.
+    copy_tx: std::sync::mpsc::Sender<String>,
+    copy_rx: std::sync::mpsc::Receiver<String>,
+    /// The one-time codes found in each message's text, from when it was rendered.
+    found_codes: HashMap<u32, Vec<String>>,
     /// Which settings pane is shown.
     settings_pane: SettingsPane,
     /// What has been typed into the notification sender lists, before it's added.
@@ -844,6 +852,7 @@ impl App {
             }
         }
         let (click_tx, click_rx) = std::sync::mpsc::channel();
+        let (copy_tx, copy_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             ctx,
             settings,
@@ -859,9 +868,14 @@ impl App {
             senders_open: false,
             senders: None,
             waiting_open: false,
+            codes_open: false,
+            codes: None,
             waiting: None,
             click_tx,
             click_rx,
+            copy_tx,
+            copy_rx,
+            found_codes: HashMap::new(),
             label_cache: None,
             settings_pane: SettingsPane::General,
             notify_draft_always: String::new(),
@@ -1056,9 +1070,27 @@ impl App {
                         }
                         ctx.request_repaint();
                     };
-                    if let Err(e) =
-                        notify::new_mail(&items, self.settings.notification_detail, on_click)
-                    {
+                    // A one-time code in the subject of a single new message can be copied from the
+                    // notification.
+                    let code = match new.as_slice() {
+                        [only] => frog::otp::find(&only.subject).into_iter().next(),
+                        _ => None,
+                    };
+                    let copy_tx = self.copy_tx.clone();
+                    let copy_ctx = self.ctx.clone();
+                    let on_copy = move || {
+                        if let Some(code) = code.clone() {
+                            let _ = copy_tx.send(code);
+                        }
+                        copy_ctx.request_repaint();
+                    };
+                    if let Err(e) = notify::new_mail(
+                        &items,
+                        self.settings.notification_detail,
+                        new.len() == 1 && frog::otp::find(&new[0].subject).len() == 1,
+                        on_click,
+                        on_copy,
+                    ) {
                         eprintln!("Could not show a notification: {e}");
                     }
                 }
@@ -1141,6 +1173,24 @@ impl App {
             }
             Event::Largest(view) => self.storage = Some(Arc::new(view)),
             Event::Senders(list) => self.senders = Some(Arc::new(list)),
+            Event::CodeMail(messages) => {
+                let rows: Vec<SearchRow> = messages
+                    .into_iter()
+                    .filter_map(|c| {
+                        let thrid = c.thrid;
+                        let unread = !c.seen;
+                        let attachments = c.attachment.unwrap_or(false);
+                        Message::from_cached(c).map(|head| SearchRow {
+                            head,
+                            thrid,
+                            count: 1,
+                            unread,
+                            attachments,
+                        })
+                    })
+                    .collect();
+                self.codes = Some(Arc::new(rows));
+            }
             Event::Waiting(threads) => {
                 let rows: Vec<SearchRow> = threads
                     .into_iter()
@@ -1249,6 +1299,7 @@ impl App {
         self.storage_open = false;
         self.senders_open = false;
         self.waiting_open = false;
+        self.codes_open = false;
         self.search_asked = None;
         self.window_filter = None;
         self.window_rows.clear();
@@ -1537,6 +1588,10 @@ impl App {
             self.open_conversation(thrid);
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
+        while let Ok(code) = self.copy_rx.try_recv() {
+            ctx.copy_text(code);
+            self.status = Some("Copied the code to the clipboard.".to_string());
+        }
     }
 
     /// Opens the storage view: the largest cached messages, biggest first.
@@ -1566,6 +1621,11 @@ impl App {
             ui.weak("Looking…");
             return;
         };
+        self.thread_rows(ui, "waiting", rows);
+    }
+
+    /// Draws thread rows as the thread list does, with the same checkboxes, stars and clicks.
+    fn thread_rows(&mut self, ui: &mut egui::Ui, id: &str, rows: Arc<Vec<SearchRow>>) {
         ui.separator();
         let row_height = ui.spacing().interact_size.y;
         let mut opened: Option<u64> = None;
@@ -1573,7 +1633,7 @@ impl App {
         let mut sender_search: Option<String> = None;
         let mut star_clicks: Vec<(u64, bool)> = Vec::new();
         egui::ScrollArea::vertical()
-            .id_salt("waiting")
+            .id_salt(id)
             .auto_shrink([false, false])
             .show_rows(ui, row_height, rows.len(), |ui, range| {
                 for row in &rows[range] {
@@ -1628,6 +1688,31 @@ impl App {
         if let Some(address) = sender_search {
             self.search_from(&address);
         }
+    }
+
+    /// Opens the verification-code emails: messages whose subjects read like one-time codes.
+    fn open_codes(&mut self) {
+        self.search.clear();
+        self.change_list();
+        self.codes_open = true;
+        self.send(Command::CodeMail { limit: SEARCH_ROWS });
+    }
+
+    /// The one-time code emails, to clear out. Check the ones to remove, then use Trash. Trash
+    /// moves each whole thread, which is usually a single message for these.
+    fn codes_list(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Verification codes");
+            if ui.button("Refresh").clicked() {
+                self.open_codes();
+            }
+        });
+        ui.weak("Messages whose subjects read like one-time code emails. Check the ones to clear, then use Trash.");
+        let Some(rows) = self.codes.clone() else {
+            ui.weak("Looking…");
+            return;
+        };
+        self.thread_rows(ui, "codes", rows);
     }
 
     /// Opens the sender statistics: the senders with the most cached messages.
@@ -2872,6 +2957,14 @@ impl App {
                 {
                     self.open_waiting();
                 }
+                let codes_open = self.codes_open && self.search.trim().is_empty();
+                if ui
+                    .selectable_label(codes_open, "Verification codes")
+                    .on_hover_text("Messages that look like one-time code emails, to clear out")
+                    .clicked()
+                {
+                    self.open_codes();
+                }
 
                 // The label tree is built once per change to the labels or their counts, not per
                 // frame. It's taken out while it's drawn, since drawing needs `&mut self`.
@@ -3025,7 +3118,14 @@ impl App {
     /// reply). `None` for the thread list, which reads its rows from the cache.
     fn listed_thrids(&self) -> Option<Vec<u64>> {
         let mut seen = HashSet::new();
-        let thrids: Vec<u64> = if self.waiting_open && self.search.trim().is_empty() {
+        let thrids: Vec<u64> = if self.codes_open && self.search.trim().is_empty() {
+            self.codes
+                .as_ref()?
+                .iter()
+                .map(|r| r.thrid)
+                .filter(|t| seen.insert(*t))
+                .collect()
+        } else if self.waiting_open && self.search.trim().is_empty() {
             self.waiting
                 .as_ref()?
                 .iter()
@@ -3301,6 +3401,28 @@ impl App {
             .map(|l| ((*l).clone(), display_label(l)))
             .collect();
 
+        // One-time codes found in the conversation, each with a button that copies it.
+        for &uid in &thread {
+            let codes = self.found_codes.get(&uid).cloned().unwrap_or_default();
+            if codes.is_empty() {
+                continue;
+            }
+            let from = self
+                .thread_msgs
+                .get(&uid)
+                .map(|m| m.from.clone())
+                .unwrap_or_default();
+            ui.horizontal(|ui| {
+                ui.label(format!("One-time code from {from}:"));
+                for code in &codes {
+                    if ui.button(format!("Copy {code}")).clicked() {
+                        ui.ctx().copy_text(code.clone());
+                        self.status = Some("Copied the code to the clipboard.".to_string());
+                    }
+                }
+            });
+        }
+
         // Bodies for the whole conversation, fetched in the background, and
         // each one rendered once.
         for &uid in &thread {
@@ -3314,6 +3436,7 @@ impl App {
                 continue;
             };
             let text = render_plaintext(body).unwrap_or_else(|| "(could not parse message)".into());
+            self.found_codes.insert(uid, frog::otp::find(&text));
             self.rendered.insert(uid, reader::blocks(&text));
         }
         for &uid in &thread {
@@ -3329,6 +3452,7 @@ impl App {
         if self.rendered.len() > 300 {
             let present = &self.thread_msgs;
             self.rendered.retain(|uid, _| present.contains_key(uid));
+            self.found_codes.retain(|uid, _| present.contains_key(uid));
         }
 
         let open_url = (thrid != 0).then(|| gmail_thread_url(thrid));
@@ -4298,6 +4422,8 @@ impl eframe::App for App {
                         self.storage_list(ui);
                     } else if self.senders_open {
                         self.senders_list(ui);
+                    } else if self.codes_open {
+                        self.codes_list(ui);
                     } else if self.waiting_open {
                         self.waiting_list(ui);
                     } else {

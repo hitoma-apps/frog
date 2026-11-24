@@ -51,24 +51,42 @@ pub fn content(items: &[NewMail], detail: NotificationDetail) -> (String, String
 pub fn new_mail(
     items: &[NewMail],
     detail: NotificationDetail,
+    has_code: bool,
     on_click: impl FnOnce() + Send + 'static,
+    on_copy: impl FnOnce() + Send + 'static,
 ) -> Result<(), String> {
     if items.is_empty() {
         return Ok(());
     }
     let (summary, body) = content(items, detail);
-    let handle = notify_rust::Notification::new()
+    let mut notification = notify_rust::Notification::new();
+    notification
         .appname("FROG")
         .summary(&summary)
         .body(&body)
-        .action("default", "Open")
-        .show()
-        .map_err(|e| e.to_string())?;
+        .action("default", "Open");
+    // A code is offered only for one message, and only when the notification shows the subject.
+    // The button says "Copy code" rather than the code, since a locked screen can show it.
+    let offer_copy = has_code && items.len() == 1 && detail == NotificationDetail::Full;
+    if offer_copy {
+        notification.action("copy", "Copy code");
+    }
+    let handle = notification.show().map_err(|e| e.to_string())?;
+    let mut on_click = Some(on_click);
+    let mut on_copy = Some(on_copy);
     std::thread::spawn(move || {
-        handle.wait_for_action(|action| {
-            if action == "default" {
-                on_click();
+        handle.wait_for_action(|action| match action {
+            "default" => {
+                if let Some(run) = on_click.take() {
+                    run();
+                }
             }
+            "copy" => {
+                if let Some(run) = on_copy.take() {
+                    run();
+                }
+            }
+            _ => {}
         });
     });
     Ok(())
