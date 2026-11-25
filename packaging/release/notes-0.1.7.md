@@ -7,6 +7,11 @@
 - A Trash click moves the message out of the Inbox as well as adding Trash, as Gmail's web app does.
 - When Gmail's reply doesn't list a changed message, FROG applies the change to its cache, so the list stays right.
 - Label changes are recorded in the log, to help diagnose a change that doesn't appear.
+- In the dark theme, all text is brighter and easier to read.
+- Save in a conversation is a menu, with .EML or Plaintext.
+- Thread and message IDs are behind a (!) tooltip, rather than shown in the conversation.
+- A label chip in a conversation has an × to remove that label. The Remove label button is gone.
+- Add label chooses from the account's existing labels in a dropdown.
 
 ## Downloads
 
