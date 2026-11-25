@@ -608,8 +608,12 @@ fn render_line(ui: &mut egui::Ui, line: &str, pending: &mut Option<LinkInfo>) {
                         *pending = Some(info);
                     }
                 }
-                Segment::Link(url) => {
+                // Only web addresses are clickable. Anything else is shown as text.
+                Segment::Link(url) if linkcheck::is_web_address(url) => {
                     ui.hyperlink_to(egui::RichText::new(url).monospace(), url);
+                }
+                Segment::Link(url) => {
+                    ui.monospace(url);
                 }
             }
         }
@@ -4062,7 +4066,12 @@ impl App {
             });
         match decision {
             Some(true) => {
-                ctx.open_url(egui::OpenUrl::new_tab(info.target.clone()));
+                if linkcheck::is_web_address(&info.target) {
+                    ctx.open_url(egui::OpenUrl::new_tab(info.target.clone()));
+                } else {
+                    self.status =
+                        Some("That link isn't a web address, so it wasn't opened.".into());
+                }
                 self.pending_link = None;
             }
             Some(false) => self.pending_link = None,

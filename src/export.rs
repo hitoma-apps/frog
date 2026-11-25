@@ -35,7 +35,7 @@ pub fn safe_file_name(name: &str) -> String {
         .collect();
     let trimmed: String = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
     let short: String = trimmed.chars().take(80).collect();
-    let short = short.trim_end_matches(['.', ' ']).to_string();
+    let short = crate::text::portable_name(&short, 200);
     if short.is_empty() {
         "thread".to_string()
     } else {
