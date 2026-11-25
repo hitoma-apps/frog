@@ -1536,11 +1536,7 @@ impl App {
             .auto_shrink([false, false])
             .show_rows(ui, row_height, results.len(), |ui, range| {
                 for row in &results[range] {
-                    let band = if self.open_thread == Some(row.thrid) {
-                        ui.visuals().selection.bg_fill
-                    } else {
-                        egui::Color32::TRANSPARENT
-                    };
+                    let selected = self.open_thread == Some(row.thrid);
                     let highlight = ui.painter().add(egui::Shape::Noop);
                     let view = RowView {
                         head: &row.head,
@@ -1571,8 +1567,7 @@ impl App {
                     if action.search_sender.is_some() {
                         sender_search = action.search_sender;
                     }
-                    ui.painter()
-                        .set(highlight, egui::Shape::rect_filled(action.rect, 4.0, band));
+                    paint_row_highlight(ui, highlight, action.rect, selected);
                 }
             });
         for (thrid, starred) in star_clicks {
@@ -1662,11 +1657,7 @@ impl App {
             .auto_shrink([false, false])
             .show_rows(ui, row_height, rows.len(), |ui, range| {
                 for row in &rows[range] {
-                    let band = if self.open_thread == Some(row.thrid) {
-                        ui.visuals().selection.bg_fill
-                    } else {
-                        egui::Color32::TRANSPARENT
-                    };
+                    let selected = self.open_thread == Some(row.thrid);
                     let highlight = ui.painter().add(egui::Shape::Noop);
                     let view = RowView {
                         head: &row.head,
@@ -1697,8 +1688,7 @@ impl App {
                     if action.search_sender.is_some() {
                         sender_search = action.search_sender;
                     }
-                    ui.painter()
-                        .set(highlight, egui::Shape::rect_filled(action.rect, 4.0, band));
+                    paint_row_highlight(ui, highlight, action.rect, selected);
                 }
             });
         for (thrid, starred) in star_clicks {
@@ -2810,13 +2800,9 @@ impl App {
             let (threads, unread) = count;
             let text = format!("{name} ({unread}/{threads})");
             let hover = format!("{name}: {unread} unread of {threads} threads");
-            let band = if selected {
-                ui.visuals().selection.bg_fill
-            } else {
-                egui::Color32::TRANSPARENT
-            };
+            let highlight = ui.painter().add(egui::Shape::Noop);
             let frame = egui::Frame::new()
-                .fill(band)
+                .fill(egui::Color32::TRANSPARENT)
                 .corner_radius(4)
                 .show(ui, |ui| {
                     ui.set_min_size(egui::vec2(width, height));
@@ -2830,6 +2816,7 @@ impl App {
                     egui::Sense::click(),
                 )
                 .on_hover_text(hover);
+            paint_row_highlight(ui, highlight, frame.response.rect, selected);
             if response.clicked() {
                 self.set_label_filter(key.map(str::to_owned));
             }
@@ -2859,13 +2846,9 @@ impl App {
         let selected = self.search.trim() == text;
         let width = ui.available_width().max(40.0);
         let height = ui.spacing().interact_size.y;
-        let band = if selected {
-            ui.visuals().selection.bg_fill
-        } else {
-            egui::Color32::TRANSPARENT
-        };
+        let highlight = ui.painter().add(egui::Shape::Noop);
         let frame = egui::Frame::new()
-            .fill(band)
+            .fill(egui::Color32::TRANSPARENT)
             .corner_radius(4)
             .show(ui, |ui| {
                 ui.set_min_size(egui::vec2(width, height));
@@ -2879,6 +2862,7 @@ impl App {
                 egui::Sense::click(),
             )
             .on_hover_text(format!("Search: {text}"));
+        paint_row_highlight(ui, highlight, frame.response.rect, selected);
         if response.clicked() {
             self.search = text.to_string();
             self.change_list();
@@ -3128,94 +3112,99 @@ impl App {
 
     /// The actions on checked threads, shown only when some are checked.
     fn action_buttons(&mut self, ui: &mut egui::Ui) {
-        if ui
-            .button("Archive")
-            .on_hover_text("Remove \\Inbox")
-            .clicked()
-        {
-            self.apply(
-                LabelAction::Remove,
-                vec![SystemLabel::Inbox.as_wire().into()],
+        // The buttons are in three groups: moving mail, read state, and labels.
+        toolbar_group(ui, |ui| {
+            if ui
+                .button("Archive")
+                .on_hover_text("Remove \\Inbox")
+                .clicked()
+            {
+                self.apply(
+                    LabelAction::Remove,
+                    vec![SystemLabel::Inbox.as_wire().into()],
+                );
+            }
+            // Trash adds \Trash and removes \Inbox, as Gmail's web app does. Adding \Trash alone
+            // leaves the message in the Inbox.
+            if ui
+                .button("Trash")
+                .on_hover_text("Move to Trash: add \\Trash and remove \\Inbox")
+                .clicked()
+            {
+                self.apply(LabelAction::Add, vec![SystemLabel::Trash.as_wire().into()]);
+                self.apply(
+                    LabelAction::Remove,
+                    vec![SystemLabel::Inbox.as_wire().into()],
+                );
+            }
+            if ui.button("Star").on_hover_text("Add \\Starred").clicked() {
+                self.apply(
+                    LabelAction::Add,
+                    vec![SystemLabel::Starred.as_wire().into()],
+                );
+            }
+        });
+        toolbar_group(ui, |ui| {
+            if ui.button("Mark read").clicked() {
+                self.apply_read_state(true);
+            }
+            if ui.button("Mark unread").clicked() {
+                self.apply_read_state(false);
+            }
+        });
+        toolbar_group(ui, |ui| {
+            // Existing labels, to choose from. A label is taken off a conversation with the × on its
+            // chip in the conversation view.
+            // Type to filter the list. Enter takes the first match, and a click takes any one.
+            let names = self.user_label_names();
+            let query = self.label_input.trim().to_lowercase();
+            let matches: Vec<String> = names
+                .iter()
+                .filter(|n| query.is_empty() || n.to_lowercase().contains(&query))
+                .take(12)
+                .cloned()
+                .collect();
+            let edit = ui.add_enabled(
+                !names.is_empty(),
+                egui::TextEdit::singleline(&mut self.label_input)
+                    .id_salt("add_label")
+                    .hint_text("Type a label")
+                    .desired_width(160.0),
             );
-        }
-        // Trash adds \Trash and removes \Inbox, as Gmail's web app does. Adding \Trash alone
-        // leaves the message in the Inbox.
-        if ui
-            .button("Trash")
-            .on_hover_text("Move to Trash: add \\Trash and remove \\Inbox")
-            .clicked()
-        {
-            self.apply(LabelAction::Add, vec![SystemLabel::Trash.as_wire().into()]);
-            self.apply(
-                LabelAction::Remove,
-                vec![SystemLabel::Inbox.as_wire().into()],
-            );
-        }
-        if ui.button("Star").on_hover_text("Add \\Starred").clicked() {
-            self.apply(
-                LabelAction::Add,
-                vec![SystemLabel::Starred.as_wire().into()],
-            );
-        }
-        ui.separator();
-        if ui.button("Mark read").clicked() {
-            self.apply_read_state(true);
-        }
-        if ui.button("Mark unread").clicked() {
-            self.apply_read_state(false);
-        }
-        ui.separator();
-        // Existing labels, to choose from. A label is taken off a conversation with the × on its
-        // chip in the conversation view.
-        // Type to filter the list. Enter takes the first match, and a click takes any one.
-        let names = self.user_label_names();
-        let query = self.label_input.trim().to_lowercase();
-        let matches: Vec<String> = names
-            .iter()
-            .filter(|n| query.is_empty() || n.to_lowercase().contains(&query))
-            .take(12)
-            .cloned()
-            .collect();
-        let edit = ui.add_enabled(
-            !names.is_empty(),
-            egui::TextEdit::singleline(&mut self.label_input)
-                .id_salt("add_label")
-                .hint_text("Type a label")
-                .desired_width(160.0),
-        );
-        let enter = edit.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        if enter
-            && !names.contains(&self.label_input)
-            && let Some(first) = matches.first()
-        {
-            self.label_input = first.clone();
-        }
-        let mut picked: Option<String> = None;
-        let open = edit.has_focus() && !matches.is_empty();
-        egui::Popup::from_response(&edit)
-            .open(open)
-            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-            .show(|ui| {
-                for name in &matches {
-                    if ui
-                        .selectable_label(self.label_input == *name, name)
-                        .clicked()
-                    {
-                        picked = Some(name.clone());
+            let enter = edit.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if enter
+                && !names.contains(&self.label_input)
+                && let Some(first) = matches.first()
+            {
+                self.label_input = first.clone();
+            }
+            let mut picked: Option<String> = None;
+            let open = edit.has_focus() && !matches.is_empty();
+            egui::Popup::from_response(&edit)
+                .open(open)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .show(|ui| {
+                    for name in &matches {
+                        if ui
+                            .selectable_label(self.label_input == *name, name)
+                            .clicked()
+                        {
+                            picked = Some(name.clone());
+                        }
                     }
-                }
-            });
-        if let Some(name) = picked {
-            self.label_input = name;
-        }
-        let has_choice = names.contains(&self.label_input);
-        if ui
-            .add_enabled(has_choice, egui::Button::new("Add label"))
-            .clicked()
-        {
-            let label = self.label_input.clone();
-            self.apply(LabelAction::Add, vec![label]);
-        }
+                });
+            if let Some(name) = picked {
+                self.label_input = name;
+            }
+            let has_choice = names.contains(&self.label_input);
+            if ui
+                .add_enabled(has_choice, egui::Button::new("Add label"))
+                .clicked()
+            {
+                let label = self.label_input.clone();
+                self.apply(LabelAction::Add, vec![label]);
+            }
+        });
         // At the end of the row, so the buttons before it stay where they are while a change
         // is in flight.
         if self.pending_changes > 0 {
@@ -4328,6 +4317,40 @@ fn draw_thread_row(ui: &mut egui::Ui, view: &RowView, checked: bool) -> RowActio
     });
     action.rect = row.response.rect;
     action
+}
+
+/// Paints the background of a row, in the slot reserved for it before the row was drawn. A
+/// selected row has the selection fill and an accent bar; a hovered one has a faint fill.
+fn paint_row_highlight(
+    ui: &mut egui::Ui,
+    slot: egui::layers::ShapeIdx,
+    rect: egui::Rect,
+    selected: bool,
+) {
+    let fill = if selected {
+        ui.visuals().selection.bg_fill
+    } else if ui.rect_contains_pointer(rect) {
+        ui.visuals().widgets.hovered.weak_bg_fill
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    ui.painter()
+        .set(slot, egui::Shape::rect_filled(rect, 4.0, fill));
+    if selected {
+        let bar = egui::Rect::from_min_max(rect.min, egui::pos2(rect.min.x + 3.0, rect.max.y));
+        ui.painter()
+            .rect_filled(bar, 2.0, ui.visuals().hyperlink_color);
+    }
+}
+
+/// Groups related toolbar buttons on a faint background, so the groups read apart.
+fn toolbar_group<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    egui::Frame::new()
+        .fill(ui.visuals().faint_bg_color)
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::symmetric(4, 2))
+        .show(ui, add)
+        .inner
 }
 
 /// A small heading that starts a group in the sidebar: capitals, with a little room above it.
