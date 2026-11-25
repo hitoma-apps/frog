@@ -2228,6 +2228,28 @@ impl Store {
     }
 
     /// The message ID for a UID in the current UIDVALIDITY, if cached.
+    /// A cached message's labels and read state, by UID.
+    pub fn labels_and_seen(&self, uid: u32) -> Result<Option<(BTreeSet<String>, bool)>> {
+        let row: Option<(i64, bool)> = self
+            .conn
+            .query_row(
+                "SELECT msgid, seen FROM messages WHERE uid = ?1",
+                params![uid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((msgid, seen)) = row else {
+            return Ok(None);
+        };
+        let mut stmt = self
+            .conn
+            .prepare("SELECT label FROM message_labels WHERE msgid = ?1")?;
+        let labels = stmt
+            .query_map(params![msgid], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+        Ok(Some((labels, seen)))
+    }
+
     pub fn msgid_for_uid(&self, uid: u32) -> Result<Option<u64>> {
         let msgid: Option<i64> = self
             .conn

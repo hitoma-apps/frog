@@ -1397,13 +1397,42 @@ impl Worker {
         action: LabelAction,
         labels: &[String],
     ) -> Result<(), SourceError> {
-        let (command, updates) = src.modify_labels(uids, action, labels)?;
-        for u in &updates {
-            // Diagnostic: what the server reports for each message after the change.
-            frog::log::log(
-                "WORKER",
-                format!("after change: uid {} has labels {:?}", u.uid, u.labels),
-            );
+        let (command, mut updates) = src.modify_labels(uids, action, labels)?;
+        // The server's answer should list every message changed. Where it doesn't, the change is
+        // made to the cache as asked, so the list shows it now. The next sync corrects anything.
+        let reported: std::collections::HashSet<u32> = updates.iter().map(|u| u.uid).collect();
+        for &uid in uids.iter().filter(|u| !reported.contains(u)) {
+            let Some(store) = self.store.as_ref() else {
+                break;
+            };
+            match store.labels_and_seen(uid) {
+                Ok(Some((mut current, seen))) => {
+                    match action {
+                        LabelAction::Add => current.extend(labels.iter().cloned()),
+                        LabelAction::Remove => {
+                            for label in labels {
+                                current.remove(label);
+                            }
+                        }
+                        LabelAction::Replace => current = labels.iter().cloned().collect(),
+                    }
+                    frog::log::log(
+                        "WORKER",
+                        format!(
+                            "the server didn't report uid {uid}; applying the change to the cache"
+                        ),
+                    );
+                    updates.push(MessageUpdate {
+                        uid,
+                        labels: current,
+                        seen,
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => self
+                    .emit
+                    .send(Event::Error(format!("cache read failed: {e}"))),
+            }
         }
         self.cache_updates(&updates);
         frog::log::log("CACHE", format!("applied {} label updates", updates.len()));
