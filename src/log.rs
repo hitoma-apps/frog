@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-/// How many lines the Log window keeps in memory.
-const KEEP: usize = 5000;
+/// How many lines the Log window keeps in memory. The log file has every line.
+const KEEP: usize = 2000;
 /// The log file rolls over to `<name>.1` once it's this big.
 const ROLL_BYTES: u64 = 2 * 1024 * 1024;
 
@@ -82,6 +82,13 @@ pub fn snapshot() -> Vec<String> {
     log.lines.iter().cloned().collect()
 }
 
+/// Runs `f` with the lines in memory, oldest first, without copying them. The logger waits
+/// while `f` runs, so keep it short.
+pub fn with_lines<R>(f: impl FnOnce(&VecDeque<String>) -> R) -> R {
+    let log = state().lock().unwrap_or_else(|e| e.into_inner());
+    f(&log.lines)
+}
+
 /// Runs `f`, and records how long it took.
 pub fn timed<T>(subsystem: &str, what: &str, f: impl FnOnce() -> T) -> T {
     let started = Instant::now();
@@ -93,6 +100,13 @@ pub fn timed<T>(subsystem: &str, what: &str, f: impl FnOnce() -> T) -> T {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_lines_can_be_read_in_place() {
+        log("TEST", "in place");
+        let found = with_lines(|lines| lines.iter().any(|l| l.contains("in place")));
+        assert!(found);
+    }
 
     #[test]
     fn lines_carry_a_timestamp_and_subsystem() {

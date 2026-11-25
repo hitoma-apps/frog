@@ -4119,15 +4119,19 @@ impl App {
             .resizable(true)
             .open(&mut open)
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("log")
-                    .auto_shrink([false, false])
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        for line in frog::log::snapshot() {
-                            ui.monospace(line);
-                        }
-                    });
+                // Only the lines on screen are drawn, and they're read in place, not copied.
+                let row = ui.text_style_height(&egui::TextStyle::Monospace);
+                frog::log::with_lines(|lines| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("log")
+                        .auto_shrink([false, false])
+                        .stick_to_bottom(true)
+                        .show_rows(ui, row, lines.len(), |ui, range| {
+                            for line in lines.range(range) {
+                                ui.monospace(line.as_str());
+                            }
+                        });
+                });
             });
         if !open {
             self.log_open = false;
