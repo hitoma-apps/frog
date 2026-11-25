@@ -1398,7 +1398,15 @@ impl Worker {
         labels: &[String],
     ) -> Result<(), SourceError> {
         let (command, updates) = src.modify_labels(uids, action, labels)?;
+        for u in &updates {
+            // Diagnostic: what the server reports for each message after the change.
+            frog::log::log(
+                "WORKER",
+                format!("after change: uid {} has labels {:?}", u.uid, u.labels),
+            );
+        }
         self.cache_updates(&updates);
+        frog::log::log("CACHE", format!("applied {} label updates", updates.len()));
         self.emit_label_counts();
         self.emit.send(Event::Labels { updates, command });
         Ok(())
