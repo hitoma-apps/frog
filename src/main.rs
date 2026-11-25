@@ -338,7 +338,8 @@ fn row_chips(m: &Message, filter: Option<&str>) -> Vec<String> {
         .filter(|l| l.as_str() != starred)
         .filter(|l| !(mailbox_view && l.as_str() == inbox))
         .collect();
-    labels.sort_by_key(|l| (!l.starts_with('\\'), l.to_lowercase()));
+    // Sorted with each key made once, rather than lower-cased again at every comparison.
+    labels.sort_by_cached_key(|l| (!l.starts_with('\\'), l.to_lowercase()));
     labels.into_iter().cloned().collect()
 }
 
@@ -4230,7 +4231,10 @@ fn draw_thread_row(ui: &mut egui::Ui, view: &RowView, checked: bool) -> RowActio
         // (raw label to filter by, shown text, tooltip). The "+N" chip has no label.
         let mut tags: Vec<(Option<String>, String, String)> = shown
             .iter()
-            .map(|raw| (Some(raw.clone()), display_label(raw), display_label(raw)))
+            .map(|raw| {
+                let text = display_label(raw);
+                (Some(raw.clone()), text.clone(), text)
+            })
             .collect();
         if !hidden.is_empty() {
             let names: Vec<String> = hidden.iter().map(|r| display_label(r)).collect();
