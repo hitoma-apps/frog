@@ -742,6 +742,11 @@ struct App {
 
     /// Rows of the thread list, from `window_start` on, read from the cache.
     window_rows: Vec<ThreadEntry>,
+    /// Label changes sent to the server and not yet confirmed, the threads they touch, and
+    /// what the toolbar says while they're pending.
+    pending_changes: usize,
+    pending_threads: HashSet<u64>,
+    pending_note: String,
     window_start: usize,
     /// Threads in the list the window belongs to.
     window_total: usize,
@@ -912,6 +917,9 @@ impl App {
             totals: (0, 0),
             known_labels: Arc::default(),
             window_rows: Vec::new(),
+            pending_changes: 0,
+            pending_threads: HashSet::new(),
+            pending_note: String::new(),
             window_start: 0,
             window_total: 0,
             window_filter: None,
@@ -1102,6 +1110,13 @@ impl App {
                 }
             }
             Event::Labels { updates, command } => {
+                // Only the answer to a change we sent counts. Sync also reports label updates.
+                if command.starts_with("UID STORE") {
+                    self.pending_changes = self.pending_changes.saturating_sub(1);
+                    if self.pending_changes == 0 {
+                        self.pending_threads.clear();
+                    }
+                }
                 for u in updates {
                     if let Some(m) = self.thread_msgs.get_mut(&u.uid) {
                         m.labels = u.labels;
@@ -1237,10 +1252,14 @@ impl App {
             } => {
                 // An answer for a list that has since changed is out of date, so it's dropped.
                 if filter == self.thread_filter() && order == self.sort {
+                    let threads: Vec<ThreadEntry> = threads
+                        .into_iter()
+                        .filter(|t| !self.pending_threads.contains(&t.thrid))
+                        .collect();
                     self.window_filter = Some(filter);
                     self.window_start = start;
                     self.window_rows = threads;
-                    self.window_total = total;
+                    self.window_total = total.saturating_sub(self.pending_threads.len());
                 }
             }
             Event::Thread { thrid, messages } => {
@@ -1271,6 +1290,9 @@ impl App {
             Event::Error(e) => {
                 self.checking = false;
                 self.loading = None;
+                self.pending_changes = 0;
+                self.pending_threads.clear();
+                self.view_stale = true;
                 self.status = Some(e);
             }
             Event::Crashed(why) => {
@@ -1973,6 +1995,24 @@ impl App {
             return;
         }
         self.status = None;
+        // Rows that leave this list are removed now, rather than when the server confirms.
+        let leaves_list = action == LabelAction::Remove
+            && matches!(&self.thread_filter(), ThreadFilter::Label(l) if labels.contains(l));
+        if leaves_list {
+            let before = self.window_rows.len();
+            self.window_rows.retain(|r| !thrids.contains(&r.thrid));
+            let removed = before - self.window_rows.len();
+            self.window_total = self.window_total.saturating_sub(removed);
+        }
+        self.pending_changes += 1;
+        self.pending_threads.extend(thrids.iter().copied());
+        self.pending_note = if labels.iter().any(|l| l == SystemLabel::Trash.as_wire()) {
+            "Moving to Trash…".into()
+        } else if action == LabelAction::Remove {
+            "Archiving…".into()
+        } else {
+            "Updating…".into()
+        };
         self.send(Command::Modify {
             thrids,
             action,
@@ -3066,6 +3106,10 @@ impl App {
 
     /// The actions on checked threads, shown only when some are checked.
     fn action_buttons(&mut self, ui: &mut egui::Ui) {
+        if self.pending_changes > 0 {
+            ui.spinner();
+            ui.weak(self.pending_note.clone());
+        }
         if ui
             .button("Archive")
             .on_hover_text("Remove \\Inbox")
