@@ -840,6 +840,7 @@ impl App {
         };
         ctx.set_theme(theme_preference(settings.theme));
         apply_accent(&ctx);
+        apply_type(&ctx);
         let mut login = LoginForm {
             remember: settings.remember_password,
             ..Default::default()
@@ -4356,10 +4357,17 @@ fn toolbar_group<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> 
 /// A small heading that starts a group in the sidebar: capitals, with a little room above it.
 fn section_heading(ui: &mut egui::Ui, text: &str) {
     ui.add_space(6.0);
-    // Slightly larger than body text, so the headings stand apart from the rows under them.
-    let size = ui.style().text_styles[&egui::TextStyle::Body].size * 1.15;
-    ui.label(egui::RichText::new(text.to_uppercase()).size(size).strong());
+    ui.label(
+        egui::RichText::new(text.to_uppercase())
+            .text_style(section_style())
+            .strong(),
+    );
     ui.add_space(2.0);
+}
+
+/// The style for sidebar section headings. Larger than body text, so they stand apart from rows.
+fn section_style() -> egui::TextStyle {
+    egui::TextStyle::Name("Section".into())
 }
 
 /// A small "(!)" that shows `text` on hover, for details that are rarely needed, such as IDs.
@@ -4394,6 +4402,22 @@ fn accent(theme: egui::Theme) -> Accent {
             hyperlink: egui::Color32::from_rgb(0x1E, 0x7A, 0x43),
             text: None,
         },
+    }
+}
+
+/// FROG's type scale, set once for both themes. Body text, buttons and headings keep egui's
+/// sizes, so rows and fixed-width columns don't move. Small text is larger than egui's default,
+/// since chips and dates were hard to read at that size.
+fn apply_type(ctx: &egui::Context) {
+    for theme in [egui::Theme::Dark, egui::Theme::Light] {
+        ctx.style_mut_of(theme, |style| {
+            style
+                .text_styles
+                .insert(egui::TextStyle::Small, egui::FontId::proportional(11.0));
+            style
+                .text_styles
+                .insert(section_style(), egui::FontId::proportional(15.0));
+        });
     }
 }
 
