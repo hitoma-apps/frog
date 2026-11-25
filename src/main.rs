@@ -1111,7 +1111,8 @@ impl App {
             }
             Event::Labels { updates, command } => {
                 // Only the answer to a change we sent counts. Sync also reports label updates.
-                if command.starts_with("UID STORE") {
+                // An empty command is a change the worker didn't send, for nothing cached.
+                if command.starts_with("UID STORE") || command.is_empty() {
                     self.pending_changes = self.pending_changes.saturating_sub(1);
                     if self.pending_changes == 0 {
                         self.pending_threads.clear();
@@ -1123,7 +1124,9 @@ impl App {
                         m.seen = u.seen;
                     }
                 }
-                frog::log::log("IMAP", &command);
+                if !command.is_empty() {
+                    frog::log::log("IMAP", &command);
+                }
                 self.view_stale = true;
             }
             Event::CacheVerified {
@@ -1942,6 +1945,14 @@ impl App {
     }
 
     /// The conversations an action applies to: the checked ones, or else the open one.
+    /// The labels the user can add: every label on the account except the system ones.
+    fn user_label_names(&self) -> Vec<String> {
+        self.label_cache
+            .as_ref()
+            .map(|c| c.counts.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     fn target_thrids(&self) -> Vec<u64> {
         if !self.checked.is_empty() {
             self.checked.iter().copied().collect()
@@ -1988,12 +1999,18 @@ impl App {
         });
     }
 
+    /// Applies a label change to the checked threads, or the open one if none are checked.
     fn apply(&mut self, action: LabelAction, labels: Vec<String>) {
         let thrids = self.target_thrids();
         if thrids.is_empty() {
             self.status = Some("Select a message or check some boxes first.".into());
             return;
         }
+        self.apply_to(thrids, action, labels);
+    }
+
+    /// Applies a label change to the given threads.
+    fn apply_to(&mut self, thrids: Vec<u64>, action: LabelAction, labels: Vec<String>) {
         self.status = None;
         // Rows that leave this list are removed now, rather than when the server confirms.
         let leaves_list = action == LabelAction::Remove
@@ -3148,24 +3165,32 @@ impl App {
             self.apply_read_state(false);
         }
         ui.separator();
-        ui.add(
-            egui::TextEdit::singleline(&mut self.label_input)
-                .hint_text("label name")
-                .desired_width(160.0),
-        );
-        let name = self.label_input.trim().to_string();
-        let has_name = !name.is_empty();
+        // Existing labels, to choose from. A label is taken off a conversation with the × on its
+        // chip in the conversation view.
+        let names = self.user_label_names();
+        let mut chosen = self.label_input.clone();
+        ui.add_enabled_ui(!names.is_empty(), |ui| {
+            egui::ComboBox::from_id_salt("add_label")
+                .selected_text(if chosen.is_empty() {
+                    "Choose a label"
+                } else {
+                    chosen.as_str()
+                })
+                .width(160.0)
+                .show_ui(ui, |ui| {
+                    for name in &names {
+                        ui.selectable_value(&mut chosen, name.clone(), name);
+                    }
+                });
+        });
+        self.label_input = chosen;
+        let has_choice = names.contains(&self.label_input);
         if ui
-            .add_enabled(has_name, egui::Button::new("Add label"))
+            .add_enabled(has_choice, egui::Button::new("Add label"))
             .clicked()
         {
-            self.apply(LabelAction::Add, vec![name.clone()]);
-        }
-        if ui
-            .add_enabled(has_name, egui::Button::new("Remove label"))
-            .clicked()
-        {
-            self.apply(LabelAction::Remove, vec![name]);
+            let label = self.label_input.clone();
+            self.apply(LabelAction::Add, vec![label]);
         }
         // At the end of the row, so the buttons before it stay where they are while a change
         // is in flight.
@@ -3534,22 +3559,24 @@ impl App {
             {
                 ui.ctx().open_url(egui::OpenUrl::new_tab(url));
             }
-            let eml = ui
-                .add_enabled(exportable, egui::Button::new("Save .eml"))
-                .on_disabled_hover_text("Waiting for the message bodies to load.");
-            if eml.clicked() {
-                export = Some(true);
+            let save = ui.add_enabled_ui(exportable, |ui| {
+                ui.menu_button("Save", |ui| {
+                    if ui.button(".EML").clicked() {
+                        export = Some(true);
+                        ui.close();
+                    }
+                    if ui.button("Plaintext").clicked() {
+                        export = Some(false);
+                        ui.close();
+                    }
+                })
+            });
+            if !exportable {
+                save.response
+                    .on_disabled_hover_text("Waiting for the message bodies to load.");
             }
-            let text = ui
-                .add_enabled(exportable, egui::Button::new("Save text"))
-                .on_disabled_hover_text("Waiting for the message bodies to load.");
-            if text.clicked() {
-                export = Some(false);
-            }
-            ui.weak(format!(
-                "thread {thrid} (0x{thrid:x}) · {} messages in this conversation",
-                thread.len()
-            ));
+            ui.weak(format!("{} messages in this conversation", thread.len()));
+            info_tip(ui, format!("Thread {thrid} (0x{thrid:x})"));
         });
         if let Some(eml) = export {
             self.export_thread(&thread, eml);
@@ -3559,6 +3586,7 @@ impl App {
         let font = egui::TextStyle::Small.resolve(ui.style());
         let chip_h = ui.text_style_height(&egui::TextStyle::Small) + 6.0;
         let mut clicked_label: Option<String> = None;
+        let mut removed_label: Option<String> = None;
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
             for (raw, name) in &chip_names {
@@ -3569,10 +3597,21 @@ impl App {
                 if resp.on_hover_text(name).clicked() {
                     clicked_label = Some(raw.clone());
                 }
+                // The × takes the label off this conversation.
+                if ui
+                    .small_button("×")
+                    .on_hover_text(format!("Remove {name} from this conversation"))
+                    .clicked()
+                {
+                    removed_label = Some(raw.clone());
+                }
             }
         });
         if let Some(label) = clicked_label {
             self.set_label_filter(Some(label));
+        }
+        if let Some(label) = removed_label {
+            self.apply_to(vec![thrid], LabelAction::Remove, vec![label]);
         }
         ui.separator();
         if thread.is_empty() {
@@ -3649,10 +3688,10 @@ impl App {
                                         .default_open(expanded)
                                         .show(ui, |ui| {
                                             ui.horizontal(|ui| {
-                                                ui.monospace(format!(
-                                                    "msgid {} (0x{:x})",
-                                                    m.msgid, m.msgid
-                                                ));
+                                                info_tip(
+                                                    ui,
+                                                    format!("Message {} (0x{:x})", m.msgid, m.msgid),
+                                                );
                                                 if ui.small_button("View original").clicked() {
                                                     open_original = Some(uid);
                                                 }
@@ -4266,6 +4305,11 @@ fn draw_thread_row(ui: &mut egui::Ui, view: &RowView, checked: bool) -> RowActio
     action
 }
 
+/// A small "(!)" that shows `text` on hover, for details that are rarely needed, such as IDs.
+fn info_tip(ui: &mut egui::Ui, text: impl Into<String>) {
+    ui.weak("(!)").on_hover_text(text.into());
+}
+
 /// The egui theme for a theme choice.
 /// FROG's accent colours for one theme. The fill is the background of a selected row or
 /// item. egui draws the text of a selected item in `selection_text`, so that's a readable
@@ -4275,6 +4319,8 @@ struct Accent {
     selection_fill: egui::Color32,
     selection_text: egui::Color32,
     hyperlink: egui::Color32,
+    /// The text colour for every label, weak text included. `None` keeps egui's own colour.
+    text: Option<egui::Color32>,
 }
 
 fn accent(theme: egui::Theme) -> Accent {
@@ -4283,11 +4329,13 @@ fn accent(theme: egui::Theme) -> Accent {
             selection_fill: egui::Color32::from_rgb(0x1F, 0x5C, 0x3A),
             selection_text: egui::Color32::from_rgb(0xF0, 0xF7, 0xF2),
             hyperlink: egui::Color32::from_rgb(0x5B, 0xD2, 0x8A),
+            text: Some(egui::Color32::from_rgb(0xFA, 0xFA, 0xFA)),
         },
         egui::Theme::Light => Accent {
             selection_fill: egui::Color32::from_rgb(0xCD, 0xEB, 0xD8),
             selection_text: egui::Color32::from_rgb(0x0F, 0x24, 0x18),
             hyperlink: egui::Color32::from_rgb(0x1E, 0x7A, 0x43),
+            text: None,
         },
     }
 }
@@ -4300,6 +4348,20 @@ fn apply_accent(ctx: &egui::Context) {
             style.visuals.selection.bg_fill = colours.selection_fill;
             style.visuals.selection.stroke = egui::Stroke::new(1.0, colours.selection_text);
             style.visuals.hyperlink_color = colours.hyperlink;
+            if let Some(text) = colours.text {
+                // Weak text is drawn from the text colour at reduced alpha, so set it directly.
+                style.visuals.weak_text_color = Some(text);
+                let widgets = &mut style.visuals.widgets;
+                for w in [
+                    &mut widgets.noninteractive,
+                    &mut widgets.inactive,
+                    &mut widgets.hovered,
+                    &mut widgets.active,
+                    &mut widgets.open,
+                ] {
+                    w.fg_stroke.color = text;
+                }
+            }
         });
     }
 }
@@ -4526,6 +4588,11 @@ mod tests {
             assert!(contrast(colours.hyperlink, visuals.panel_fill) >= 4.5);
             // The text of a selected row is drawn on the selection fill.
             assert!(contrast(colours.selection_text, colours.selection_fill) >= 4.5);
+            // All text in the dark theme is bright, so it reads clearly on the panels.
+            if let Some(text) = colours.text {
+                assert!(contrast(text, visuals.panel_fill) >= 7.0);
+                assert!(contrast(text, visuals.window_fill) >= 7.0);
+            }
         }
     }
 
