@@ -4690,6 +4690,54 @@ mod tests {
         )
     }
 
+    /// Times drawing a long list of thread rows, to compare before and after a performance
+    /// change. Run with: cargo test --release bench_thread_rows -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_thread_rows() {
+        let msgs: Vec<Message> = (0..400)
+            .map(|i| {
+                let mut m =
+                    message_with(&["\\Inbox", "Work", "Home/Bills", "2011/Moving", "Travel"]);
+                m.subject = format!("Subject number {i} with some words in it");
+                m.from = format!("Sender {i}");
+                m
+            })
+            .collect();
+        let ctx = egui::Context::default();
+        let frame = || {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    for m in &msgs {
+                        let view = RowView {
+                            head: m,
+                            thrid: m.thrid,
+                            count: 3,
+                            unread: true,
+                            attachments: true,
+                            filter_label: None,
+                            row_height: 20.0,
+                        };
+                        draw_thread_row(ui, &view, false);
+                    }
+                });
+            });
+        };
+        for _ in 0..5 {
+            frame();
+        }
+        const FRAMES: u32 = 50;
+        let start = Instant::now();
+        for _ in 0..FRAMES {
+            frame();
+        }
+        println!(
+            "{} rows: {:.2} ms per frame",
+            msgs.len(),
+            start.elapsed().as_secs_f64() * 1000.0 / f64::from(FRAMES)
+        );
+    }
+
     #[test]
     fn a_sender_always_gets_the_same_colour() {
         assert_eq!(sender_slot("Alice Smith"), sender_slot("  alice smith "));
