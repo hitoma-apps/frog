@@ -2004,15 +2004,20 @@ impl App {
             let removed = before - self.window_rows.len();
             self.window_total = self.window_total.saturating_sub(removed);
         }
+        // A Trash click sends two requests (add \Trash, then remove \Inbox). The note names the
+        // Trash request, and the second one doesn't replace it.
+        let is_trash = labels.iter().any(|l| l == SystemLabel::Trash.as_wire());
+        if is_trash || self.pending_changes == 0 {
+            self.pending_note = if is_trash {
+                "Moving to Trash…".into()
+            } else if action == LabelAction::Remove {
+                "Archiving…".into()
+            } else {
+                "Updating…".into()
+            };
+        }
         self.pending_changes += 1;
         self.pending_threads.extend(thrids.iter().copied());
-        self.pending_note = if labels.iter().any(|l| l == SystemLabel::Trash.as_wire()) {
-            "Moving to Trash…".into()
-        } else if action == LabelAction::Remove {
-            "Archiving…".into()
-        } else {
-            "Updating…".into()
-        };
         self.send(Command::Modify {
             thrids,
             action,
@@ -3106,10 +3111,6 @@ impl App {
 
     /// The actions on checked threads, shown only when some are checked.
     fn action_buttons(&mut self, ui: &mut egui::Ui) {
-        if self.pending_changes > 0 {
-            ui.spinner();
-            ui.weak(self.pending_note.clone());
-        }
         if ui
             .button("Archive")
             .on_hover_text("Remove \\Inbox")
@@ -3165,6 +3166,13 @@ impl App {
             .clicked()
         {
             self.apply(LabelAction::Remove, vec![name]);
+        }
+        // At the end of the row, so the buttons before it stay where they are while a change
+        // is in flight.
+        if self.pending_changes > 0 {
+            ui.separator();
+            ui.spinner();
+            ui.weak(self.pending_note.clone());
         }
     }
 
