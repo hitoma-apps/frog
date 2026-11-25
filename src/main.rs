@@ -2901,7 +2901,7 @@ impl App {
             .id_salt("sidebar")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.heading("Search");
+                section_heading(ui, "Search");
                 let search = ui.add(
                     egui::TextEdit::singleline(&mut self.search)
                         .hint_text("Search mail")
@@ -3167,23 +3167,47 @@ impl App {
         ui.separator();
         // Existing labels, to choose from. A label is taken off a conversation with the × on its
         // chip in the conversation view.
+        // Type to filter the list. Enter takes the first match, and a click takes any one.
         let names = self.user_label_names();
-        let mut chosen = self.label_input.clone();
-        ui.add_enabled_ui(!names.is_empty(), |ui| {
-            egui::ComboBox::from_id_salt("add_label")
-                .selected_text(if chosen.is_empty() {
-                    "Choose a label"
-                } else {
-                    chosen.as_str()
-                })
-                .width(160.0)
-                .show_ui(ui, |ui| {
-                    for name in &names {
-                        ui.selectable_value(&mut chosen, name.clone(), name);
+        let query = self.label_input.trim().to_lowercase();
+        let matches: Vec<String> = names
+            .iter()
+            .filter(|n| query.is_empty() || n.to_lowercase().contains(&query))
+            .take(12)
+            .cloned()
+            .collect();
+        let edit = ui.add_enabled(
+            !names.is_empty(),
+            egui::TextEdit::singleline(&mut self.label_input)
+                .id_salt("add_label")
+                .hint_text("Type a label")
+                .desired_width(160.0),
+        );
+        let enter = edit.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if enter
+            && !names.contains(&self.label_input)
+            && let Some(first) = matches.first()
+        {
+            self.label_input = first.clone();
+        }
+        let mut picked: Option<String> = None;
+        let open = edit.has_focus() && !matches.is_empty();
+        egui::Popup::from_response(&edit)
+            .open(open)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                for name in &matches {
+                    if ui
+                        .selectable_label(self.label_input == *name, name)
+                        .clicked()
+                    {
+                        picked = Some(name.clone());
                     }
-                });
-        });
-        self.label_input = chosen;
+                }
+            });
+        if let Some(name) = picked {
+            self.label_input = name;
+        }
         let has_choice = names.contains(&self.label_input);
         if ui
             .add_enabled(has_choice, egui::Button::new("Add label"))
@@ -4309,7 +4333,9 @@ fn draw_thread_row(ui: &mut egui::Ui, view: &RowView, checked: bool) -> RowActio
 /// A small heading that starts a group in the sidebar: capitals, with a little room above it.
 fn section_heading(ui: &mut egui::Ui, text: &str) {
     ui.add_space(6.0);
-    ui.label(egui::RichText::new(text.to_uppercase()).small().strong());
+    // Slightly larger than body text, so the headings stand apart from the rows under them.
+    let size = ui.style().text_styles[&egui::TextStyle::Body].size * 1.15;
+    ui.label(egui::RichText::new(text.to_uppercase()).size(size).strong());
     ui.add_space(2.0);
 }
 
