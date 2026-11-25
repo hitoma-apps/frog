@@ -3076,8 +3076,18 @@ impl App {
                 vec![SystemLabel::Inbox.as_wire().into()],
             );
         }
-        if ui.button("Trash").on_hover_text("Add \\Trash").clicked() {
+        // Trash adds \Trash and removes \Inbox, as Gmail's web app does. Adding \Trash alone
+        // leaves the message in the Inbox.
+        if ui
+            .button("Trash")
+            .on_hover_text("Move to Trash: add \\Trash and remove \\Inbox")
+            .clicked()
+        {
             self.apply(LabelAction::Add, vec![SystemLabel::Trash.as_wire().into()]);
+            self.apply(
+                LabelAction::Remove,
+                vec![SystemLabel::Inbox.as_wire().into()],
+            );
         }
         if ui.button("Star").on_hover_text("Add \\Starred").clicked() {
             self.apply(

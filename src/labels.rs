@@ -129,7 +129,9 @@ pub fn uid_store_labels(
             out.push(' ');
         }
         match label {
-            LabelRef::System(sys) => push_quoted(&mut out, sys.as_wire()),
+            // System labels are IMAP flags, written bare (\Inbox). Quoting makes the server read
+            // them as ordinary label names, so the change is accepted but nothing moves.
+            LabelRef::System(sys) => out.push_str(sys.as_wire()),
             LabelRef::Name(name) => push_quoted(&mut out, &crate::utf7::encode(name)),
         }
     }

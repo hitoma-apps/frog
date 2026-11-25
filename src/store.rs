@@ -3244,6 +3244,54 @@ mod tests {
     }
 
     #[test]
+    fn a_reader_cursor_sees_a_label_removed_by_the_writer() {
+        let dir = std::env::temp_dir().join(format!("cursor-labels-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("labels.sqlite");
+        let _ = std::fs::remove_file(&path);
+        let mut writer = Store::open(&path).unwrap();
+        let messages: Vec<CachedMessage> = (1..=30u64)
+            .map(|i| msg(i, i as u32, &["\\Inbox"]))
+            .collect();
+        writer.upsert_messages(&messages).unwrap();
+        let reader = Store::open_reader(&path).unwrap();
+        let inbox = ThreadFilter::Label("\\Inbox".into());
+        let order = ListOrder::default();
+        let mut cursor = PageCursor::new(SAMPLE_STRIDE);
+        // The list as the user sees it before the archive.
+        let before = cursor.page(&reader, &inbox, order, 0, 10).unwrap();
+        assert_eq!(before.len(), 10);
+        // The writer removes \Inbox from the first thread (uid 30 is the newest).
+        let none: BTreeSet<String> = BTreeSet::new();
+        writer.apply_updates(&[(30, &none, false)]).unwrap();
+        let after = cursor.page(&reader, &inbox, order, 0, 10).unwrap();
+        let want = reader.thread_page_sorted(&inbox, order, 0, 10).unwrap();
+        assert_eq!(
+            after.iter().map(|t| t.thrid).collect::<Vec<_>>(),
+            want.iter().map(|t| t.thrid).collect::<Vec<_>>()
+        );
+        assert!(
+            !after.iter().any(|t| t.thrid == 130),
+            "the archived thread is still listed"
+        );
+    }
+
+    #[test]
+    fn removing_the_inbox_label_takes_a_thread_out_of_the_inbox_list() {
+        let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
+        s.upsert_messages(&[msg(1, 1, &["\\Inbox"]), msg(2, 2, &["\\Inbox"])])
+            .unwrap();
+        let inbox = ThreadFilter::Label("\\Inbox".into());
+        assert_eq!(s.thread_count(&inbox).unwrap(), 2);
+        // The server's answer after Archive: message 1 no longer has \Inbox.
+        let labels: BTreeSet<String> = BTreeSet::new();
+        s.apply_updates(&[(1, &labels, false)]).unwrap();
+        assert_eq!(s.thread_count(&inbox).unwrap(), 1);
+        let rows = s.thread_page(&inbox, 0, 10).unwrap();
+        assert_eq!(rows.iter().map(|t| t.thrid).collect::<Vec<_>>(), vec![102]);
+    }
+
+    #[test]
     fn code_mail_lists_only_messages_whose_subjects_read_like_codes() {
         let mut s = Store::open_in_memory(DEFAULT_BODY_CAP).unwrap();
         let subjects = [

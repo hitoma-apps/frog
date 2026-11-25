@@ -70,13 +70,13 @@ fn classifies_labels() {
 #[test]
 fn archive_removes_inbox_with_compact_uid_set() {
     let cmd = labels::archive(&[3, 1, 2, 7, 2]).unwrap();
-    assert_eq!(cmd, r#"UID STORE 1:3,7 -X-GM-LABELS ("\\Inbox")"#);
+    assert_eq!(cmd, r#"UID STORE 1:3,7 -X-GM-LABELS (\Inbox)"#);
 }
 
 #[test]
 fn trash_adds_trash_label() {
     let cmd = labels::trash(&[10]).unwrap();
-    assert_eq!(cmd, r#"UID STORE 10 +X-GM-LABELS ("\\Trash")"#);
+    assert_eq!(cmd, r#"UID STORE 10 +X-GM-LABELS (\Trash)"#);
 }
 
 #[test]

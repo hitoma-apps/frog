@@ -505,7 +505,7 @@ mod tests {
         let (cmd, updates) = s
             .modify_labels(&[1], LabelAction::Remove, &["\\Inbox".to_string()])
             .unwrap();
-        assert_eq!(cmd, r#"UID STORE 1 -X-GM-LABELS ("\\Inbox")"#);
+        assert_eq!(cmd, r#"UID STORE 1 -X-GM-LABELS (\Inbox)"#);
         assert!(seen.lock().unwrap().iter().any(|c| c == &cmd));
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].uid, 1);

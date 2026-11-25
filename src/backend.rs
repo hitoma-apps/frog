@@ -713,7 +713,7 @@ mod tests {
         let (cmd, _) = src
             .modify_labels(&[3], LabelAction::Remove, &["\\Inbox".to_string()])
             .unwrap();
-        assert_eq!(cmd, r#"UID STORE 3 -X-GM-LABELS ("\\Inbox")"#);
+        assert_eq!(cmd, r#"UID STORE 3 -X-GM-LABELS (\Inbox)"#);
         assert!(!labels_of(&mut src, 3).contains("\\Inbox"));
         assert!(labels_of(&mut src, 3).contains("\\Starred"));
     }
