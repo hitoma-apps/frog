@@ -2982,7 +2982,7 @@ impl App {
 
                 let favorites = self.settings.favorite_labels.clone();
                 if !favorites.is_empty() {
-                    ui.heading("Favorites");
+                    section_heading(ui, "Favorites");
                     for key in &favorites {
                         let count = counts.get(key).copied().unwrap_or((0, 0));
                         self.label_row(ui, Some(key), &display_label(key), count);
@@ -2990,7 +2990,7 @@ impl App {
                     ui.separator();
                 }
 
-                ui.heading("Mailboxes");
+                section_heading(ui, "Mailboxes");
                 for (name, key) in MAILBOXES {
                     let count = match key {
                         None => self.totals,
@@ -2999,7 +2999,7 @@ impl App {
                     self.label_row(ui, key, name, count);
                 }
                 ui.separator();
-                ui.heading("Tools");
+                section_heading(ui, "Tools");
                 // A tool is a view, like a mailbox: it's highlighted while it's the one shown.
                 let helper_open = self.storage_open && self.search.trim().is_empty();
                 if ui.selectable_label(helper_open, "Storage Helper").clicked() {
@@ -3046,7 +3046,7 @@ impl App {
                 if let Some(cache) = self.label_cache.take() {
                     if !cache.counts.is_empty() {
                         ui.separator();
-                        ui.heading("Labels");
+                        section_heading(ui, "Labels");
                         self.label_tree(ui, &cache.tree, &cache.counts, "");
                     }
                     self.label_cache = Some(cache);
@@ -3550,68 +3550,71 @@ impl App {
                 .all(|uid| self.thread_msgs.get(uid).is_some_and(|m| m.body.is_some()));
         // Some(true) saves .eml files, Some(false) the text.
         let mut export: Option<bool> = None;
-        ui.horizontal(|ui| {
-            let button = ui.add_enabled(open_url.is_some(), egui::Button::new("Open in Gmail"));
-            if button
-                .on_disabled_hover_text("This message has no thread ID.")
-                .clicked()
-                && let Some(url) = open_url
-            {
-                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
-            }
-            let save = ui.add_enabled_ui(exportable, |ui| {
-                ui.menu_button("Save", |ui| {
-                    if ui.button(".EML").clicked() {
-                        export = Some(true);
-                        ui.close();
-                    }
-                    if ui.button("Plaintext").clicked() {
-                        export = Some(false);
-                        ui.close();
-                    }
-                })
+        // The actions and labels sit in one card, so the header reads as a unit.
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let button = ui.add_enabled(open_url.is_some(), egui::Button::new("Open in Gmail"));
+                if button
+                    .on_disabled_hover_text("This message has no thread ID.")
+                    .clicked()
+                    && let Some(url) = open_url
+                {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                }
+                let save = ui.add_enabled_ui(exportable, |ui| {
+                    ui.menu_button("Save", |ui| {
+                        if ui.button(".EML").clicked() {
+                            export = Some(true);
+                            ui.close();
+                        }
+                        if ui.button("Plaintext").clicked() {
+                            export = Some(false);
+                            ui.close();
+                        }
+                    })
+                });
+                if !exportable {
+                    save.response
+                        .on_disabled_hover_text("Waiting for the message bodies to load.");
+                }
+                ui.weak(format!("{} messages in this conversation", thread.len()));
+                info_tip(ui, format!("Thread {thrid} (0x{thrid:x})"));
             });
-            if !exportable {
-                save.response
-                    .on_disabled_hover_text("Waiting for the message bodies to load.");
+
+            // The conversation's labels, as chips. A chip that's cut short has the full name on hover.
+            let font = egui::TextStyle::Small.resolve(ui.style());
+            let chip_h = ui.text_style_height(&egui::TextStyle::Small) + 6.0;
+            let mut clicked_label: Option<String> = None;
+            let mut removed_label: Option<String> = None;
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                for (raw, name) in &chip_names {
+                    let w = chip_width(ui, name, &font);
+                    let (rect, resp) =
+                        ui.allocate_exact_size(egui::vec2(w, chip_h), egui::Sense::click());
+                    paint_chip(ui, rect, name, &font);
+                    if resp.on_hover_text(name).clicked() {
+                        clicked_label = Some(raw.clone());
+                    }
+                    // The × takes the label off this conversation.
+                    if ui
+                        .small_button("×")
+                        .on_hover_text(format!("Remove {name} from this conversation"))
+                        .clicked()
+                    {
+                        removed_label = Some(raw.clone());
+                    }
+                }
+            });
+            if let Some(label) = clicked_label {
+                self.set_label_filter(Some(label));
             }
-            ui.weak(format!("{} messages in this conversation", thread.len()));
-            info_tip(ui, format!("Thread {thrid} (0x{thrid:x})"));
+            if let Some(label) = removed_label {
+                self.apply_to(vec![thrid], LabelAction::Remove, vec![label]);
+            }
         });
         if let Some(eml) = export {
             self.export_thread(&thread, eml);
-        }
-
-        // The conversation's labels, as chips. A chip that's cut short has the full name on hover.
-        let font = egui::TextStyle::Small.resolve(ui.style());
-        let chip_h = ui.text_style_height(&egui::TextStyle::Small) + 6.0;
-        let mut clicked_label: Option<String> = None;
-        let mut removed_label: Option<String> = None;
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-            for (raw, name) in &chip_names {
-                let w = chip_width(ui, name, &font);
-                let (rect, resp) =
-                    ui.allocate_exact_size(egui::vec2(w, chip_h), egui::Sense::click());
-                paint_chip(ui, rect, name, &font);
-                if resp.on_hover_text(name).clicked() {
-                    clicked_label = Some(raw.clone());
-                }
-                // The × takes the label off this conversation.
-                if ui
-                    .small_button("×")
-                    .on_hover_text(format!("Remove {name} from this conversation"))
-                    .clicked()
-                {
-                    removed_label = Some(raw.clone());
-                }
-            }
-        });
-        if let Some(label) = clicked_label {
-            self.set_label_filter(Some(label));
-        }
-        if let Some(label) = removed_label {
-            self.apply_to(vec![thrid], LabelAction::Remove, vec![label]);
         }
         ui.separator();
         if thread.is_empty() {
@@ -4247,14 +4250,12 @@ fn draw_thread_row(ui: &mut egui::Ui, view: &RowView, checked: bool) -> RowActio
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     if view.unread {
-                        // Bold isn't available in this font, so unread gets a dot.
+                        // Bold isn't available in this font, so unread gets a dot, in the accent
+                        // colour, since all text is the same bright white in the dark theme.
                         let (dot, _) = ui
                             .allocate_exact_size(egui::vec2(8.0, row_height), egui::Sense::hover());
-                        ui.painter().circle_filled(
-                            dot.center(),
-                            3.5,
-                            ui.visuals().strong_text_color(),
-                        );
+                        ui.painter()
+                            .circle_filled(dot.center(), 3.5, ui.visuals().hyperlink_color);
                     }
                     ui.add(
                         egui::Label::new(title_text)
@@ -4303,6 +4304,13 @@ fn draw_thread_row(ui: &mut egui::Ui, view: &RowView, checked: bool) -> RowActio
     });
     action.rect = row.response.rect;
     action
+}
+
+/// A small heading that starts a group in the sidebar: capitals, with a little room above it.
+fn section_heading(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(6.0);
+    ui.label(egui::RichText::new(text.to_uppercase()).small().strong());
+    ui.add_space(2.0);
 }
 
 /// A small "(!)" that shows `text` on hover, for details that are rarely needed, such as IDs.
