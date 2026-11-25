@@ -601,7 +601,19 @@ impl Worker {
                     None => Ok(Vec::new()),
                 };
                 match uids {
-                    Ok(uids) if uids.is_empty() => Ok(()),
+                    Ok(uids) if uids.is_empty() => {
+                        // Nothing is cached for these threads, so nothing is sent. The empty
+                        // answer still ends the change, so the window stops showing it as pending.
+                        frog::log::log(
+                            "WORKER",
+                            "label change: no cached messages in those threads",
+                        );
+                        self.emit.send(Event::Labels {
+                            updates: Vec::new(),
+                            command: String::new(),
+                        });
+                        Ok(())
+                    }
                     Ok(uids) => self.op_modify(src, &uids, *action, labels),
                     Err(e) => {
                         self.emit
@@ -1397,6 +1409,11 @@ impl Worker {
         action: LabelAction,
         labels: &[String],
     ) -> Result<(), SourceError> {
+        // Logged before the server is asked, so a change that never returns still shows in the log.
+        frog::log::log(
+            "WORKER",
+            format!("label change: {} message(s), labels {labels:?}", uids.len()),
+        );
         let (command, mut updates) = src.modify_labels(uids, action, labels)?;
         // The server's answer should list every message changed. Where it doesn't, the change is
         // made to the cache as asked, so the list shows it now. The next sync corrects anything.
