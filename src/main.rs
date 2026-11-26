@@ -338,7 +338,8 @@ fn row_chips(m: &Message, filter: Option<&str>) -> Vec<String> {
         .filter(|l| l.as_str() != starred)
         .filter(|l| !(mailbox_view && l.as_str() == inbox))
         .collect();
-    labels.sort_by_key(|l| (!l.starts_with('\\'), l.to_lowercase()));
+    // Sorted with each key made once, rather than lower-cased again at every comparison.
+    labels.sort_by_cached_key(|l| (!l.starts_with('\\'), l.to_lowercase()));
     labels.into_iter().cloned().collect()
 }
 
@@ -840,6 +841,7 @@ impl App {
         };
         ctx.set_theme(theme_preference(settings.theme));
         apply_accent(&ctx);
+        apply_type(&ctx);
         let mut login = LoginForm {
             remember: settings.remember_password,
             ..Default::default()
@@ -1536,11 +1538,7 @@ impl App {
             .auto_shrink([false, false])
             .show_rows(ui, row_height, results.len(), |ui, range| {
                 for row in &results[range] {
-                    let band = if self.open_thread == Some(row.thrid) {
-                        ui.visuals().selection.bg_fill
-                    } else {
-                        egui::Color32::TRANSPARENT
-                    };
+                    let selected = self.open_thread == Some(row.thrid);
                     let highlight = ui.painter().add(egui::Shape::Noop);
                     let view = RowView {
                         head: &row.head,
@@ -1571,8 +1569,7 @@ impl App {
                     if action.search_sender.is_some() {
                         sender_search = action.search_sender;
                     }
-                    ui.painter()
-                        .set(highlight, egui::Shape::rect_filled(action.rect, 4.0, band));
+                    paint_row_highlight(ui, highlight, action.rect, selected);
                 }
             });
         for (thrid, starred) in star_clicks {
@@ -1662,11 +1659,7 @@ impl App {
             .auto_shrink([false, false])
             .show_rows(ui, row_height, rows.len(), |ui, range| {
                 for row in &rows[range] {
-                    let band = if self.open_thread == Some(row.thrid) {
-                        ui.visuals().selection.bg_fill
-                    } else {
-                        egui::Color32::TRANSPARENT
-                    };
+                    let selected = self.open_thread == Some(row.thrid);
                     let highlight = ui.painter().add(egui::Shape::Noop);
                     let view = RowView {
                         head: &row.head,
@@ -1697,8 +1690,7 @@ impl App {
                     if action.search_sender.is_some() {
                         sender_search = action.search_sender;
                     }
-                    ui.painter()
-                        .set(highlight, egui::Shape::rect_filled(action.rect, 4.0, band));
+                    paint_row_highlight(ui, highlight, action.rect, selected);
                 }
             });
         for (thrid, starred) in star_clicks {
@@ -2810,13 +2802,9 @@ impl App {
             let (threads, unread) = count;
             let text = format!("{name} ({unread}/{threads})");
             let hover = format!("{name}: {unread} unread of {threads} threads");
-            let band = if selected {
-                ui.visuals().selection.bg_fill
-            } else {
-                egui::Color32::TRANSPARENT
-            };
+            let highlight = ui.painter().add(egui::Shape::Noop);
             let frame = egui::Frame::new()
-                .fill(band)
+                .fill(egui::Color32::TRANSPARENT)
                 .corner_radius(4)
                 .show(ui, |ui| {
                     ui.set_min_size(egui::vec2(width, height));
@@ -2830,6 +2818,7 @@ impl App {
                     egui::Sense::click(),
                 )
                 .on_hover_text(hover);
+            paint_row_highlight(ui, highlight, frame.response.rect, selected);
             if response.clicked() {
                 self.set_label_filter(key.map(str::to_owned));
             }
@@ -2859,13 +2848,9 @@ impl App {
         let selected = self.search.trim() == text;
         let width = ui.available_width().max(40.0);
         let height = ui.spacing().interact_size.y;
-        let band = if selected {
-            ui.visuals().selection.bg_fill
-        } else {
-            egui::Color32::TRANSPARENT
-        };
+        let highlight = ui.painter().add(egui::Shape::Noop);
         let frame = egui::Frame::new()
-            .fill(band)
+            .fill(egui::Color32::TRANSPARENT)
             .corner_radius(4)
             .show(ui, |ui| {
                 ui.set_min_size(egui::vec2(width, height));
@@ -2879,6 +2864,7 @@ impl App {
                 egui::Sense::click(),
             )
             .on_hover_text(format!("Search: {text}"));
+        paint_row_highlight(ui, highlight, frame.response.rect, selected);
         if response.clicked() {
             self.search = text.to_string();
             self.change_list();
@@ -2901,7 +2887,7 @@ impl App {
             .id_salt("sidebar")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.heading("Search");
+                section_heading(ui, "Search");
                 let search = ui.add(
                     egui::TextEdit::singleline(&mut self.search)
                         .hint_text("Search mail")
@@ -2982,7 +2968,7 @@ impl App {
 
                 let favorites = self.settings.favorite_labels.clone();
                 if !favorites.is_empty() {
-                    ui.heading("Favorites");
+                    section_heading(ui, "Favorites");
                     for key in &favorites {
                         let count = counts.get(key).copied().unwrap_or((0, 0));
                         self.label_row(ui, Some(key), &display_label(key), count);
@@ -2990,7 +2976,7 @@ impl App {
                     ui.separator();
                 }
 
-                ui.heading("Mailboxes");
+                section_heading(ui, "Mailboxes");
                 for (name, key) in MAILBOXES {
                     let count = match key {
                         None => self.totals,
@@ -2999,7 +2985,7 @@ impl App {
                     self.label_row(ui, key, name, count);
                 }
                 ui.separator();
-                ui.heading("Tools");
+                section_heading(ui, "Tools");
                 // A tool is a view, like a mailbox: it's highlighted while it's the one shown.
                 let helper_open = self.storage_open && self.search.trim().is_empty();
                 if ui.selectable_label(helper_open, "Storage Helper").clicked() {
@@ -3046,7 +3032,7 @@ impl App {
                 if let Some(cache) = self.label_cache.take() {
                     if !cache.counts.is_empty() {
                         ui.separator();
-                        ui.heading("Labels");
+                        section_heading(ui, "Labels");
                         self.label_tree(ui, &cache.tree, &cache.counts, "");
                     }
                     self.label_cache = Some(cache);
@@ -3128,70 +3114,99 @@ impl App {
 
     /// The actions on checked threads, shown only when some are checked.
     fn action_buttons(&mut self, ui: &mut egui::Ui) {
-        if ui
-            .button("Archive")
-            .on_hover_text("Remove \\Inbox")
-            .clicked()
-        {
-            self.apply(
-                LabelAction::Remove,
-                vec![SystemLabel::Inbox.as_wire().into()],
+        // The buttons are in three groups: moving mail, read state, and labels.
+        toolbar_group(ui, |ui| {
+            if ui
+                .button("Archive")
+                .on_hover_text("Remove \\Inbox")
+                .clicked()
+            {
+                self.apply(
+                    LabelAction::Remove,
+                    vec![SystemLabel::Inbox.as_wire().into()],
+                );
+            }
+            // Trash adds \Trash and removes \Inbox, as Gmail's web app does. Adding \Trash alone
+            // leaves the message in the Inbox.
+            if ui
+                .button("Trash")
+                .on_hover_text("Move to Trash: add \\Trash and remove \\Inbox")
+                .clicked()
+            {
+                self.apply(LabelAction::Add, vec![SystemLabel::Trash.as_wire().into()]);
+                self.apply(
+                    LabelAction::Remove,
+                    vec![SystemLabel::Inbox.as_wire().into()],
+                );
+            }
+            if ui.button("Star").on_hover_text("Add \\Starred").clicked() {
+                self.apply(
+                    LabelAction::Add,
+                    vec![SystemLabel::Starred.as_wire().into()],
+                );
+            }
+        });
+        toolbar_group(ui, |ui| {
+            if ui.button("Mark read").clicked() {
+                self.apply_read_state(true);
+            }
+            if ui.button("Mark unread").clicked() {
+                self.apply_read_state(false);
+            }
+        });
+        toolbar_group(ui, |ui| {
+            // Existing labels, to choose from. A label is taken off a conversation with the × on its
+            // chip in the conversation view.
+            // Type to filter the list. Enter takes the first match, and a click takes any one.
+            let names = self.user_label_names();
+            let query = self.label_input.trim().to_lowercase();
+            let matches: Vec<String> = names
+                .iter()
+                .filter(|n| query.is_empty() || n.to_lowercase().contains(&query))
+                .take(12)
+                .cloned()
+                .collect();
+            let edit = ui.add_enabled(
+                !names.is_empty(),
+                egui::TextEdit::singleline(&mut self.label_input)
+                    .id_salt("add_label")
+                    .hint_text("Type a label")
+                    .desired_width(160.0),
             );
-        }
-        // Trash adds \Trash and removes \Inbox, as Gmail's web app does. Adding \Trash alone
-        // leaves the message in the Inbox.
-        if ui
-            .button("Trash")
-            .on_hover_text("Move to Trash: add \\Trash and remove \\Inbox")
-            .clicked()
-        {
-            self.apply(LabelAction::Add, vec![SystemLabel::Trash.as_wire().into()]);
-            self.apply(
-                LabelAction::Remove,
-                vec![SystemLabel::Inbox.as_wire().into()],
-            );
-        }
-        if ui.button("Star").on_hover_text("Add \\Starred").clicked() {
-            self.apply(
-                LabelAction::Add,
-                vec![SystemLabel::Starred.as_wire().into()],
-            );
-        }
-        ui.separator();
-        if ui.button("Mark read").clicked() {
-            self.apply_read_state(true);
-        }
-        if ui.button("Mark unread").clicked() {
-            self.apply_read_state(false);
-        }
-        ui.separator();
-        // Existing labels, to choose from. A label is taken off a conversation with the × on its
-        // chip in the conversation view.
-        let names = self.user_label_names();
-        let mut chosen = self.label_input.clone();
-        ui.add_enabled_ui(!names.is_empty(), |ui| {
-            egui::ComboBox::from_id_salt("add_label")
-                .selected_text(if chosen.is_empty() {
-                    "Choose a label"
-                } else {
-                    chosen.as_str()
-                })
-                .width(160.0)
-                .show_ui(ui, |ui| {
-                    for name in &names {
-                        ui.selectable_value(&mut chosen, name.clone(), name);
+            let enter = edit.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if enter
+                && !names.contains(&self.label_input)
+                && let Some(first) = matches.first()
+            {
+                self.label_input = first.clone();
+            }
+            let mut picked: Option<String> = None;
+            let open = edit.has_focus() && !matches.is_empty();
+            egui::Popup::from_response(&edit)
+                .open(open)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .show(|ui| {
+                    for name in &matches {
+                        if ui
+                            .selectable_label(self.label_input == *name, name)
+                            .clicked()
+                        {
+                            picked = Some(name.clone());
+                        }
                     }
                 });
+            if let Some(name) = picked {
+                self.label_input = name;
+            }
+            let has_choice = names.contains(&self.label_input);
+            if ui
+                .add_enabled(has_choice, egui::Button::new("Add label"))
+                .clicked()
+            {
+                let label = self.label_input.clone();
+                self.apply(LabelAction::Add, vec![label]);
+            }
         });
-        self.label_input = chosen;
-        let has_choice = names.contains(&self.label_input);
-        if ui
-            .add_enabled(has_choice, egui::Button::new("Add label"))
-            .clicked()
-        {
-            let label = self.label_input.clone();
-            self.apply(LabelAction::Add, vec![label]);
-        }
         // At the end of the row, so the buttons before it stay where they are while a change
         // is in flight.
         if self.pending_changes > 0 {
@@ -3550,68 +3565,71 @@ impl App {
                 .all(|uid| self.thread_msgs.get(uid).is_some_and(|m| m.body.is_some()));
         // Some(true) saves .eml files, Some(false) the text.
         let mut export: Option<bool> = None;
-        ui.horizontal(|ui| {
-            let button = ui.add_enabled(open_url.is_some(), egui::Button::new("Open in Gmail"));
-            if button
-                .on_disabled_hover_text("This message has no thread ID.")
-                .clicked()
-                && let Some(url) = open_url
-            {
-                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
-            }
-            let save = ui.add_enabled_ui(exportable, |ui| {
-                ui.menu_button("Save", |ui| {
-                    if ui.button(".EML").clicked() {
-                        export = Some(true);
-                        ui.close();
-                    }
-                    if ui.button("Plaintext").clicked() {
-                        export = Some(false);
-                        ui.close();
-                    }
-                })
+        // The actions and labels sit in one card, so the header reads as a unit.
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let button = ui.add_enabled(open_url.is_some(), egui::Button::new("Open in Gmail"));
+                if button
+                    .on_disabled_hover_text("This message has no thread ID.")
+                    .clicked()
+                    && let Some(url) = open_url
+                {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                }
+                let save = ui.add_enabled_ui(exportable, |ui| {
+                    ui.menu_button("Save", |ui| {
+                        if ui.button(".EML").clicked() {
+                            export = Some(true);
+                            ui.close();
+                        }
+                        if ui.button("Plaintext").clicked() {
+                            export = Some(false);
+                            ui.close();
+                        }
+                    })
+                });
+                if !exportable {
+                    save.response
+                        .on_disabled_hover_text("Waiting for the message bodies to load.");
+                }
+                ui.weak(format!("{} messages in this conversation", thread.len()));
+                info_tip(ui, format!("Thread {thrid} (0x{thrid:x})"));
             });
-            if !exportable {
-                save.response
-                    .on_disabled_hover_text("Waiting for the message bodies to load.");
+
+            // The conversation's labels, as chips. A chip that's cut short has the full name on hover.
+            let font = egui::TextStyle::Small.resolve(ui.style());
+            let chip_h = ui.text_style_height(&egui::TextStyle::Small) + 6.0;
+            let mut clicked_label: Option<String> = None;
+            let mut removed_label: Option<String> = None;
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                for (raw, name) in &chip_names {
+                    let w = chip_width(ui, name, &font);
+                    let (rect, resp) =
+                        ui.allocate_exact_size(egui::vec2(w, chip_h), egui::Sense::click());
+                    paint_chip(ui, rect, name, &font);
+                    if resp.on_hover_text(name).clicked() {
+                        clicked_label = Some(raw.clone());
+                    }
+                    // The × takes the label off this conversation.
+                    if ui
+                        .small_button("×")
+                        .on_hover_text(format!("Remove {name} from this conversation"))
+                        .clicked()
+                    {
+                        removed_label = Some(raw.clone());
+                    }
+                }
+            });
+            if let Some(label) = clicked_label {
+                self.set_label_filter(Some(label));
             }
-            ui.weak(format!("{} messages in this conversation", thread.len()));
-            info_tip(ui, format!("Thread {thrid} (0x{thrid:x})"));
+            if let Some(label) = removed_label {
+                self.apply_to(vec![thrid], LabelAction::Remove, vec![label]);
+            }
         });
         if let Some(eml) = export {
             self.export_thread(&thread, eml);
-        }
-
-        // The conversation's labels, as chips. A chip that's cut short has the full name on hover.
-        let font = egui::TextStyle::Small.resolve(ui.style());
-        let chip_h = ui.text_style_height(&egui::TextStyle::Small) + 6.0;
-        let mut clicked_label: Option<String> = None;
-        let mut removed_label: Option<String> = None;
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-            for (raw, name) in &chip_names {
-                let w = chip_width(ui, name, &font);
-                let (rect, resp) =
-                    ui.allocate_exact_size(egui::vec2(w, chip_h), egui::Sense::click());
-                paint_chip(ui, rect, name, &font);
-                if resp.on_hover_text(name).clicked() {
-                    clicked_label = Some(raw.clone());
-                }
-                // The × takes the label off this conversation.
-                if ui
-                    .small_button("×")
-                    .on_hover_text(format!("Remove {name} from this conversation"))
-                    .clicked()
-                {
-                    removed_label = Some(raw.clone());
-                }
-            }
-        });
-        if let Some(label) = clicked_label {
-            self.set_label_filter(Some(label));
-        }
-        if let Some(label) = removed_label {
-            self.apply_to(vec![thrid], LabelAction::Remove, vec![label]);
         }
         ui.separator();
         if thread.is_empty() {
@@ -4101,15 +4119,19 @@ impl App {
             .resizable(true)
             .open(&mut open)
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("log")
-                    .auto_shrink([false, false])
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        for line in frog::log::snapshot() {
-                            ui.monospace(line);
-                        }
-                    });
+                // Only the lines on screen are drawn, and they're read in place, not copied.
+                let row = ui.text_style_height(&egui::TextStyle::Monospace);
+                frog::log::with_lines(|lines| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("log")
+                        .auto_shrink([false, false])
+                        .stick_to_bottom(true)
+                        .show_rows(ui, row, lines.len(), |ui, range| {
+                            for line in lines.range(range) {
+                                ui.monospace(line.as_str());
+                            }
+                        });
+                });
             });
         if !open {
             self.log_open = false;
@@ -4213,7 +4235,10 @@ fn draw_thread_row(ui: &mut egui::Ui, view: &RowView, checked: bool) -> RowActio
         // (raw label to filter by, shown text, tooltip). The "+N" chip has no label.
         let mut tags: Vec<(Option<String>, String, String)> = shown
             .iter()
-            .map(|raw| (Some(raw.clone()), display_label(raw), display_label(raw)))
+            .map(|raw| {
+                let text = display_label(raw);
+                (Some(raw.clone()), text.clone(), text)
+            })
             .collect();
         if !hidden.is_empty() {
             let names: Vec<String> = hidden.iter().map(|r| display_label(r)).collect();
@@ -4247,14 +4272,12 @@ fn draw_thread_row(ui: &mut egui::Ui, view: &RowView, checked: bool) -> RowActio
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     if view.unread {
-                        // Bold isn't available in this font, so unread gets a dot.
+                        // Bold isn't available in this font, so unread gets a dot, in the accent
+                        // colour, since all text is the same bright white in the dark theme.
                         let (dot, _) = ui
                             .allocate_exact_size(egui::vec2(8.0, row_height), egui::Sense::hover());
-                        ui.painter().circle_filled(
-                            dot.center(),
-                            3.5,
-                            ui.visuals().strong_text_color(),
-                        );
+                        ui.painter()
+                            .circle_filled(dot.center(), 3.5, ui.visuals().hyperlink_color);
                     }
                     ui.add(
                         egui::Label::new(title_text)
@@ -4305,6 +4328,56 @@ fn draw_thread_row(ui: &mut egui::Ui, view: &RowView, checked: bool) -> RowActio
     action
 }
 
+/// Paints the background of a row, in the slot reserved for it before the row was drawn. A
+/// selected row has the selection fill and an accent bar; a hovered one has a faint fill.
+fn paint_row_highlight(
+    ui: &mut egui::Ui,
+    slot: egui::layers::ShapeIdx,
+    rect: egui::Rect,
+    selected: bool,
+) {
+    let fill = if selected {
+        ui.visuals().selection.bg_fill
+    } else if ui.rect_contains_pointer(rect) {
+        ui.visuals().widgets.hovered.weak_bg_fill
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    ui.painter()
+        .set(slot, egui::Shape::rect_filled(rect, 4.0, fill));
+    if selected {
+        let bar = egui::Rect::from_min_max(rect.min, egui::pos2(rect.min.x + 3.0, rect.max.y));
+        ui.painter()
+            .rect_filled(bar, 2.0, ui.visuals().hyperlink_color);
+    }
+}
+
+/// Groups related toolbar buttons on a faint background, so the groups read apart.
+fn toolbar_group<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    egui::Frame::new()
+        .fill(ui.visuals().faint_bg_color)
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::symmetric(4, 2))
+        .show(ui, add)
+        .inner
+}
+
+/// A small heading that starts a group in the sidebar: capitals, with a little room above it.
+fn section_heading(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new(text.to_uppercase())
+            .text_style(section_style())
+            .strong(),
+    );
+    ui.add_space(2.0);
+}
+
+/// The style for sidebar section headings. Larger than body text, so they stand apart from rows.
+fn section_style() -> egui::TextStyle {
+    egui::TextStyle::Name("Section".into())
+}
+
 /// A small "(!)" that shows `text` on hover, for details that are rarely needed, such as IDs.
 fn info_tip(ui: &mut egui::Ui, text: impl Into<String>) {
     ui.weak("(!)").on_hover_text(text.into());
@@ -4337,6 +4410,22 @@ fn accent(theme: egui::Theme) -> Accent {
             hyperlink: egui::Color32::from_rgb(0x1E, 0x7A, 0x43),
             text: None,
         },
+    }
+}
+
+/// FROG's type scale, set once for both themes. Body text, buttons and headings keep egui's
+/// sizes, so rows and fixed-width columns don't move. Small text is larger than egui's default,
+/// since chips and dates were hard to read at that size.
+fn apply_type(ctx: &egui::Context) {
+    for theme in [egui::Theme::Dark, egui::Theme::Light] {
+        ctx.style_mut_of(theme, |style| {
+            style
+                .text_styles
+                .insert(egui::TextStyle::Small, egui::FontId::proportional(11.0));
+            style
+                .text_styles
+                .insert(section_style(), egui::FontId::proportional(15.0));
+        });
     }
 }
 
@@ -4607,6 +4696,54 @@ mod tests {
             true,
             b"From: a@example.com\r\nSubject: hi\r\n\r\n".to_vec(),
         )
+    }
+
+    /// Times drawing a long list of thread rows, to compare before and after a performance
+    /// change. Run with: cargo test --release bench_thread_rows -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_thread_rows() {
+        let msgs: Vec<Message> = (0..400)
+            .map(|i| {
+                let mut m =
+                    message_with(&["\\Inbox", "Work", "Home/Bills", "2011/Moving", "Travel"]);
+                m.subject = format!("Subject number {i} with some words in it");
+                m.from = format!("Sender {i}");
+                m
+            })
+            .collect();
+        let ctx = egui::Context::default();
+        let frame = || {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    for m in &msgs {
+                        let view = RowView {
+                            head: m,
+                            thrid: m.thrid,
+                            count: 3,
+                            unread: true,
+                            attachments: true,
+                            filter_label: None,
+                            row_height: 20.0,
+                        };
+                        draw_thread_row(ui, &view, false);
+                    }
+                });
+            });
+        };
+        for _ in 0..5 {
+            frame();
+        }
+        const FRAMES: u32 = 50;
+        let start = Instant::now();
+        for _ in 0..FRAMES {
+            frame();
+        }
+        println!(
+            "{} rows: {:.2} ms per frame",
+            msgs.len(),
+            start.elapsed().as_secs_f64() * 1000.0 / f64::from(FRAMES)
+        );
     }
 
     #[test]
