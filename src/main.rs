@@ -4807,7 +4807,7 @@ mod tests {
         // egui panics on a font family it doesn't know, so each choice is drawn once.
         let ctx = egui::Context::default();
         apply_fonts(&ctx);
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             for font in [
                 settings::ReadingFont::Monospace,
                 settings::ReadingFont::Sans,
@@ -4816,6 +4816,8 @@ mod tests {
                 ui.label(egui::RichText::new("Mail text, ünïcödé").family(reading_family(font)));
             }
         });
+        // This test doesn't paint, so the font atlas changes it reports are dropped here.
+        output.textures_delta.clear();
     }
 
     #[test]
