@@ -409,6 +409,8 @@ const ARROW_GUTTER: f32 = 14.0;
 const BAR_CLEAR: f32 = 4.0;
 /// The space before a sidebar row that has no arrow, so its text clears the accent bar.
 const LABEL_INSET: f32 = 8.0;
+/// How long the cache may take to open before the user is told why it's slow.
+const CACHE_SLOW_AFTER: Duration = Duration::from_secs(5);
 /// The size of a tree arrow, which is larger than body text so it's easy to hit.
 const ARROW_TEXT: f32 = 18.0;
 
@@ -772,6 +774,10 @@ struct App {
     pending_changes: usize,
     pending_threads: HashSet<u64>,
     pending_note: String,
+    /// When the cache started opening, until it's open. Set while it may be slow to open.
+    cache_opening: Option<Instant>,
+    /// Whether the note about a slow cache open has been shown for this start.
+    cache_slow_noted: bool,
     window_start: usize,
     /// Threads in the list the window belongs to.
     window_total: usize,
@@ -947,6 +953,8 @@ impl App {
             pending_changes: 0,
             pending_threads: HashSet::new(),
             pending_note: String::new(),
+            cache_opening: None,
+            cache_slow_noted: false,
             window_start: 0,
             window_total: 0,
             window_filter: None,
@@ -995,6 +1003,8 @@ impl App {
             self.save_settings();
         }
         self.connecting = true;
+        self.cache_opening = Some(Instant::now());
+        self.cache_slow_noted = false;
         let body_cap = self.settings.body_cache_mib * 1024 * 1024;
         self.link = Some(worker::spawn_gmail(
             user,
@@ -1029,6 +1039,7 @@ impl App {
 
     fn handle_event(&mut self, ev: Event) {
         match ev {
+            Event::CacheReady => self.cache_opening = None,
             Event::Connected => {
                 self.connecting = false;
                 self.connected = true;
@@ -1933,6 +1944,24 @@ impl App {
 
     /// Re-reads the rows on screen and the open conversation after a change. Repeats are
     /// throttled, so a long load doesn't ask for a refresh on every batch.
+    /// Tells the user when the cache is slow to open. On Windows that's often Defender scanning
+    /// the file, which can take a minute or more, so the wait is explained rather than left.
+    fn watch_cache_open(&mut self) {
+        let Some(since) = self.cache_opening else {
+            return;
+        };
+        if since.elapsed() >= CACHE_SLOW_AFTER && !self.cache_slow_noted {
+            self.cache_slow_noted = true;
+            self.status = Some(
+                "Still opening the mail cache. An antivirus scan, such as Windows Defender, can \
+                 slow this down. The list fills in when it's done."
+                    .into(),
+            );
+        }
+        // Keep the window looking while the cache is open, so the note appears on time.
+        self.ctx.request_repaint_after(Duration::from_secs(1));
+    }
+
     fn refresh_views(&mut self) {
         if !self.view_stale {
             return;
@@ -4709,6 +4738,7 @@ impl eframe::App for App {
             self.login_window(&ctx);
             return;
         }
+        self.watch_cache_open();
         self.refresh_views();
 
         // Window title: the app name and the signed-in account.

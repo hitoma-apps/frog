@@ -121,6 +121,9 @@ pub struct ServerCheck {
 
 /// What the worker reports back. Message data goes out only when the GUI asks for it.
 pub enum Event {
+    /// The cache file is open, so the list can fill in. Opening can be slow, when an antivirus
+    /// program scans the file.
+    CacheReady,
     Connected,
     ConnectFailed(String),
     /// The connection dropped, and the worker is trying to reconnect.
@@ -258,7 +261,16 @@ fn cache_for(email: &str, body_cap: u64) -> (Option<Store>, Option<Store>, Vec<E
 /// Starts a worker that signs in to Gmail and uses that account's cache.
 /// Starts the worker for `user`. `body_cap` is how many bytes of message bodies the cache keeps.
 pub fn spawn_gmail(user: String, password: String, ctx: egui::Context, body_cap: u64) -> Link {
-    let (store, reader, startup) = cache_for(&user, body_cap);
+    // The cache opens on a thread of its own. A slow file open, such as an antivirus scan, then
+    // holds up only the list, not the window.
+    let (cache_tx, cache_rx) = channel();
+    let (reader_tx, reader_rx) = channel();
+    let account = user.clone();
+    thread::spawn(move || {
+        let (store, reader, startup) = cache_for(&account, body_cap);
+        let _ = reader_tx.send(reader);
+        let _ = cache_tx.send((store, startup));
+    });
     // With the `demo` feature, the built-in demo mailbox stands in for Gmail, so the app can
     // be run and screenshotted without an account.
     #[cfg(feature = "demo")]
@@ -270,7 +282,7 @@ pub fn spawn_gmail(user: String, password: String, ctx: egui::Context, body_cap:
     let connect: Connector = Box::new(move || live::connect_gmail(&user, &password));
     #[cfg(feature = "demo")]
     let _ = password;
-    spawn_with_reader(ctx, connect, KEEPALIVE, RETRY_BASE, store, reader, startup)
+    spawn_with_cache(ctx, connect, KEEPALIVE, RETRY_BASE, cache_rx, reader_rx)
 }
 
 #[cfg(test)]
@@ -285,7 +297,9 @@ fn spawn(
     spawn_with_reader(ctx, connect, keepalive, retry_base, store, None, startup)
 }
 
-/// Starts the worker and, given a reader connection, a reader thread for cache reads.
+/// Starts the worker and, given a reader connection, a reader thread for cache reads. The tests
+/// use this, since the app opens the cache itself.
+#[cfg(test)]
 fn spawn_with_reader(
     ctx: egui::Context,
     connect: Connector,
@@ -295,28 +309,57 @@ fn spawn_with_reader(
     reader: Option<Store>,
     startup: Vec<Event>,
 ) -> Link {
+    let (cache_tx, cache_rx) = channel();
+    let (reader_tx, reader_rx) = channel();
+    let _ = cache_tx.send((store, startup));
+    let _ = reader_tx.send(reader);
+    spawn_with_cache(ctx, connect, keepalive, retry_base, cache_rx, reader_rx)
+}
+
+/// Starts the worker and a reader thread for cache reads. The cache and the reader connection
+/// arrive on their channels, once they're open, so the window never waits for the file.
+fn spawn_with_cache(
+    ctx: egui::Context,
+    connect: Connector,
+    keepalive: Duration,
+    retry_base: Duration,
+    cache: Receiver<(Option<Store>, Vec<Event>)>,
+    reader: Receiver<Option<Store>>,
+) -> Link {
     let (cmd_tx, cmd_rx) = channel();
     let (ev_tx, ev_rx) = channel();
     let emit = Emitter { tx: ev_tx, ctx };
-    let reads = reader.map(|reader| {
-        let (read_tx, read_rx) = channel();
-        let emit = emit.clone();
-        thread::spawn(move || {
-            let crash = emit.clone();
-            let outcome = catch_unwind(AssertUnwindSafe(move || read_loop(reader, read_rx, emit)));
-            if let Err(payload) = outcome {
-                crash.send(Event::Crashed(format!(
-                    "The cache reader stopped: {}",
-                    panic_message(&payload)
-                )));
+    let (read_tx, read_rx) = channel();
+    let forward = cmd_tx.clone();
+    let reader_emit = emit.clone();
+    thread::spawn(move || {
+        let crash = reader_emit.clone();
+        let outcome = catch_unwind(AssertUnwindSafe(move || {
+            match reader.recv().ok().flatten() {
+                Some(store) => read_loop(store, read_rx, reader_emit),
+                // Without a reader connection, the worker answers the reads, as it does without
+                // a reader thread.
+                None => {
+                    for cmd in read_rx {
+                        let _ = forward.send(cmd);
+                    }
+                }
             }
-        });
-        read_tx
+        }));
+        if let Err(payload) = outcome {
+            crash.send(Event::Crashed(format!(
+                "The cache reader stopped: {}",
+                panic_message(&payload)
+            )));
+        }
     });
     let crash = emit.clone();
     thread::spawn(move || {
         // A panic is caught here, so the GUI can offer a restart instead of going quiet.
         let outcome = catch_unwind(AssertUnwindSafe(move || {
+            // If the cache can't be opened at all, the worker starts without one.
+            let (store, startup) = cache.recv().unwrap_or((None, Vec::new()));
+            emit.send(Event::CacheReady);
             run_worker(connect, emit, startup, keepalive, retry_base, store, cmd_rx)
         }));
         if let Err(payload) = outcome {
@@ -329,7 +372,7 @@ fn spawn_with_reader(
     Link {
         commands: cmd_tx,
         events: ev_rx,
-        reads,
+        reads: Some(read_tx),
     }
 }
 
@@ -2496,6 +2539,7 @@ mod sync_tests {
     /// The variant name of an event, for readable test failures.
     fn name(ev: &Event) -> &'static str {
         match ev {
+            Event::CacheReady => "CacheReady",
             Event::Connected => "Connected",
             Event::ConnectFailed(_) => "ConnectFailed",
             Event::Reconnecting => "Reconnecting",
