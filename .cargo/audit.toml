@@ -5,7 +5,7 @@
 # The fixes are in zip 9.x, which only a development Velopack build uses. The advisories concern
 # extracting archives: path escapes, symlinks and file permissions. Update packages come from our
 # own GitHub release over HTTPS, so the risk needs someone to control those release assets.
-# Tracked in a Forgejo ticket. Remove these entries once Velopack releases a zip 9 build.
+# Remove these entries once Velopack releases a zip 9 build.
 [advisories]
 ignore = [
     "RUSTSEC-2026-0367",
