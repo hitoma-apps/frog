@@ -1944,6 +1944,35 @@ impl App {
 
     /// Re-reads the rows on screen and the open conversation after a change. Repeats are
     /// throttled, so a long load doesn't ask for a refresh on every batch.
+    /// While the cache opens, a modal panel covers the window and says what's happening. Once the
+    /// wait is long, the panel names the likely cause, so it isn't mistaken for a freeze.
+    fn cache_overlay(&self, ctx: &egui::Context) {
+        let Some(since) = self.cache_opening else {
+            return;
+        };
+        let waited = since.elapsed();
+        egui::Modal::new(egui::Id::unique("cache_loading"))
+            .backdrop_color(egui::Color32::from_black_alpha(160))
+            .show(ctx, |ui| {
+                ui.set_width(380.0);
+                ui.vertical_centered(|ui| {
+                    ui.add_space(8.0);
+                    ui.spinner();
+                    ui.add_space(8.0);
+                    ui.heading("Opening your mail cache");
+                    ui.label(format!("Waiting {} s", waited.as_secs()));
+                    if waited >= CACHE_SLOW_AFTER {
+                        ui.add_space(8.0);
+                        ui.label(
+                            "Windows Defender may be scanning the cache file, which can take a \
+                             minute or more. The list fills in when it's done.",
+                        );
+                    }
+                    ui.add_space(8.0);
+                });
+            });
+    }
+
     /// Tells the user when the cache is slow to open. On Windows that's often Defender scanning
     /// the file, which can take a minute or more, so the wait is explained rather than left.
     fn watch_cache_open(&mut self) {
@@ -4819,6 +4848,7 @@ impl eframe::App for App {
         self.original_window(&ctx);
         self.log_window(&ctx);
         self.help_window(&ctx);
+        self.cache_overlay(&ctx);
     }
 }
 
