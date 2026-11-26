@@ -2304,7 +2304,14 @@ mod tests {
                 count: 500,
             })
             .unwrap();
-        match link.events.recv_timeout(Duration::from_secs(2)) {
+        // CacheReady may come first; it isn't the answer to the read.
+        let answer = loop {
+            match link.events.recv_timeout(Duration::from_secs(2)) {
+                Ok(Event::CacheReady) => continue,
+                other => break other,
+            }
+        };
+        match answer {
             Ok(Event::Window { threads, .. }) => {
                 assert_eq!(cached_messages(&threads), 6);
                 assert!(started.elapsed() < Duration::from_secs(2));
