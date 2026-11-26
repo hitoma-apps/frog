@@ -830,6 +830,8 @@ struct App {
     /// A conversation waiting to be marked read after a delay: its thread, and when it opened.
     read_timer: Option<(u64, Instant)>,
     label_input: String,
+    /// Whether the list of labels under the label box is showing.
+    label_list_open: bool,
     /// IMAP commands issued this session, newest last.
     status: Option<String>,
 }
@@ -982,6 +984,7 @@ impl App {
             mark_read_on_open: false,
             read_timer: None,
             label_input: String::new(),
+            label_list_open: false,
             status: None,
         };
         // Environment variables take precedence over a remembered password.
@@ -3322,9 +3325,15 @@ impl App {
             {
                 self.label_input = first.clone();
             }
+            // The list stays open while it's used. Clicking an item takes the focus from the box,
+            // so the list can't depend on the box having focus.
+            if edit.gained_focus() || edit.changed() {
+                self.label_list_open = true;
+            }
+            let escape = edit.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape));
             let mut picked: Option<String> = None;
-            let open = edit.has_focus() && !matches.is_empty();
-            egui::Popup::from_response(&edit)
+            let open = self.label_list_open && !matches.is_empty();
+            let list = egui::Popup::from_response(&edit)
                 .open(open)
                 .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                 .show(|ui| {
@@ -3337,8 +3346,15 @@ impl App {
                         }
                     }
                 });
+            let clicked_away = ui.input(|i| i.pointer.any_pressed())
+                && !edit.contains_pointer()
+                && !list.is_some_and(|l| l.response.contains_pointer());
+            let closing = picked.is_some() || escape || clicked_away;
             if let Some(name) = picked {
                 self.label_input = name;
+            }
+            if closing {
+                self.label_list_open = false;
             }
             let has_choice = names.contains(&self.label_input);
             if ui
