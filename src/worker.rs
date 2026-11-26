@@ -1779,10 +1779,17 @@ mod tests {
     /// Retry wait for tests, so reconnect tests don't sleep for seconds.
     const FAST: Duration = Duration::from_millis(1);
 
+    /// The next event. `CacheReady` is skipped, since it comes before anything a test checks.
     fn next(link: &Link) -> Event {
-        link.events
-            .recv_timeout(Duration::from_secs(5))
-            .expect("worker went quiet")
+        loop {
+            let ev = link
+                .events
+                .recv_timeout(Duration::from_secs(5))
+                .expect("worker went quiet");
+            if !matches!(ev, Event::CacheReady) {
+                return ev;
+            }
+        }
     }
 
     /// The next event that isn't progress, which tests don't care about.
@@ -2571,10 +2578,17 @@ mod sync_tests {
         }
     }
 
+    /// The next event. `CacheReady` is skipped, since it comes before anything a test checks.
     fn next(link: &Link) -> Event {
-        link.events
-            .recv_timeout(Duration::from_secs(5))
-            .expect("worker went quiet")
+        loop {
+            let ev = link
+                .events
+                .recv_timeout(Duration::from_secs(5))
+                .expect("worker went quiet");
+            if !matches!(ev, Event::CacheReady) {
+                return ev;
+            }
+        }
     }
 
     /// Starts a worker on `source`, loads it, and waits until the load is done.
