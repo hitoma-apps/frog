@@ -405,6 +405,21 @@ fn sender_line(m: &Message) -> String {
 
 /// Width of the expand/collapse arrow's gutter in the label tree. Every label row has one.
 const ARROW_GUTTER: f32 = 14.0;
+/// The space at the left of a sidebar row, for the accent bar, so it doesn't cover the text.
+const BAR_CLEAR: f32 = 4.0;
+/// The space before a sidebar row that has no arrow, so its text clears the accent bar.
+const LABEL_INSET: f32 = 8.0;
+/// The size of a tree arrow, which is larger than body text so it's easy to hit.
+const ARROW_TEXT: f32 = 18.0;
+
+/// What a sidebar row has at its left: nothing, an empty gutter for a leaf, or an arrow for a
+/// parent.
+#[derive(Clone, Copy)]
+enum Gutter {
+    None,
+    Leaf,
+    Parent { open: bool },
+}
 
 /// Gap between the items of a row.
 const ROW_GAP: f32 = 4.0;
@@ -577,14 +592,19 @@ fn auth_line(ui: &mut egui::Ui, checks: &[AuthCheck]) {
     });
 }
 
-fn render_line(ui: &mut egui::Ui, line: &str, pending: &mut Option<LinkInfo>) {
+fn render_line(
+    ui: &mut egui::Ui,
+    line: &str,
+    pending: &mut Option<LinkInfo>,
+    font: egui::FontFamily,
+) {
     if line.is_empty() {
         ui.add_space(ui.text_style_height(&egui::TextStyle::Monospace) * 0.6);
         return;
     }
     let segments = reader::split_links(line);
     if segments.iter().all(|s| matches!(s, Segment::Text(_))) {
-        ui.label(egui::RichText::new(line).monospace());
+        ui.label(egui::RichText::new(line).family(font));
         return;
     }
     ui.horizontal_wrapped(|ui| {
@@ -592,7 +612,7 @@ fn render_line(ui: &mut egui::Ui, line: &str, pending: &mut Option<LinkInfo>) {
         for segment in segments {
             match segment {
                 Segment::Text(text) => {
-                    ui.label(egui::RichText::new(text).monospace());
+                    ui.label(egui::RichText::new(text).family(font.clone()));
                 }
                 Segment::Link(url) if linkcheck::is_suspicious(url) => {
                     let info = linkcheck::analyze(url);
@@ -602,7 +622,7 @@ fn render_line(ui: &mut egui::Ui, line: &str, pending: &mut Option<LinkInfo>) {
                         info.warnings.join("\n")
                     );
                     let text = egui::RichText::new(format!("⚠ {url}"))
-                        .monospace()
+                        .family(font.clone())
                         .color(egui::Color32::LIGHT_RED);
                     if ui.link(text).on_hover_text(hover).clicked() {
                         *pending = Some(info);
@@ -610,7 +630,7 @@ fn render_line(ui: &mut egui::Ui, line: &str, pending: &mut Option<LinkInfo>) {
                 }
                 // Only web addresses are clickable. Anything else is shown as text.
                 Segment::Link(url) if linkcheck::is_web_address(url) => {
-                    ui.hyperlink_to(egui::RichText::new(url).monospace(), url);
+                    ui.hyperlink_to(egui::RichText::new(url).family(font.clone()), url);
                 }
                 Segment::Link(url) => {
                     ui.monospace(url);
@@ -846,6 +866,7 @@ impl App {
         ctx.set_theme(theme_preference(settings.theme));
         apply_accent(&ctx);
         apply_type(&ctx);
+        apply_fonts(&ctx);
         let mut login = LoginForm {
             remember: settings.remember_password,
             ..Default::default()
@@ -2239,6 +2260,27 @@ impl App {
             );
         });
         ui.add_space(8.0);
+        ui.label("Reading font");
+        let before = self.settings.reading_font;
+        egui::ComboBox::from_id_salt("reading_font")
+            .selected_text(reading_font_name(self.settings.reading_font))
+            .show_ui(ui, |ui| {
+                for font in [
+                    settings::ReadingFont::Monospace,
+                    settings::ReadingFont::Sans,
+                    settings::ReadingFont::Serif,
+                ] {
+                    ui.selectable_value(
+                        &mut self.settings.reading_font,
+                        font,
+                        reading_font_name(font),
+                    );
+                }
+            });
+        if self.settings.reading_font != before {
+            self.save_settings();
+        }
+        ui.add_space(8.0);
         ui.label("Mark a conversation as read when it's opened");
         ui.horizontal(|ui| {
             ui.radio_value(
@@ -2784,13 +2826,15 @@ impl App {
     /// One sidebar row: a favorite toggle, then the label, which filters the list.
     /// `key` is `None` for All Mail, which can't be favorited.
     /// `count` is (threads with the label, of those unread).
+    /// One row in the sidebar. Returns whether its arrow was clicked, for a row with children.
     fn label_row(
         &mut self,
         ui: &mut egui::Ui,
         key: Option<&str>,
         name: &str,
         count: (usize, usize),
-    ) {
+        gutter: Gutter,
+    ) -> bool {
         let is_fav = key.is_some_and(|k| self.settings.favorite_labels.iter().any(|f| f == k));
         // While a search is typed, the search is the view, so no label is shown as selected.
         let selected = self.search.trim().is_empty()
@@ -2799,6 +2843,7 @@ impl App {
             && !self.waiting_open
             && self.filter.as_deref() == key;
         let mut toggle = false;
+        let mut arrow_clicked = false;
         ui.horizontal(|ui| {
             // Truncate to the space the sidebar has, so a long name can't stop it shrinking.
             let width = ui.available_width().max(40.0);
@@ -2807,17 +2852,41 @@ impl App {
             let text = format!("{name} ({unread}/{threads})");
             let hover = format!("{name}: {unread} unread of {threads} threads");
             let highlight = ui.painter().add(egui::Shape::Noop);
+            // The highlight covers the arrow too, so a selected parent's arrow is in the band.
             let frame = egui::Frame::new()
                 .fill(egui::Color32::TRANSPARENT)
                 .corner_radius(4)
                 .show(ui, |ui| {
                     ui.set_min_size(egui::vec2(width, height));
                     ui.set_max_width(width);
-                    ui.add(egui::Label::new(text).truncate());
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        // The accent bar sits at the left edge, so the content starts after it.
+                        match gutter {
+                            Gutter::None => ui.add_space(LABEL_INSET),
+                            Gutter::Leaf => ui.add_space(BAR_CLEAR + ARROW_GUTTER),
+                            Gutter::Parent { open } => {
+                                ui.add_space(BAR_CLEAR);
+                                let arrow = if open { "▾" } else { "▸" };
+                                let text = egui::RichText::new(arrow).size(ARROW_TEXT);
+                                let button = ui.add_sized(
+                                    [ARROW_GUTTER, height],
+                                    egui::Button::new(text).frame(false),
+                                );
+                                arrow_clicked = button.clicked();
+                            }
+                        }
+                        ui.add(egui::Label::new(text).truncate());
+                    });
                 });
+            // The label is clickable everywhere except the arrow.
+            let mut label_area = frame.response.rect;
+            if matches!(gutter, Gutter::Parent { .. }) {
+                label_area.min.x += BAR_CLEAR + ARROW_GUTTER;
+            }
             let response = ui
                 .interact(
-                    frame.response.rect,
+                    label_area,
                     ui.scope_id().with(("label", key.unwrap_or(name))),
                     egui::Sense::click(),
                 )
@@ -2844,6 +2913,7 @@ impl App {
         if toggle && let Some(k) = key {
             self.toggle_favorite(k);
         }
+        arrow_clicked
     }
 
     /// One saved search in the sidebar. Clicking it runs the search, and the list follows the
@@ -2859,7 +2929,10 @@ impl App {
             .show(ui, |ui| {
                 ui.set_min_size(egui::vec2(width, height));
                 ui.set_max_width(width);
-                ui.add(egui::Label::new(text).truncate());
+                ui.horizontal(|ui| {
+                    ui.add_space(LABEL_INSET);
+                    ui.add(egui::Label::new(text).truncate());
+                });
             });
         let response = ui
             .interact(
@@ -2975,7 +3048,7 @@ impl App {
                     section_heading(ui, "Favorites");
                     for key in &favorites {
                         let count = counts.get(key).copied().unwrap_or((0, 0));
-                        self.label_row(ui, Some(key), &display_label(key), count);
+                        self.label_row(ui, Some(key), &display_label(key), count, Gutter::None);
                     }
                     ui.separator();
                 }
@@ -2986,7 +3059,7 @@ impl App {
                         None => self.totals,
                         Some(k) => counts.get(k).copied().unwrap_or((0, 0)),
                     };
-                    self.label_row(ui, key, name, count);
+                    self.label_row(ui, key, name, count, Gutter::None);
                 }
                 ui.separator();
                 section_heading(ui, "Tools");
@@ -3067,31 +3140,34 @@ impl App {
             // Every row starts with the same gutter, so the names at one level line up.
             // A parent's arrow sits in that gutter, and leaves leave it empty.
             let open = self.label_open.contains(&child_path);
-            ui.horizontal(|ui| {
-                let height = ui.spacing().interact_size.y;
-                if child.children.is_empty() {
-                    ui.allocate_exact_size(egui::vec2(ARROW_GUTTER, height), egui::Sense::hover());
-                } else {
-                    let arrow = if open { "▾" } else { "▸" };
-                    let toggle = ui.add_sized(
-                        [ARROW_GUTTER, height],
-                        egui::Button::new(arrow).frame(false),
-                    );
-                    if toggle.clicked() {
-                        if open {
-                            self.label_open.remove(&child_path);
-                        } else {
-                            self.label_open.insert(child_path.clone());
-                        }
-                    }
+            let mut arrow_clicked = false;
+            ui.horizontal(|ui| match &child.label {
+                Some(raw) => {
+                    let gutter = if child.children.is_empty() {
+                        Gutter::Leaf
+                    } else {
+                        Gutter::Parent { open }
+                    };
+                    arrow_clicked = self.label_row(ui, Some(raw.as_str()), segment, count, gutter);
                 }
-                match &child.label {
-                    Some(raw) => self.label_row(ui, Some(raw.as_str()), segment, count),
-                    None => {
-                        ui.weak(segment.as_str());
-                    }
+                None => {
+                    // A path with no label of its own: its arrow and name, with nothing to select.
+                    let height = ui.spacing().interact_size.y;
+                    let arrow = if open { "▾" } else { "▸" };
+                    let text = egui::RichText::new(arrow).size(ARROW_TEXT);
+                    arrow_clicked = ui
+                        .add_sized([ARROW_GUTTER, height], egui::Button::new(text).frame(false))
+                        .clicked();
+                    ui.weak(segment.as_str());
                 }
             });
+            if arrow_clicked {
+                if open {
+                    self.label_open.remove(&child_path);
+                } else {
+                    self.label_open.insert(child_path.clone());
+                }
+            }
             if open && !child.children.is_empty() {
                 ui.indent(child_path.as_str(), |ui| {
                     self.label_tree(ui, child, counts, &child_path)
@@ -3104,20 +3180,24 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             self.select_all_box(ui);
             ui.separator();
-            if self.checked.is_empty() {
-                // Actions act on checked threads, so they're shown once some are checked.
-                ui.weak("Check threads to act on them.");
-            } else {
-                self.action_buttons(ui);
-            }
+            self.action_buttons(ui);
         });
         if let Some(status) = &self.status {
             ui.colored_label(egui::Color32::LIGHT_RED, status);
         }
     }
 
-    /// The actions on checked threads, shown only when some are checked.
+    /// The actions on checked threads. With none checked they're shown, but disabled, so it's
+    /// clear what's there.
     fn action_buttons(&mut self, ui: &mut egui::Ui) {
+        let enabled = !self.checked.is_empty();
+        ui.add_enabled_ui(enabled, |ui| self.action_group(ui));
+        if !enabled {
+            ui.weak("Check threads to act on them.");
+        }
+    }
+
+    fn action_group(&mut self, ui: &mut egui::Ui) {
         // The buttons are in three groups: moving mail, read state, and labels.
         toolbar_group(ui, |ui| {
             if ui
@@ -3668,6 +3748,7 @@ impl App {
         // A message whose attachments are all to be saved, into a folder the user picks.
         let mut save_all_request: Option<u32> = None;
         let mut pending: Option<LinkInfo> = None;
+        let font = reading_family(self.settings.reading_font);
         egui::ScrollArea::vertical()
             .id_salt("reader")
             .auto_shrink([false, false])
@@ -3769,7 +3850,7 @@ impl App {
                                                     for (i, block) in blocks.iter().enumerate() {
                                                         match block {
                                                             Block::Line(line) => {
-                                                                render_line(ui, line, &mut pending)
+                                                                render_line(ui, line, &mut pending, font.clone())
                                                             }
                                                             Block::Quote(lines) => {
                                                                 ui.push_id(i, |ui| {
@@ -3780,7 +3861,7 @@ impl App {
                                                         .default_open(false)
                                                         .show(ui, |ui| {
                                                             for line in lines {
-                                                                render_line(ui, line, &mut pending);
+                                                                render_line(ui, line, &mut pending, font.clone());
                                                             }
                                                         });
                                                     });
@@ -4387,9 +4468,9 @@ fn section_style() -> egui::TextStyle {
     egui::TextStyle::Name("Section".into())
 }
 
-/// A small "(!)" that shows `text` on hover, for details that are rarely needed, such as IDs.
+/// A small "ⓘ" that shows `text` on hover, for details that are rarely needed, such as IDs.
 fn info_tip(ui: &mut egui::Ui, text: impl Into<String>) {
-    ui.weak("(!)").on_hover_text(text.into());
+    ui.weak("ⓘ").on_hover_text(text.into());
 }
 
 /// The egui theme for a theme choice.
@@ -4435,6 +4516,52 @@ fn apply_type(ctx: &egui::Context) {
                 .text_styles
                 .insert(section_style(), egui::FontId::proportional(15.0));
         });
+    }
+}
+
+/// The font family name of the bundled serif font, for the reading pane.
+const READING_SERIF: &str = "Serif";
+
+/// Adds the bundled serif font. The sans-serif and monospace fonts are egui's own, so they're
+/// already there.
+fn apply_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "liberation-serif".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/LiberationSerif-Regular.ttf"
+        ))),
+    );
+    // The serif font comes first, then the sans-serif fonts for characters it lacks.
+    let mut serif = vec!["liberation-serif".to_owned()];
+    serif.extend(
+        fonts
+            .families
+            .get(&egui::FontFamily::Proportional)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    fonts
+        .families
+        .insert(egui::FontFamily::Name(READING_SERIF.into()), serif);
+    ctx.set_fonts(fonts);
+}
+
+/// The font family the reading pane draws message text with.
+fn reading_family(font: settings::ReadingFont) -> egui::FontFamily {
+    match font {
+        settings::ReadingFont::Monospace => egui::FontFamily::Monospace,
+        settings::ReadingFont::Sans => egui::FontFamily::Proportional,
+        settings::ReadingFont::Serif => egui::FontFamily::Name(READING_SERIF.into()),
+    }
+}
+
+/// The name of a reading font, as the settings list it.
+fn reading_font_name(font: settings::ReadingFont) -> &'static str {
+    match font {
+        settings::ReadingFont::Monospace => "Monospace",
+        settings::ReadingFont::Sans => "Sans-serif",
+        settings::ReadingFont::Serif => "Serif",
     }
 }
 
@@ -4673,6 +4800,22 @@ mod tests {
         let query = search::parse(&format!("from:{}", "ana@example.com")).query;
         assert_eq!(query.from, vec!["ana@example.com".to_string()]);
         assert!(query.words.is_empty() && query.subject.is_empty());
+    }
+
+    #[test]
+    fn every_reading_font_is_defined_and_draws() {
+        // egui panics on a font family it doesn't know, so each choice is drawn once.
+        let ctx = egui::Context::default();
+        apply_fonts(&ctx);
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            for font in [
+                settings::ReadingFont::Monospace,
+                settings::ReadingFont::Sans,
+                settings::ReadingFont::Serif,
+            ] {
+                ui.label(egui::RichText::new("Mail text, ünïcödé").family(reading_family(font)));
+            }
+        });
     }
 
     #[test]

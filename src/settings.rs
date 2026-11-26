@@ -36,6 +36,8 @@ pub struct Settings {
     pub theme: Theme,
     /// The view shown at startup.
     pub startup_view: StartupView,
+    /// The font for message text in the reading pane.
+    pub reading_font: ReadingFont,
     /// How the thread list is sorted when the app starts, and when the default is changed.
     pub default_sort: crate::store::ListOrder,
     /// The label last shown in the list, or empty for All Mail. Used by `StartupView::Last`.
@@ -111,6 +113,18 @@ pub enum StartupView {
     AllMail,
     /// The view last shown: `last_view`.
     Last,
+}
+
+/// The font for message text in the reading pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ReadingFont {
+    /// Fixed-width. Messages are plain text, so this is the default.
+    #[default]
+    Monospace,
+    /// The app's sans-serif font.
+    Sans,
+    /// A serif font, bundled with the app.
+    Serif,
 }
 
 /// How much of a new message a desktop notification shows. Notifications can appear on a locked
@@ -200,6 +214,7 @@ impl Default for Settings {
             notify_never_from: Vec::new(),
             theme: Theme::System,
             startup_view: StartupView::Inbox,
+            reading_font: ReadingFont::Monospace,
             last_view: String::new(),
             default_sort: crate::store::ListOrder::default(),
             read_on_open: ReadOnOpen::Immediately,
@@ -346,6 +361,7 @@ mod tests {
             notify_never_from: Vec::new(),
             theme: Theme::System,
             startup_view: StartupView::Inbox,
+            reading_font: ReadingFont::Monospace,
             last_view: String::new(),
             default_sort: crate::store::ListOrder::default(),
             read_on_open: ReadOnOpen::Immediately,
