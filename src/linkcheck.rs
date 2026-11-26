@@ -42,6 +42,16 @@ fn url_target(text: &str) -> String {
     text.trim().to_string()
 }
 
+/// Whether a link target may be handed to the system to open: an http or https address, with
+/// no spaces or control characters. Anything else, such as `file:` or a program's scheme, is
+/// refused, whatever the message says.
+pub fn is_web_address(target: &str) -> bool {
+    let rest = target
+        .strip_prefix("https://")
+        .or_else(|| target.strip_prefix("http://"));
+    rest.is_some_and(|r| !r.is_empty()) && target.chars().all(|c| !c.is_control() && c != ' ')
+}
+
 /// Whether a link may be disguised (see [`analyze`]). Drawing asks this for
 /// every visible link on every frame, so answers are remembered per link text:
 /// up to 256 of them, for links up to 512 bytes (about 128 KB at most).

@@ -59,10 +59,11 @@ pub fn safe_name(name: &str) -> String {
         })
         .collect();
     let cleaned = cleaned.trim().trim_start_matches('.').trim();
-    if cleaned.is_empty() {
+    let portable = crate::text::portable_name(cleaned, 200);
+    if portable.is_empty() {
         "attachment".into()
     } else {
-        cleaned.to_string()
+        portable
     }
 }
 

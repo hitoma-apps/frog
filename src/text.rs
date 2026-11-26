@@ -21,6 +21,39 @@ pub fn strip_hidden(text: &str) -> String {
     text.chars().filter(|&c| !is_hidden_or_bidi(c)).collect()
 }
 
+/// A file name that Windows accepts. A device name such as `CON`, `NUL` or `COM1` (with or without
+/// an extension) gets a `_` in front, since writing to it reaches a device. Trailing dots and
+/// spaces are removed, and the name is cut to `max_bytes`, on a character boundary. May return an
+/// empty string, which the caller replaces.
+pub fn portable_name(name: &str, max_bytes: usize) -> String {
+    let trimmed = name.trim_start().trim_end_matches(['.', ' ']);
+    let stem = trimmed
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_uppercase();
+    let numbered = stem.len() == 4
+        && (stem.starts_with("COM") || stem.starts_with("LPT"))
+        && matches!(stem.as_bytes()[3], b'1'..=b'9');
+    let reserved = numbered || matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL");
+    let mut out = if reserved {
+        format!("_{trimmed}")
+    } else {
+        trimmed.to_string()
+    };
+    if out.len() > max_bytes {
+        let mut end = max_bytes;
+        while !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.truncate(end);
+        // Cutting can leave a dot or space at the end, which Windows drops.
+        out = out.trim_end_matches(['.', ' ']).to_string();
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

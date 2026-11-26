@@ -44,6 +44,13 @@ pub fn content(items: &[NewMail], detail: NotificationDetail) -> (String, String
     }
 }
 
+/// Escapes the characters that start markup, so the text is shown exactly as it was written.
+pub fn escape_markup(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 /// Shows one notification for a batch of new mail. Nothing is shown for an empty batch.
 ///
 /// `on_click` runs when the user clicks the notification. Waiting for that happens on a thread of
@@ -59,6 +66,13 @@ pub fn new_mail(
         return Ok(());
     }
     let (summary, body) = content(items, detail);
+    // On Linux the notification server reads the text as light markup, so mail text must not be
+    // able to add links or emphasis. Other systems show the text as it is.
+    let (summary, body) = if cfg!(all(unix, not(target_os = "macos"))) {
+        (escape_markup(&summary), escape_markup(&body))
+    } else {
+        (summary, body)
+    };
     let mut notification = notify_rust::Notification::new();
     notification
         .appname("FROG")
@@ -134,6 +148,14 @@ mod tests {
         );
         assert_eq!(title, "2 new messages");
         assert!(body.is_empty());
+    }
+
+    #[test]
+    fn markup_in_mail_text_is_shown_as_text() {
+        assert_eq!(
+            escape_markup("<a href=\"https://evil.example\">Your bank</a> & more"),
+            "&lt;a href=\"https://evil.example\"&gt;Your bank&lt;/a&gt; &amp; more"
+        );
     }
 
     #[test]
